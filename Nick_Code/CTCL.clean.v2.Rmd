@@ -1,0 +1,3057 @@
+---
+title: "CTCL.clean.v2"
+output: html_document
+date: "2023-06-08"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+```{r}
+#Load Packages to be used
+suppressPackageStartupMessages(library(Seurat))
+suppressPackageStartupMessages(library(glmGamPoi))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(gridExtra))
+suppressPackageStartupMessages(library(tidyr))
+suppressPackageStartupMessages(library(batchelor))
+suppressPackageStartupMessages(library(bluster))
+suppressPackageStartupMessages(library(stringr))
+suppressPackageStartupMessages(library(viridis))
+suppressPackageStartupMessages(library(scater))
+suppressPackageStartupMessages(library(leidenAlg))
+suppressPackageStartupMessages(library(SoupX))
+suppressPackageStartupMessages(library(SeuratDisk))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(gridExtra))
+suppressPackageStartupMessages(library(scCustomize))
+suppressPackageStartupMessages(library(scRepertoire))
+suppressPackageStartupMessages(library(Trex))
+suppressPackageStartupMessages(library(ggraph))
+suppressPackageStartupMessages(library(celltype))
+suppressPackageStartupMessages(library(SingleR))
+suppressPackageStartupMessages(library(celldex))
+suppressPackageStartupMessages(library(ssGSEA2))
+suppressPackageStartupMessages(library(reticulate))
+suppressPackageStartupMessages(library(keras))
+suppressPackageStartupMessages(library(xgboost))
+suppressPackageStartupMessages(library(caTools))
+suppressPackageStartupMessages(library(cvms))
+suppressPackageStartupMessages(library(igraph))
+suppressPackageStartupMessages(library(alluvial))
+suppressPackageStartupMessages(library(GPUmatrix))
+suppressPackageStartupMessages(library(plotly))
+suppressPackageStartupMessages(library(rayshader))
+suppressPackageStartupMessages(library(enrichplot))
+suppressPackageStartupMessages(library(org.Hs.eg.db))
+suppressPackageStartupMessages(library(clusterProfiler))
+suppressPackageStartupMessages(library(monocle3))
+suppressPackageStartupMessages(library(SeuratWrappers))
+suppressPackageStartupMessages(library(djvdj))
+suppressPackageStartupMessages(library(lisi))
+suppressPackageStartupMessages(library(CellChat))
+suppressPackageStartupMessages(library(djvdj))
+suppressPackageStartupMessages(library(scran))
+suppressPackageStartupMessages(library(scuttle))
+
+suppressPackageStartupMessages(library(escape))
+suppressPackageStartupMessages(library(Seurat))
+suppressPackageStartupMessages(library(dittoSeq))
+suppressPackageStartupMessages(library(ggplot2))
+```
+
+
+```{r}
+################################################################################
+# Load in data, remove doublets, ensure barcodes are set
+################################################################################
+colorblind_vector <- colorRampPalette(rev(c("#0D0887FF", "#47039FFF", 
+              "#7301A8FF", "#9C179EFF", "#BD3786FF", "#D8576BFF",
+              "#ED7953FF","#FA9E3BFF", "#FDC926FF", "#F0F921FF")))
+
+inventory <- readxl::read_xlsx("~/CTCL.analysis/File.Inventory (2).xlsx")
+
+###############################################################################
+# Read in data, split by orig.ident, and sct transform the data
+###############################################################################
+asdf <- readRDS("~/seurat.merged (4).rds")
+split <- SplitObject(object = asdf, split.by = "orig.ident")
+
+list <- unique(asdf$orig.ident)
+for(i in seq_along(list)){
+  tmp <- list[i]
+  split[[tmp]] <- SCTransform(object = split[[tmp]], return.only.var.genes = F, assay = "RNA")
+  DefaultAssay(split[[tmp]]) <- "SCT"
+  split[[tmp]]@assays$RNA <- NULL
+}
+
+merge <- merge(split[[1]], split[-1])
+SCT.save.assay <- merge@assays$SCT
+rm(list, split, merge)
+
+###############################################################################
+#Visualize what this looks like after transformation
+###############################################################################
+SCT.save.assay <- readRDS(file = "~/SCT.save.assay.rds")
+asdf@assays$SCT <- SCT.save.assay
+rm(SCT.save.assay)
+DefaultAssay(asdf) <- "RNA"
+FeaturePlot(asdf, features = "NKG7", slot = "counts", raster = F)
+FeaturePlot(asdf, features = "NKG7", slot = "data", raster = F)
+DefaultAssay(asdf) <- "SCT"
+FeaturePlot(asdf, features = "NKG7", slot = "counts", raster = F)
+FeaturePlot(asdf, features = "NKG7", slot = "data", raster = F)
+
+which(rownames(asdf@assays$RNA@counts) == "NKG7")
+which(rownames(asdf@assays$RNA@data) == "NKG7")
+x <- asdf@assays$RNA@data[13582,]
+y <- asdf@assays$RNA@counts[15472,]
+plot(x, y)
+
+which(rownames(T.cells@assays$RNA@counts) == "NKG7")
+which(rownames(T.cells@assays$RNA@data) == "NKG7")
+x <- T.cells@assays$RNA@data[13582,]
+y <- T.cells@assays$RNA@counts[15472,]
+plot(x, y)
+
+
+###############################################################################
+#Visualize some qc metrics
+###############################################################################
+
+FeaturePlot(asdf, features = "db.score", raster = F)
+FeaturePlot(asdf, features = "nCount_RNA", raster = F)
+FeaturePlot(asdf, features = "nFeature_RNA", raster = F)
+FeaturePlot(asdf, features = "percent.mt", raster = F)
+
+hist(asdf$db.score, breaks = 50)
+asdf <- subset(asdf, db.class == "singlet")
+FeaturePlot(asdf, features = "db.score", raster = F)
+hist(asdf$db.score, breaks = 50)
+
+```
+
+
+
+```{r}
+################################################################################
+# Ensure labels are set and shorten labels
+################################################################################
+asdf$barcode <- asdf@assays$RNA@counts@Dimnames[2]
+Idents(asdf) <- asdf$knn.leiden
+
+rna <- as.data.frame(asdf@assays$RNA@data@Dimnames[1])
+adt <- as.data.frame(asdf@assays$ADT@data@Dimnames[1])
+
+################################################################################
+# Change metadata labels
+################################################################################
+#Prune HPCA labels
+unique(asdf$HPCA.pruned.labels)
+test <- stringr::word(string = asdf$HPCA.labels, sep = ":")
+asdf$HPCA.pruned.labels <- test
+
+#PT.annot
+test <- asdf$PT.annot
+test[is.na(test)] <- "none"
+asdf$PT.annot <- test
+
+#CloneType NONE info
+test <- asdf$cloneType
+test[is.na(test)] <- "none"
+asdf$cloneType <- test
+asdf$cloneType <- factor(asdf$cloneType, levels = c("none", "Rare (0 < X <= 1e-04)", "Small (1e-04 < X <= 0.001)", "Medium (0.001 < X <= 0.01)", "Large (0.01 < X <= 0.1)", "Hyperexpanded (0.1 < X <= 1)"))
+
+#Shorten labels
+Idents(asdf) <- asdf$Dx
+unique((Idents(asdf)))
+asdf <- RenameIdents(object = asdf,
+             "Mycosis fungoides" = "MF",
+             "Sezary Syndrome" = "SS",
+             "Healthy Control" = "HC",
+             "Primary Cutaneous Anaplastic Large Cell Lymphoma" = "PCALCL",
+             "Follicular Mycosis Fungoides" = "FMF")
+asdf$Dx <- Idents(asdf)
+Idents(asdf) <- asdf$knn.leiden
+
+################################################################################
+# Autolabel Celltypes
+################################################################################
+table <- as.data.frame.matrix(table(asdf$knn.leiden, asdf$HPCA.pruned.labels))
+table$sum <- rowSums(table)
+table[,1:(length(table)-1)] <- table[,1:(length(table)-1)]/table$sum*100
+table$Largest_Column<-colnames(table)[apply(table[,1:(length(table)-1)],1,which.max)]
+
+Idents(asdf) <- asdf$knn.leiden
+list <- as.vector(table$Largest_Column)
+names(list) <- c(0:26)
+list
+
+asdf <- Rename_Clusters(seurat_object = asdf, new_idents = list)
+asdf$init.label <- Idents(asdf)
+DimPlot(asdf, group.by = "knn.leiden", label = TRUE, raster = F)
+DimPlot(asdf, group.by = "init.label", label = TRUE, raster = F)
+
+```
+
+
+```{r}
+################################################################################
+# Isolate T cells and re-UMAP, cluster only T cells
+################################################################################
+T.cells <- subset(asdf, knn.leiden == "0"|knn.leiden == "2"|knn.leiden == "4"|knn.leiden == "10"|knn.leiden == "11"|knn.leiden == "12"|knn.leiden == "14"|knn.leiden == "15"|knn.leiden == "17"|knn.leiden == "18"|knn.leiden == "19"|knn.leiden == "20"|knn.leiden == "21")
+DimPlot(T.cells, group.by = "knn.leiden", label = TRUE, raster = F)
+
+FeaturePlot(T.cells, features = "CD3E", raster = F)
+FeaturePlot(T.cells, features = "CD4", raster = F)
+FeaturePlot(T.cells, features = "CD8A", raster = F)
+FeaturePlot(T.cells, features = "CD8B", raster = F)
+
+DimPlot(T.cells, group.by = "cloneType", raster = F)
+
+umap <- DimPlot(T.cells, group.by = "knn.leiden", label = TRUE, raster = F)
+Idents(T.cells) <- T.cells$db.class
+#T.cells <- CellSelector(plot = umap, object = T.cells, ident = "selected")
+#T.cells$selected <- Idents(T.cells)
+check.T <- FindAllMarkers(T.cells, only.pos = T, logfc.threshold = 0.5, min.pct = 0.5)
+#T.cells <- subset(T.cells, selected == "selected")
+#DimPlot(T.cells, group.by = "knn.leiden", label = TRUE, raster = F)
+```
+
+
+```{r}
+################################################################################
+# re-UMAP, cluster only T cells
+################################################################################
+fastMNN_output <- readRDS("~/fastMNN_output.rds")
+keep <- T.cells$barcode
+fastMNN_output <- fastMNN_output[, (colnames(fastMNN_output) %in% keep)]
+T.cells <- subset(T.cells, barcode %in% fastMNN_output@colData@rownames)
+out <- fastMNN_output
+rm(fastMNN_output)
+
+set.seed(123453)
+umap <- runUMAP(x = out, dimred = "corrected")
+umap.T <- CreateDimReducObject(embeddings = umap@int_colData$reducedDims@listData$UMAP, 
+                            loadings = umap@int_colData$reducedDims@listData$UMAP, 
+                            projected = umap@int_colData$reducedDims@listData$UMAP, 
+                            assay = "RNA", 
+                            key = "umap.T")
+T.cells[["umap.T"]] <- umap.T
+#DimPlot(T.cells, group.by = "selected", reduction = "umap.T", raster = F)
+T.cells@reductions$umap <- NULL
+
+#DimPlot(T.cells, group.by = "knn.leiden", raster=F)
+
+#snn.gr <- makeSNNGraph(out@int_colData$reducedDims$corrected)
+#snn.cluster <- leiden.community(snn.gr)
+
+#knn.gr <- makeKNNGraph(out@int_colData$reducedDims$corrected, k = 10)
+#saveRDS(object = knn.gr, file = "~/T.cells.knn.gr.rds")
+
+knn.leiden.T.5 <- readRDS("~/knn.leiden.T.5.rds")
+knn.leiden.T1 <- readRDS("~/knn.leiden.T1.rds")
+knn.leiden.T2 <- readRDS("~/knn.leiden.T2.rds")
+
+T.cells$knn.leiden.T.5 <- knn.leiden.T.5
+T.cells$knn.leiden.T1 <- knn.leiden.T1
+T.cells$knn.leiden.T2 <- knn.leiden.T2
+
+knn.gr <- readRDS("~/T.cells.knn.gr.rds")
+clusters <- cluster_leiden(graph = knn.gr,objective_function = "modularity",weights = NULL,resolution_parameter = 0.5,beta = 0.01,initial_membership = NULL,n_iterations = 2,vertex_weights = NULL)
+com <- membership(communities = clusters)
+T.cells$knn.leiden.T.5 <- com
+
+clusters <- cluster_leiden(graph = knn.gr,objective_function = "modularity",weights = NULL,resolution_parameter = 1,beta = 0.01,initial_membership = NULL,n_iterations = 2,vertex_weights = NULL)
+com <- membership(communities = clusters)
+T.cells$knn.leiden.T1 <- com
+
+clusters <- cluster_leiden(graph = knn.gr,objective_function = "modularity",weights = NULL,resolution_parameter = 2,beta = 0.01,initial_membership = NULL,n_iterations = 2,vertex_weights = NULL)
+com <- membership(communities = clusters)
+T.cells$knn.leiden.T2 <- com
+
+clusters <- cluster_leiden(graph = knn.gr,objective_function = "modularity",weights = NULL,resolution_parameter = 3,beta = 0.01,initial_membership = NULL,n_iterations = 2,vertex_weights = NULL)
+com <- membership(communities = clusters)
+T.cells$knn.leiden.T3 <- com
+
+# Alluvial Plot of clustering
+meta <- T.cells[[]] %>% 
+        group_by(knn.leiden.T.5, knn.leiden.T1, knn.leiden.T2) %>%
+        summarise(Freq = n())
+meta <- meta[-1161,]
+
+png(file = "~/alluvial.png", width = 900, height = 1500)
+alluvial(meta[,1:3], freq=meta$Freq, col = colorblind_vector(n = length(meta)))
+dev.off()
+
+DimPlot(object = T.cells, group.by = "knn.leiden.T.5", raster = F)
+DimPlot(object = T.cells, group.by = "knn.leiden.T1", raster = F)
+DimPlot(object = T.cells, group.by = "knn.leiden.T2", raster = F)
+
+DimPlot(T.cells, group.by = "knn.leiden.T.5", raster = F)
+DimPlot(T.cells, group.by = "knn.leiden.T1", raster = F)
+DimPlot(T.cells, group.by = "knn.leiden.T2", raster = F)
+DimPlot(T.cells, group.by = "knn.leiden.T2", raster = F)
+
+has.tcr <- subset(T.cells, cloneType != "none")
+
+table(has.tcr$cloneType, has.tcr$knn.leiden.T.5)
+table(has.tcr$cloneType, has.tcr$knn.leiden.T1)
+table(has.tcr$cloneType, has.tcr$knn.leiden.T2)
+
+table(T.cells$knn.leiden.T2, T.cells$PT.annot)
+
+```
+
+
+```{r}
+################################################################################
+# Organize tcr and clonetype info for downstream analysis plus update new.clone call
+################################################################################
+T.cells$has.tcr <- T.cells$cloneType != "none"
+T.cells$malignant.hyperonly <- T.cells$cloneType == "Hyperexpanded (0.1 < X <= 1)"
+T.cells$tcr.and.malig <- paste0(T.cells$has.tcr, T.cells$malignant.hyperonly)
+table <- as.data.frame.matrix(table(T.cells$orig.ident, T.cells$tcr.and.malig))
+
+
+meta <- T.cells[[]]
+meta <- meta[meta$Dx != "HC",]
+
+table <- subset(table, TRUETRUE > 5)
+origins <- rownames(table)
+out.list <- list()
+for(i in seq_along(origins)) {
+  tmp <- meta[meta$orig.ident == origins[i],]
+  if(length(which(is.na(tmp$CTaa) == TRUE)) == nrow(tmp)) {
+    next()
+  }
+   
+  counts <- tmp %>%
+            filter(!is.na(CTaa)) %>%
+            group_by(CTaa) %>%
+            dplyr::count() %>%
+            as.data.frame()
+  if(max(counts$n) < 5) {
+    next()
+  }
+ 
+  denominator <- nrow(tmp[!is.na(tmp$CTaa),])
+  top <- counts %>%
+    slice_max(order_by = n, n = 10)
+  top$prop <- top$n/denominator
+  if(max(top$prop) < .05) {
+    next()
+  }
+  top <- top[top$prop > .09,]
+  top <- top[top$n > 3,]
+  topchain <- top$CTaa
+  topA <- stringr::str_split(top$CTaa, "_", simplify = TRUE)[1:nrow(top), 1]
+  topB <- stringr::str_split(top$CTaa, "_", simplify = TRUE)[1:nrow(top), 2]
+  chainA <- stringr::str_split(tmp$CTaa, "_", simplify = TRUE)[,1]
+  chainB <- stringr::str_split(tmp$CTaa, "_", simplify = TRUE)[,2]
+  chainA[chainA == "NA"] <- NA
+  chainB[chainB == "NA"] <- NA
+  chainB[chainB == ""] <- NA
+
+  a.pos <- which(chainA %in% topA)
+  b.pos <- which(chainB %in% topB)
+  both <- sort(unique(c(a.pos, b.pos)))
+  
+  meta.add <- data.frame(row.names = rownames(tmp[both,]), major_clone = rep("malignantClones", length(both)), new.proportion = rep(length(both)/denominator, length(both)))
+  out.list[[i]] <- meta.add
+}
+
+list <- c(1:length(out.list))
+rbind <- data.frame()
+for(i in seq_along(list)){
+rbind <- rbind(rbind, out.list[[i]])
+}
+clones <- as.vector(rbind$major_clone)
+names(clones) <- rownames(rbind)
+T.cells$new.clones <- clones
+
+test <- T.cells$new.clones
+test[is.na(test)] <- "none"
+T.cells$new.clones <- test
+
+T.cells$tcr.and.new.clones <- paste0(T.cells$has.tcr, T.cells$new.clones)
+
+T.cells$malignant.hyperonly <- factor(T.cells$malignant.hyperonly, levels = c("TRUE", "FALSE"))
+DimPlot(object = T.cells, group.by = "malignant.hyperonly", raster = F)
+
+DimPlot(object = T.cells, group.by = "new.clones", raster = F)
+DimPlot(object = T.cells, group.by = "has.tcr", raster = F, cols = c("red", "grey"))
+table(T.cells$has.tcr)
+```
+
+```{r}
+# InferCNV load data already run
+table <- as.data.frame.matrix(table(T.cells$orig.ident, T.cells$tcr.and.new.clones))
+table <- subset(table, TRUEmalignantClones >9)
+all <- rownames(table)
+
+all.cnv.results <- list.files("~/inferCNV.out")
+for(i in seq_along(all.cnv.results)){
+  tmp <- all.cnv.results[i]
+  tmp2 <- read.csv(file = paste0("~/inferCNV.out/", tmp))
+  if(tmp == "S1.csv"){
+    rbind <- tmp2
+    next()
+  }
+  rbind <- rbind(rbind, tmp2)
+}
+
+rownames(rbind) <- rbind$X
+rbind$X <- NULL
+rbind$cnv.total <- rowSums(rbind)
+
+cnv.total <- rbind$cnv.total
+names(cnv.total) <- rownames(rbind)
+T.cells$cnv.total <- cnv.total
+
+ss <- subset(T.cells, orig.ident %in% all)
+
+ss <- subset(ss, cnv.total >= 0)
+freq_table <- ss[[]]
+zzz <- freq_table %>%
+    group_by(orig.ident, tcr.and.new.clones) %>%
+    summarise(c(quantile(cnv.total, .05)))
+subset <- subset(zzz, tcr.and.new.clones == "TRUEmalignantClones")
+colnames(subset) <- c("orig.ident", "tcr.and.new.clones", "cutoff")
+
+hist(ss$cnv.total, breaks = 100, xlim = c(0,20))
+
+vector <- subset$cutoff
+names(vector) <- subset$orig.ident
+Idents(ss) <- ss$orig.ident
+ss <- Rename_Clusters(seurat_object = ss, new_idents = vector)
+ss$cnv.cutoff.per.sample <- Idents(ss)
+table(ss$orig.ident, ss$cnv.cutoff.per.sample)
+ss$cnv.cutoff.per.sample <- as.numeric(trimws(ss$cnv.cutoff.per.sample))
+
+ss$cnv.call.per.sample <- ss$cnv.total > ss$cnv.cutoff.per.sample
+dif <- setdiff(ss$barcode, train.cnv.check)
+
+check <- subset(ss, barcode %in% dif)
+
+benchmark.cnv <- as.data.frame.matrix(table(ss$cnv.call.per.sample, ss$tcr.and.new.clones))
+accuracy.cnv <- 100*(benchmark.cnv[1,3]/2+benchmark.cnv[2,2]/2)/(benchmark.cnv[1,2]+benchmark.cnv[2,2]/2+benchmark.cnv[1,3]/2+benchmark.cnv[2,3])
+benchmark.cnv <- benchmark.cnv[,-1]
+
+T.cells$pred.cnv <- ss$cnv.call.per.sample
+
+
+
+```
+
+
+
+```{r}
+################################################################################
+# Seurat anchor transfer predict malignant cells
+################################################################################
+T.cells.vdj <- subset(T.cells, cloneType != "none")
+
+df <- data.frame(cell_type=T.cells.vdj$orig.ident)
+df$barcode <- rownames(df)
+row_odd <- seq_len(nrow(df)) %% 2     
+row_odd  
+df <- df[row_odd == 0, ]
+
+train.anchor.transfer <- df$barcode
+
+T.cells.vdj <- subset(T.cells.vdj, barcode %in% df$barcode)
+test <- setdiff(T.cells$barcode, df$barcode)
+T.cells.test <- subset(T.cells, barcode %in% test)
+
+###
+
+split.vdj <- SplitObject(T.cells.vdj, split.by = "orig.ident")
+split.all.t <- SplitObject(T.cells.test, split.by = "orig.ident")
+
+out <- vector()
+for(i in seq_along(all)){
+  tmp <- all[i]
+  ss <- split.all.t[[tmp]]
+  ref <- split.vdj[[tmp]]
+  if(nrow(ref[[]]) < 20) {
+    next()
+  }
+  ss <- FindVariableFeatures(object = ss)
+  ref <- FindVariableFeatures(object = ref)
+  features <- intersect(ss@assays[["RNA"]]@var.features, ref@assays[["RNA"]]@var.features)
+  anchors <- FindTransferAnchors(reference = ref, query = ss, dims = 1:10, reference.assay = "RNA", query.assay = "RNA",  features = features, k.filter = NA, k.score = 10, k.anchor = 10, npcs = 10)
+predictions.malig <- TransferData(anchorset = anchors, refdata = ref$new.clones, dims = 1:10, k.weight = 10)
+
+x <- predictions.malig$predicted.id
+names(x) <- rownames(predictions.malig)
+out <- append(out, x)
+
+}
+
+T.cells.test$predictions.malig <- out
+benchmark.seurat <- as.data.frame.matrix(table(T.cells.test$predictions.malig, T.cells.test$tcr.and.new.clones))
+accuracy.seurat <- 100*(benchmark.seurat[1,2]/2+benchmark.seurat[2,3]/2)/(benchmark.seurat[1,2]/2+benchmark.seurat[2,2]+benchmark.seurat[1,3]+benchmark.seurat[2,3]/2)
+
+T.cells.vdj$predictions.malig <- T.cells.vdj$new.clones
+T.cells$predictions.malig <-c(T.cells.test$predictions.malig, T.cells.vdj$predictions.malig)
+table(T.cells$tcr.and.new.clones, T.cells$predictions.malig)
+
+
+rm(anchors, clusters, counts, df, knn.gr, meta, meta.add, out.list, predictions.malig, rbind, ref, split.all.t, split.vdj, ss, T.cells.test, T.cells.vdj, table, top, umap, umap.T, a.pos, b.pos, both, chainA, chainB, clones, com, denominator, features, i, keep, out, row_odd, test, tmp, topA, topB, topchain, x)
+gc()
+```
+
+
+```{r}
+################################################################################
+# XGBoost predict malignant cells
+################################################################################
+
+table <- as.data.frame.matrix(table(T.cells$orig.ident, T.cells$tcr.and.new.clones))
+xg <- subset(T.cells, orig.ident %in% all)
+xg.train <- subset(xg, has.tcr == "TRUE")
+
+out <- vector()
+train.xgboost <- vector()
+for(i in seq_along(all)){
+  tmp <- all[i]
+  tmp2 <- subset(xg.train, orig.ident == tmp)
+  tmp2$train <- sample.split(Y = tmp2$new.clones, SplitRatio = 0.8)
+  train.save <- subset(tmp2, train == TRUE)
+  query <- subset(xg, orig.ident == tmp)
+  train.xgboost <- append(train.xgboost, train.save$barcode)
+  test.keep <- setdiff(query$barcode, train.save$barcode)
+  test <- subset(xg, barcode %in% test.keep)
+  label <- train.save$new.clones
+  label <- label == "malignantClones"
+  label <- as.numeric(label)
+  
+  tcr <- quietTCRgenes(train.save@assays[["SCT"]]@data@Dimnames[[1]])
+  train <- train.save@assays$SCT@data
+  train <- train[tcr,]
+  
+  tcr <- quietTCRgenes(test@assays[["SCT"]]@data@Dimnames[[1]])
+  test <- test@assays$SCT@data
+  test <- test[tcr,]
+
+bstSparse <- xgboost(data = t(train), label = label, max.depth = 2, eta = 1, nthread = 16, nrounds = 500, early_stopping_rounds = 8, objective = "binary:logistic", device = "cude")
+  importance_matrix <- xgb.importance(model = bstSparse)
+  importance_matrix$orig.ident <- tmp
+  
+    avg <- as.data.frame(AverageExpression(train.save, assays = "SCT", slot = "counts", features = importance_matrix$Feature, group.by = "tcr.and.new.clones"))
+    importance_matrix$larger.malig <- avg$SCT.TRUEmalignantClones > avg$SCT.TRUEnone
+  
+  write.csv(importance_matrix, paste0("~/xgboost.remove.tcr/", tmp, ".csv"))
+  pred <- predict(object = bstSparse, newdata = t(test))
+  names(pred) <- test@Dimnames[[2]]
+
+out <- append(out, pred)
+}
+all.test <- setdiff(xg$barcode, train.xgboost)
+
+xg.test <- subset(xg, barcode %in% all.test)
+xg.test$xgboost.score <- out
+xg.test$pred.xgboost <- xg.test$xgboost.score >0.5
+
+
+benchmark.xgboost <- as.data.frame.matrix(table(xg.test$pred.xgboost, xg.test$tcr.and.new.clones))
+accuracy.xgboost <- 100*(benchmark.xgboost[1,3]+benchmark.xgboost[2,2])/(benchmark.xgboost[1,2]+benchmark.xgboost[2,2]+benchmark.xgboost[1,3]+benchmark.xgboost[2,3])
+
+train <- subset(T.cells, barcode %in% train.xgboost)
+train2 <- train$new.clones
+names(train2) <- train$barcode
+
+test2 <- xg.test$pred.xgboost
+names(test2) <- xg.test$barcode
+
+train <- subset(T.cells, barcode %in% train.xgboost)
+train2 <- train$new.clones
+names(train2) <- train$barcode
+
+combine <- c(test2, train2)
+T.cells$pred.xgboost <- combine
+unique(T.cells$pred.xgboost)
+T.cells$pred.xgboost <- ifelse(T.cells$pred.xgboost == "TRUE"|T.cells$pred.xgboost == "malignantClones", "malignantClones", "none")
+table(T.cells$tcr.and.new.clones, T.cells$pred.xgboost)
+
+################################################
+#read in files, combine, and add directionality
+
+all.xgb.results <- list.files("~/xgboost.remove.tcr")
+for(i in seq_along(all.xgb.results)){
+  tmp <- all.xgb.results[i]
+  tmp2 <- read.csv(file = paste0("~/xgboost.remove.tcr/", tmp))
+  if(tmp == "S1.csv"){
+    rbind <- tmp2
+    next()
+  }
+  rbind <- rbind(rbind, tmp2)
+}
+rbind$Gain <- rbind$Gain*100
+
+zzz <- rbind %>%
+    group_by(Feature) %>%
+    summarise(sum(Gain))
+
+rbind$calc <- ifelse(rbind$larger.malig == "TRUE", 1, -1)
+rbind$final.value <- rbind$Gain * rbind$calc
+zzz.direction <- rbind %>%
+    group_by(Feature) %>%
+    summarise(sum(final.value))
+rbind.pos <- subset(rbind, calc > 0)
+rbind.neg <- subset(rbind, calc <0)
+
+dif <- intersect(rbind.pos$Feature, rbind.neg$Feature)
+
+zzz.pos <- rbind.pos %>%
+    group_by(Feature) %>%
+    summarise(sum(final.value))
+zzz.pos <- zzz.pos[order(-zzz.pos$`sum(final.value)`),]
+ggplot(head(zzz.pos, 20), aes(fill=`sum(final.value)`, y=`sum(final.value)`, x=reorder(Feature, -`sum(final.value)`))) + 
+  geom_bar(stat="identity")+
+  theme(axis.text.x = element_text(angle = 90))+NoLegend()
+
+zzz.neg <- rbind.neg %>%
+    group_by(Feature) %>%
+    summarise(sum(final.value))
+zzz.neg <- zzz.neg[order(zzz.neg$`sum(final.value)`),]
+ggplot(head(zzz.neg, 20), aes(fill=`sum(final.value)`, y=`sum(final.value)`, x=reorder(Feature, -`sum(final.value)`))) + 
+  geom_bar(stat="identity")+
+  theme(axis.text.x = element_text(angle = 90))+NoLegend()
+
+###################################################################
+# Check occurances of genes together with gain > 1%
+
+rbind.strong <- subset(rbind, Gain >1)
+list <- unique(rbind.strong$orig.ident)
+out <- vector()
+for(i in seq_along(list)){
+  tmp <- list[i]
+  ss <- subset(rbind.strong, orig.ident == tmp)
+  ss.feats <- unique(ss$Feature)
+  occur <- tidyr::crossing(ss.feats, ss.feats)
+  occur$both <-  paste0(occur$ss.feats...1, "-", occur$ss.feats...2)
+  occur$same <-  occur$ss.feats...1 == occur$ss.feats...2
+  occur <- subset(occur, same != TRUE)
+  out <- append(out, occur$both)
+  names(out) <- tmp
+}
+occur <- as.data.frame.array(table(out))
+rm(avg, bstSparse, importance_matrix, ss, test, train, xg, xg.test, xg.train, out, pred, ss.feats, tcr)
+gc()
+rbind.xgb <- rbind
+occur.xgb <- occur
+
+
+```
+
+
+
+
+```{r}
+######### Global Algorithm, not yet remove GSE182861 for validation ###################
+table(T.cells$has.tcr)
+xg.train <- subset(T.cells, has.tcr == "TRUE")
+table(T.cells$GEO.Cohort)
+#xg.train <- subset(xg.train, GEO.Cohort != "GSE182861")
+  
+out <- vector()
+
+xg.train$train <- sample.split(Y = xg.train$new.clones, SplitRatio = 0.8)
+train.save <- subset(xg.train, train == TRUE)
+query <- subset(xg.train, train == FALSE)
+
+train2 <- train.save$barcode
+
+test <- setdiff(T.cells$barcode, train2)
+
+test <- subset(T.cells, barcode %in% test)
+label <- train.save$new.clones
+label <- label == "malignantClones"
+label <- as.numeric(label)
+    
+tcr <- quietTCRgenes(train.save@assays[["SCT"]]@data@Dimnames[[1]])
+train <- train.save@assays$SCT@data
+train <- train[tcr,]
+train <- t(train)
+
+#test <- subset(T.cells, GEO.Cohort == "GSE182861")
+#geo <- setdiff(test$barcode, train2)
+#test <- subset(test, barcode %in% geo)
+tcr <- quietTCRgenes(test@assays[["SCT"]]@data@Dimnames[[1]])
+test2 <- test@assays$SCT@data
+test2 <- test2[tcr,]
+test2 <- t(test2)
+  
+bstSparse <- xgboost(data = train, label = label, nthread = 16, nrounds = 5000, early_stopping_rounds = 500, objective = "binary:logistic", max.depth = 100, eta = 1, min_child_weight = 0.01, gamma = 0.01, tree.method = "gpu_hist")
+importance_matrix <- xgb.importance(model = bstSparse)
+    
+avg <- as.data.frame(AverageExpression(train.save, assays = "SCT", slot = "data", features = importance_matrix$Feature, group.by = "tcr.and.new.clones"))
+importance_matrix$larger.malig <- avg$SCT.TRUEmalignantClones > avg$SCT.TRUEnone
+    
+write.csv(importance_matrix, "global.csv")
+pred <- predict(object = bstSparse, newdata = test2, tree.method = "gpu_hist")
+names(pred) <- test$barcode
+  
+out <- pred
+
+
+test$xgboost.score <- out
+test$pred.xgboost <- test$xgboost.score >0.5
+  
+benchmark.xgboost.global <- as.data.frame.matrix(table(test$pred.xgboost, test$tcr.and.new.clones))
+
+accuracy.xgboost.global <- 100*(benchmark.xgboost.global[1,3]+benchmark.xgboost.global[2,2])/(benchmark.xgboost.global[1,2]+benchmark.xgboost.global[2,2]+benchmark.xgboost.global[1,3]+benchmark.xgboost.global[2,3])
+
+table(test$orig.ident, test$pred.xgboost)
+hist(test$xgboost.score, breaks = 50)
+FeaturePlot(test, "xgboost.score", raster = F, split.by = "pred.final")
+ggsave("asdf.png", height = 5, width = 30)
+
+test$wrong <- paste0(test$pred.xgboost, test$tcr.and.new.clones)
+table(test$wrong)
+wrong <- subset(test, wrong == "FALSETRUEmalignantClones"|wrong == "TRUETRUEnone")
+table <- as.data.frame.array(table(wrong$orig.ident))
+################################################
+#read in files, combine, and add directionality
+
+rbind <- read.csv("~/global.csv")
+rbind$Gain <- rbind$Gain*100
+
+rbind$calc <- ifelse(rbind$larger.malig == "TRUE", 1, -1)
+rbind$final.value <- rbind$Gain * rbind$calc
+
+
+table(test$cloneType, test$pred.xgboost)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+################################################################################
+# inferCNV and cnv clonecall
+################################################################################
+ss <- subset(T.cells, orig.ident %in% all)
+
+Idents(ss) <- ss$tcr.and.new.clones
+train.cnv <- vector()
+for(i in seq_along(all.cnv)){
+  tmp <- all.cnv[i]
+  tmp2 <- subset(ss, orig.ident == tmp)
+  
+  df <- data.frame(cell_type=tmp2$tcr.and.new.clones)
+  df <- subset(df, cell_type == "TRUEnone")
+  df$barcode <- rownames(df)
+  df <- df %>% group_by(cell_type) %>% slice_sample(n=round(nrow(df)/2, digits = 0), replace = F)
+  
+  tmp2$train.cnv.ref <- tmp2$barcode %in% df$barcode
+  tmp2$master <- paste0(tmp2$tcr.and.new.clones, tmp2$train.cnv.ref)
+  tmp2$master <- tmp2$master == "TRUEnoneTRUE"
+  barcodes <- subset(tmp2, master == TRUE)
+  barcodes <- barcodes$barcode
+  train.cnv <- append(train.cnv, barcodes)
+
+cnv.obj <- CreateInfercnvObject(raw_counts_matrix = GetAssayData(tmp2, assay = "RNA", slot = "counts"), annotations_file = as.matrix(tmp2$master), gene_order_file = "~/gene.position.txt", delim = "\t", ref_group_names = "TRUE")
+
+run.cnv <- run(infercnv_obj = cnv.obj, cutoff = 0.1, out_dir = "~/inferCNV.loop", HMM = T, analysis_mode = "subclusters", k_nn = 10, denoise = T, num_threads = 32, resume_mode = F, cluster_by_groups = T, leiden_resolution = 0.005, HMM_report_by = "subcluster")
+
+tmp2 <- add_to_seurat(seurat_obj = tmp2, infercnv_output_path = "~/inferCNV.loop")
+
+meta <- tmp2[[]]
+list <- paste0(rep("proportion_loss_chr", 23), 1:23)
+list2 <- paste0(rep("proportion_dupli_chr", 23), 1:23)
+list <- c(list, list2)
+keep.cols <- which(colnames(meta) %in% list)
+meta <- meta[,c(keep.cols)]
+meta$cnv.total <- rowSums(meta)
+write.csv(meta, file = paste0("~/inferCNV.out/", tmp, ".csv"))
+}
+
+all.cnv.results <- list.files("~/inferCNV.out")
+for(i in seq_along(all.cnv.results)){
+  tmp <- all.cnv.results[i]
+  tmp2 <- read.csv(file = paste0("~/inferCNV.out/", tmp))
+  if(tmp == "S1.csv"){
+    rbind <- tmp2
+    next()
+  }
+  rbind <- rbind(rbind, tmp2)
+}
+
+rownames(rbind) <- rbind$X
+rbind$X <- NULL
+rbind$cnv.total <- rowSums(rbind)
+
+cnv.total <- rbind$cnv.total
+names(cnv.total) <- rownames(rbind)
+T.cells$cnv.total <- cnv.total
+
+ss <- subset(T.cells, orig.ident %in% all)
+
+freq_table <- ss[[]]
+zzz <- freq_table %>%
+    group_by(orig.ident, tcr.and.new.clones) %>%
+    summarise(c(quantile(cnv.total, .05)))
+subset <- subset(zzz, tcr.and.new.clones == "TRUEmalignantClones")
+colnames(subset) <- c("orig.ident", "tcr.and.new.clones", "cutoff")
+
+vector <- subset$cutoff
+names(vector) <- subset$orig.ident
+Idents(ss) <- ss$orig.ident
+ss <- Rename_Clusters(seurat_object = ss, new_idents = vector)
+ss$cnv.cutoff.per.sample <- Idents(ss)
+table(ss$orig.ident, ss$cnv.cutoff.per.sample)
+ss$cnv.cutoff.per.sample <- as.numeric(trimws(ss$cnv.cutoff.per.sample))
+
+ss$cnv.call.per.sample <- ss$cnv.total > ss$cnv.cutoff.per.sample
+dif <- setdiff(ss$barcode, train.cnv.check)
+
+check <- subset(ss, barcode %in% dif)
+
+benchmark.cnv <- as.data.frame.matrix(table(check$cnv.call.per.sample, check$tcr.and.new.clones))
+accuracy.cnv <- 100*(benchmark.cnv[1,3]+benchmark.cnv[2,2])/(benchmark.cnv[1,2]+benchmark.cnv[2,2]+benchmark.cnv[1,3]+benchmark.cnv[2,3])
+
+T.cells$pred.cnv <- ss$cnv.call.per.sample
+table(T.cells$tcr.and.new.clones, T.cells$pred.cnv)
+T.cells$pred.cnv <- ifelse(T.cells$barcode %in% train.cnv.check, FALSE, T.cells$pred.cnv)
+table(T.cells$tcr.and.new.clones, T.cells$pred.cnv)
+```
+
+
+```{r}
+################################################################################
+# Compare all methods
+################################################################################
+missing.tcr <- subset(T.cells, has.tcr == "FALSE")
+
+
+x <- table(missing.tcr$pred.cnv, missing.tcr$predictions.malig)
+overlap.cnv.seurat <- 100*(x[1,2]+x[2,1])/sum(x)
+x <- table(missing.tcr$pred.cnv, missing.tcr$pred.xgboost)
+overlap.cnv.xg <- 100*(x[1,2]+x[2,1])/sum(x)
+x <- table(missing.tcr$pred.xgboost, missing.tcr$predictions.malig)
+overlap.xg.seurat <- 100*(x[1,1]+x[2,2])/sum(x)
+
+missing.tcr$pred.combine <- paste0(missing.tcr$predictions.malig, missing.tcr$pred.xgboost)
+table(missing.tcr$pred.combine, missing.tcr$orig.ident)
+missing.tcr <- subset(missing.tcr, pred.combine != "malignantClonesnone" & pred.combine != "nonemalignantClones")
+table(missing.tcr$pred.combine)
+
+missing.tcr$pred.combine <- replace(missing.tcr$pred.combine, missing.tcr$pred.combine == "malignantClonesmalignantClones"|missing.tcr$pred.combine =="NAmalignantClones", "malignant")
+missing.tcr$pred.combine <- replace(missing.tcr$pred.combine, missing.tcr$pred.combine == "nonenone"|missing.tcr$pred.combine =="NAnone", "none")
+missing.tcr$pred.combine <- replace(missing.tcr$pred.combine, missing.tcr$pred.combine == "NANA","NA")
+
+table(missing.tcr$pred.combine)
+has.tcr <- subset(T.cells, has.tcr == "TRUE")
+table(has.tcr$new.clones)
+has.tcr$new.clones <- replace(has.tcr$new.clones, has.tcr$new.clones == "malignantClones", "malignant")
+table(has.tcr$new.clones)
+
+tcr <- has.tcr$new.clones
+names(tcr) <- has.tcr$barcode
+
+notcr <- missing.tcr$pred.combine
+names(notcr) <- missing.tcr$barcode
+
+pred.final <- c(tcr, notcr)
+T.cells$pred.final <- pred.final
+table(T.cells$pred.final)
+table(T.cells$pred.final, T.cells$orig.ident)
+
+s10.11 <- subset(T.cells, orig.ident == "S10"| orig.ident == "S11")
+DimPlot(object = s10.11, reduction = "umap.T", group.by = "knn.leiden.T.5")
+Idents(s10.11) <- s10.11$knn.leiden.T.5
+markers.s10.11 <- FindAllMarkers(object = s10.11, assay = "RNA")
+FeaturePlot_scCustom(seurat_object = s10.11, features = "TRDC")
+FeaturePlot_scCustom(seurat_object = s10.11, features = "TRDJ1")
+FeaturePlot_scCustom(seurat_object = s10.11, features = "TRDJ2")
+FeaturePlot_scCustom(seurat_object = s10.11, features = "TRDJ3")
+FeaturePlot_scCustom(seurat_object = s10.11, features = "TRDV1")
+FeaturePlot_scCustom(seurat_object = s10.11, features = "TRDV2")
+FeaturePlot_scCustom(seurat_object = s10.11, features = "TRDV3")
+FeaturePlot_scCustom(seurat_object = s10.11, features = "TRGC1")
+FeaturePlot_scCustom(seurat_object = s10.11, features = "TRGC2")
+
+FeaturePlot_scCustom(seurat_object = s10.11, features = "CD4")
+FeaturePlot_scCustom(seurat_object = s10.11, features = "CD8A")
+FeaturePlot_scCustom(seurat_object = s10.11, features = "CD8B")
+FeaturePlot_scCustom(seurat_object = s10.11, features = "TRDJ3")
+FeaturePlot_scCustom(seurat_object = s10.11, features = "TRDV1")
+FeaturePlot_scCustom(seurat_object = s10.11, features = "TRDV2")
+FeaturePlot_scCustom(seurat_object = s10.11, features = "TRDV3")
+FeaturePlot_scCustom(seurat_object = s10.11, features = "TRGC1")
+FeaturePlot_scCustom(seurat_object = s10.11, features = "TRGC2")
+```
+
+```{r}
+Idents(T.cells) <- T.cells$knn.leiden.T2
+markers.all <- FindAllMarkers(object = T.cells, assay = "RNA", only.pos = T, logfc.threshold = 0.5)
+
+
+
+split.t <- SplitObject(object = T.cells, split.by = "orig.ident")
+
+seurat.list <- PrepSCTIntegration(split.t, assay = "RNA")
+features <- SelectIntegrationFeatures(object.list = split.t, nfeatures = 3000)
+
+seurat.list <- lapply(split.t, function(x) {
+  tmp <- subset(x,features = features)
+  tmp <- as.SingleCellExperiment(tmp,
+                                 assay = "SCT")
+  tmp
+})
+
+out <- fastMNN(seurat.list)
+
+umap <- runUMAP(x = out, dimred = "corrected")
+umap.tcr <- CreateDimReducObject(embeddings = umap@int_colData$reducedDims@listData$UMAP, 
+                            loadings = umap@int_colData$reducedDims@listData$UMAP, 
+                            projected = umap@int_colData$reducedDims@listData$UMAP, 
+                            assay = "RNA", 
+                            key = "umap.tcr")
+T.cells[["umap.tcr"]] <- umap.tcr
+
+
+
+```
+
+
+```{r}
+# Old labeling, save just in case
+missing.tcr <- subset(T.cells, has.tcr == FALSE)
+table(missing.tcr$new.clones)
+
+table(missing.tcr$pred.xgboost, missing.tcr$predictions.malig)
+
+missing.tcr$combine.predictions <- paste0(missing.tcr$predictions.malig, missing.tcr$pred.xgboost)
+
+missing.tcr$combine.predictions <- replace(missing.tcr$combine.predictions, missing.tcr$combine.predictions == "malignantClonesmalignantClones", "malignantClones")
+missing.tcr$combine.predictions <- replace(missing.tcr$combine.predictions, missing.tcr$combine.predictions == "nonenone", "none")
+missing.tcr$combine.predictions <- replace(missing.tcr$combine.predictions, 
+      missing.tcr$combine.predictions == "malignantClonesnone" | 
+      missing.tcr$combine.predictions == "nonemalignantClones" | 
+      missing.tcr$combine.predictions == "NANA" |
+      missing.tcr$combine.predictions == "NAnone" |
+      missing.tcr$combine.predictions == "NAmalignantClones" , "NA")
+table(missing.tcr$Dx, missing.tcr$combine.predictions)
+
+table(missing.tcr$combine.predictions)
+missing <- missing.tcr$combine.predictions
+names(missing) <- missing.tcr$barcode
+
+has.tcr <- subset(T.cells, cloneType != "none")
+has.tcr.call <- has.tcr$new.clones
+names(has.tcr.call) <- has.tcr$barcode
+T.cells$pred.final <- c(missing, has.tcr.call)
+table(T.cells$pred.final)
+table(T.cells$tcr.and.new.clones)
+
+```
+
+
+```{r}
+################# XGBoost Dx wide pred #############################
+  table <- as.data.frame.matrix(table(T.cells$orig.ident, T.cells$tcr.and.new.clones))
+  xg <- subset(T.cells, orig.ident %in% all)
+  xg.train <- subset(xg, has.tcr == "TRUE")
+  
+  out <- vector()
+  train.xgboost <- vector()
+  dx <- unique(xg.train$Dx)
+  for(i in seq_along(dx)){
+    tmp <- dx[i]
+    tmp2 <- subset(xg.train, Dx == tmp)
+    tmp2$train <- sample.split(Y = tmp2$new.clones, SplitRatio = 0.8)
+    train.save <- subset(tmp2, train == TRUE)
+    query <- subset(xg, Dx == tmp)
+    train.xgboost <- append(train.xgboost, train.save$barcode)
+    test.keep <- setdiff(query$barcode, train.save$barcode)
+    test <- subset(xg, barcode %in% test.keep)
+    label <- train.save$new.clones
+    label <- label == "malignantClones"
+    label <- as.numeric(label)
+    
+    tcr <- quietTCRgenes(train.save@assays[["RNA"]]@counts@Dimnames[[1]])
+    train <- train.save@assays$RNA@counts
+    train <- train[tcr,]
+    
+    tcr <- quietTCRgenes(test@assays[["RNA"]]@counts@Dimnames[[1]])
+    test <- test@assays$RNA@counts
+    test <- test[tcr,]
+  
+  bstSparse <- xgboost(data = t(train), label = label, max.depth = 2, eta = 1, nthread = 16, nrounds = 2000, early_stopping_rounds = 25, objective = "binary:logistic")
+    importance_matrix <- xgb.importance(model = bstSparse)
+    importance_matrix$orig.ident <- tmp
+    
+    avg <- as.data.frame(AverageExpression(train.save, assays = "RNA", slot = "counts", features = importance_matrix$Feature, group.by = "tcr.and.new.clones"))
+    importance_matrix$larger.malig <- avg$RNA.TRUEmalignantClones > avg$RNA.TRUEnone
+    
+    write.csv(importance_matrix, paste0("~/xgboost.dx.remove.tcr/", tmp, ".csv"))
+    pred <- predict(object = bstSparse, newdata = t(test))
+    names(pred) <- test@Dimnames[[2]]
+  
+  out <- append(out, pred)
+  }
+  
+  
+  all.test <- setdiff(xg$barcode, train.xgboost)
+  
+  xg.test <- subset(xg, barcode %in% all.test)
+  xg.test$xgboost.score <- out
+  xg.test$pred.xgboost <- xg.test$xgboost.score >0.5
+  
+benchmark.xgboost <- as.data.frame.matrix(table(xg.test$pred.xgboost, xg.test$tcr.and.new.clones))
+
+accuracy.xgboost.dx <- 100*(benchmark.xgboost[1,3]+benchmark.xgboost[2,2])/(benchmark.xgboost[1,2]+benchmark.xgboost[2,2]+benchmark.xgboost[1,3]+benchmark.xgboost[2,3])
+
+
+################################################
+#read in files, combine, and add directionality
+
+all.xgb.results <- list.files("~/xgboost.dx.remove.tcr")
+for(i in seq_along(all.xgb.results)){
+  tmp <- all.xgb.results[i]
+  tmp2 <- read.csv(file = paste0("~/xgboost.dx.remove.tcr/", tmp))
+  if(tmp == "FMF.csv"){
+    rbind <- tmp2
+    next()
+  }
+  rbind <- rbind(rbind, tmp2)
+}
+rbind$Gain <- rbind$Gain*100
+
+rbind$calc <- ifelse(rbind$larger.malig == "TRUE", 1, -1)
+rbind$final.value <- rbind$Gain * rbind$calc
+
+rbind.MF <- subset(rbind, orig.ident == "MF")
+rbind.SS <- subset(rbind, orig.ident == "SS")
+rbind.PCALCL <- subset(rbind, orig.ident == "PCALCL")
+rbind.FMF <- subset(rbind, orig.ident == "FMF")
+
+```
+
+
+
+```{r}
+######### By tissue site ###################
+table <- as.data.frame.matrix(table(T.cells$orig.ident, T.cells$tcr.and.new.clones))
+xg <- subset(T.cells, orig.ident %in% all)
+xg.train <- subset(xg, has.tcr == "TRUE")
+  
+out <- vector()
+train.xgboost <- vector()
+tissue <- unique(xg.train$Tissue)
+  for(i in seq_along(tissue)){
+    tmp <- tissue[i]
+    tmp2 <- subset(xg.train, Tissue == tmp)
+    tmp2$train <- sample.split(Y = tmp2$new.clones, SplitRatio = 0.8)
+    train.save <- subset(tmp2, train == TRUE)
+    query <- subset(xg, Tissue == tmp)
+    train.xgboost <- append(train.xgboost, train.save$barcode)
+    test.keep <- setdiff(query$barcode, train.save$barcode)
+    test <- subset(xg, barcode %in% test.keep)
+    label <- train.save$new.clones
+    label <- label == "malignantClones"
+    label <- as.numeric(label)
+    
+    tcr <- quietTCRgenes(train.save@assays[["RNA"]]@counts@Dimnames[[1]])
+    train <- train.save@assays$RNA@counts
+    train <- train[tcr,]
+    
+    tcr <- quietTCRgenes(test@assays[["RNA"]]@counts@Dimnames[[1]])
+    test <- test@assays$RNA@counts
+    test <- test[tcr,]
+  
+  bstSparse <- xgboost(data = t(train), label = label, max.depth = 2, eta = 1, nthread = 16, nrounds = 2000, early_stopping_rounds = 25, objective = "binary:logistic")
+    importance_matrix <- xgb.importance(model = bstSparse)
+    importance_matrix$orig.ident <- tmp
+    
+    avg <- as.data.frame(AverageExpression(train.save, assays = "RNA", slot = "counts", features = importance_matrix$Feature, group.by = "tcr.and.new.clones"))
+    importance_matrix$larger.malig <- avg$RNA.TRUEmalignantClones > avg$RNA.TRUEnone
+    
+    write.csv(importance_matrix, paste0("~/xgboost.tissue.remove.tcr/", tmp, ".csv"))
+    pred <- predict(object = bstSparse, newdata = t(test))
+    names(pred) <- test@Dimnames[[2]]
+  
+  out <- append(out, pred)
+  }
+  
+  
+all.test <- setdiff(xg$barcode, train.xgboost)
+  
+xg.test <- subset(xg, barcode %in% all.test)
+xg.test$xgboost.score <- out
+xg.test$pred.xgboost <- xg.test$xgboost.score >0.5
+  
+benchmark.xgboost <- as.data.frame.matrix(table(xg.test$pred.xgboost, xg.test$tcr.and.new.clones))
+
+accuracy.xgboost.Tissue <- 100*(benchmark.xgboost[1,3]+benchmark.xgboost[2,2])/(benchmark.xgboost[1,2]+benchmark.xgboost[2,2]+benchmark.xgboost[1,3]+benchmark.xgboost[2,3])
+
+
+################################################
+#read in files, combine, and add directionality
+
+all.xgb.results <- list.files("~/xgboost.tissue.remove.tcr")
+for(i in seq_along(all.xgb.results)){
+  tmp <- all.xgb.results[i]
+  tmp2 <- read.csv(file = paste0("~/xgboost.tissue.remove.tcr/", tmp))
+  if(tmp == "blood.csv"){
+    rbind <- tmp2
+    next()
+  }
+  rbind <- rbind(rbind, tmp2)
+}
+rbind$Gain <- rbind$Gain*100
+
+rbind$calc <- ifelse(rbind$larger.malig == "TRUE", 1, -1)
+rbind$final.value <- rbind$Gain * rbind$calc
+
+rbind.blood <- subset(rbind, orig.ident == "blood")
+rbind.skin <- subset(rbind, orig.ident == "skin")
+rbind.LN <- subset(rbind, orig.ident == "lymph node")
+
+FeaturePlot(sr.new, features = "NKG7", slot = "counts", raster = F)
+FeaturePlot(sr.new, features = "NKG7", slot = "data", raster = F)
+```
+
+
+
+
+
+
+
+
+```{r}
+################################################################################
+# Analysis woooooooooooooooooooooooo
+################################################################################
+
+#Find Markers and make SCT heatmap based on top markers for each Dx
+#########################################################################
+T.cells$dx.and.malig <- paste0(T.cells$Dx, T.cells$pred.final)
+Idents(T.cells) <- T.cells$dx.and.malig
+unique(Idents(T.cells))
+
+markers.mf <- FindMarkers(T.cells, ident.1 = "MFmalignantClones", ident.2 = c("HCnone","HCNA"), only.pos = T)
+markers.ss <- FindMarkers(T.cells, ident.1 = "SSmalignantClones", ident.2 = c("HCnone","HCNA"), only.pos = T)
+markers.fmf <- FindMarkers(T.cells, ident.1 = "FMFmalignantClones", ident.2 = c("HCnone","HCNA"), only.pos = T)
+markers.pcalcl <- FindMarkers(T.cells, ident.1 = "PCALCLmalignantClones", ident.2 = c("HCnone","HCNA"), only.pos = T)
+
+markers.mf <- markers.mf[order(-markers.mf$avg_log2FC), ]
+markers.ss <- markers.ss[order(-markers.ss$avg_log2FC), ]
+markers.fmf <- markers.fmf[order(-markers.fmf$avg_log2FC), ]
+markers.pcalcl <- markers.pcalcl[order(-markers.pcalcl$avg_log2FC), ]
+
+play <- FindVariableFeatures(play)
+play <- ScaleData(play)
+play <- RunPCA(object = play)
+DimHeatmap(play, 
+           dims = 1:2, 
+           cells = 500, 
+           balanced = TRUE)
+ElbowPlot(object = play, ndims = 50, reduction = "pca")
+
+DimPlot(object = play, reduction = "umap.T", raster = F, group.by = "knn.leiden.T.5", label = T)
+#DimPlot(object = play, reduction = "umap.T", raster = F, group.by = "knn.leiden.T1")
+DimPlot(object = play, reduction = "umap.T", raster = F, group.by = "knn.leiden.T2", label = T)
+DimPlot(object = play, reduction = "umap.T", raster = F, group.by = "dx.and.malig", label = T)
+
+table(play$orig.ident, play$knn.leiden.T.5)
+
+Idents(play) <- play$knn.leiden.T.5
+markers.all.T.5 <- FindAllMarkers(object = play, assay = "RNA", slot = "data", only.pos = F)
+Idents(play) <- play$knn.leiden.T2
+markers.all.T2 <- FindAllMarkers(object = play, assay = "RNA", slot = "data", only.pos = F)
+markers.all.T.5$cluster <- as.numeric(markers.all.T.5$cluster)
+markers.all.T2$cluster <- as.numeric(markers.all.T2$cluster)
+
+
+freq_table <- T.cells[[]]
+freq_table <- freq_table[,c("nCount_RNA", "orig.ident", "percent.mt")]
+zzz <- freq_table %>%
+    group_by(orig.ident) %>%
+    summarise(n = mean(nCount_RNA))
+
+
+
+
+
+all <- c(head(rownames(markers.mf), 50),head(rownames(markers.ss), 50), head(rownames(markers.pcalcl), 50),head(rownames(markers.fmf), 50))
+all <- quietTCRgenes(all)
+hla <- which(str_detect(all, "HLA"))
+all <- all[-hla]
+
+keep <- c("MFmalignantClones", "SSmalignantClones","FMFmalignantClones","PCALCLmalignantClones", "HCnone","HCNA")
+subset <- subset(T.cells, dx.and.malig %in% keep)
+
+df <- data.frame(cell_type=subset$Dx)
+table(df$cell_type)
+df$barcode <- rownames(df)
+df <- df %>% group_by(cell_type) %>% slice_sample(n=8000, replace = F)
+play <- subset(subset, barcode %in% df$barcode)
+
+
+unique(play$Dx)
+play$Dx <- factor(play$Dx, levels = c("HC", "MF", "SS", "PCALCL", "FMF"))
+
+features <- play@assays$RNA@counts@Dimnames[1]
+features <- features[[1]]
+
+
+DoHeatmap(play, group.by = "Dx", features = all, label = T, assay = "RNA", slot = "data")
+ggsave("heatmap.sct.malig.by.dx.png", height = 15, width = 15)
+
+
+play <- ScaleData(object = play, features = features, assay = "RNA", do.scale = F, do.center = T)
+DoHeatmap(play, group.by = "Dx", features = all, label = T, assay = "RNA", slot = "scale.data")
+
+ggsave("heatmap.sct.scale.malig.by.dx.png", height = 15, width = 15)
+
+play2 <- ScaleData(object = play, features = features, assay = "RNA", do.scale = F, do.center = T, vars.to.regress = c("nCount_RNA", "nFeature_RNA"))
+DoHeatmap(play2, group.by = "Dx", features = all, label = T, assay = "RNA", slot = "scale.data")
+ggsave("heatmap.sct.reg.count.feats.scale.malig.by.dx.png", height = 15, width = 15)
+```
+
+```{r}
+################################################################################
+# Make UMAPs
+################################################################################
+df <- data.frame(cell_type=subset$Dx)
+table(df$cell_type)
+df$barcode <- rownames(df)
+df <- df %>% group_by(cell_type) %>% slice_sample(n=12000, replace = F)
+play <- subset(subset, barcode %in% df$barcode)
+
+
+DimPlot(object = play, group.by = "Dx", raster = F)
+DimPlot(object = play, split.by = "Dx", raster = F)
+ggsave("umap.split.by.dx.png", height = 5, width = 15)
+
+remove.na <- subset(play, pred.final == "malignantClones"|pred.final == "none")
+DimPlot(object = remove.na, group.by = "pred.final", raster = F)
+DimPlot(object = remove.na, split.by = "pred.final", raster = F)
+ggsave("umap.split.by.malig.png", height = 5, width = 10)
+
+remove.ln <- subset(play, Tissue == "blood"|Tissue == "skin")
+DimPlot(object = remove.ln, group.by = "Tissue", raster = F)
+DimPlot(object = remove.ln, split.by = "Tissue", raster = F)
+ggsave("umap.split.by.tissue.png", height = 5, width = 10)
+
+# Make Dotplot of only malignant cells and cd4/8 expression
+only.malig <- subset(T.cells, pred.final == "malignantClones")
+Idents(only.malig) <- only.malig$Patient.ID
+DotPlot(only.malig, features = c("CD4", "CD8A", "CD8B"), group.by = "Patient.ID") + RotatedAxis()
+ggsave("dotplot.cd4.8.by.Patient.ID.png", height = 15, width = 7)
+```
+
+```{r}
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "CD4", split.by = "pred.final")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "CD8A", split.by = "pred.final")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "CD8B", split.by = "pred.final")
+
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "NKG7", split.by = "pred.final")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "GZMA", split.by = "pred.final")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "GZMB", split.by = "pred.final")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "GNLY", split.by = "pred.final")
+
+# Central Memory
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.ln, features = "PTPRC", split.by = "Tissue")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.ln, features = "CCR7", split.by = "Tissue")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.ln, features = "SELL", split.by = "Tissue")
+
+# Tissue Resident Memory
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.ln, features = "CD69", split.by = "Tissue")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.ln, features = "ITGAE", split.by = "Tissue")
+
+mf.ss <- subset(only.malig, Dx == "SS"|Dx == "MF")
+# Central Memory
+scCustomize::FeaturePlot_scCustom(seurat_object = mf.ss, features = "PTPRC", split.by = "Dx")
+scCustomize::FeaturePlot_scCustom(seurat_object = mf.ss, features = "CCR7", split.by = "Dx")
+scCustomize::FeaturePlot_scCustom(seurat_object = mf.ss, features = "SELL", split.by = "Dx")
+
+# Tissue Resident Memory
+scCustomize::FeaturePlot_scCustom(seurat_object = mf.ss, features = "CD69", split.by = "Dx")
+scCustomize::FeaturePlot_scCustom(seurat_object = mf.ss, features = "ITGAE", split.by = "Dx")
+
+
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "CD7", split.by = "pred.final")
+```
+
+
+
+```{r}
+# NK Cell Markers
+scCustomize::FeaturePlot_scCustom(seurat_object = T.cells, features = "NKG7")
+scCustomize::FeaturePlot_scCustom(seurat_object = T.cells, features = "NKG7", slot = "data")
+scCustomize::FeaturePlot_scCustom(seurat_object = T.cells, features = "GNLY")
+scCustomize::FeaturePlot_scCustom(seurat_object = T.cells, features = "GNLY", slot = "data")
+scCustomize::FeaturePlot_scCustom(seurat_object = T.cells, features = "NCAM1") #CD56
+scCustomize::FeaturePlot_scCustom(seurat_object = T.cells, features = "NCAM1", slot = "data") #CD56
+scCustomize::FeaturePlot_scCustom(seurat_object = T.cells, features = "FCGR3A") #CD16a
+scCustomize::FeaturePlot_scCustom(seurat_object = T.cells, features = "FCGR3A", slot = "data") #CD16a
+
+
+# NK Cell Markers
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "NKG7")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "NKG7", slot = "data")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "GNLY")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "GNLY", slot = "data")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "NCAM1") #CD56
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "NCAM1", slot = "data") #CD56
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "FCGR3A") #CD16a
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "FCGR3A", slot = "data") #CD16a
+
+
+# NKT Cell Markers
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "ITGA1") #CD49a
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "IL2RB") #CD122
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "CD27")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "CXCR3")
+
+# GD T cells
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "TRDC")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "TRGC1")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "TRGC2")
+
+# CD8 Effector T cells
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "CD8A")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "CD8B")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "FASLG")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "GZMA")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "GZMB")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "PRF1")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "EOMES") #TF
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "TBX21") #TF
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "IL7R") #CD127
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "KLRG1")
+
+# CD4 T cells - Naive
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "CCR7")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "SELL") #CD62L
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "PTPRC") #CD45RA
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "IL7R") #CD127
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "IL2RG") #CD132
+
+# CD4 T cells - TH1
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "TBX21")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "IL2")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "IFNG")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "CCR5")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "CXCR3")
+
+# CD4 T cells - TH2
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "GATA3")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "STAT5A")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "STAT5B")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "STAT6")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "CCR3")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "CCR4")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "CCR8")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "CXCR4")
+
+# CD4 T cells - TH17
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "RORC")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "IL17A")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "IL17F")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "IL23R")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "CCL20")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "CCR6") 
+
+# CD4 T cells - Treg
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "IL2RA") #CD25
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "FOXP3") 
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "TGFBI")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "TGFB1")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "LAG3")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "CTLA4")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "TNFRSF18") #GITR
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "ENTPD1") #CD39
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "NT5E") #CD73
+
+# T cells - Central Memory
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "STAT5A")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "STAT5B") 
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "CCR7")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "SELL")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "CD44")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "PTPRC") #CD45RO
+
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "CX3CR1")
+
+# T cells - Resident Memory
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "CD69")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "ITGAE") 
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "ITGA1")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "CXCR3")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "CD44")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "PTPRC") #CD45RO
+
+# T cells - Stem Memory
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "CCR7", split.by = "pred.final")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "SELL", split.by = "pred.final") 
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "IL7R", split.by = "pred.final")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "CD27", split.by = "pred.final")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "CD28", split.by = "pred.final")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "FAS", split.by = "pred.final")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "CXCR3", split.by = "pred.final")
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "ITGAL", split.by = "pred.final") #LFA-1
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "ITGB2", split.by = "pred.final") #LFA-1
+scCustomize::FeaturePlot_scCustom(seurat_object = remove.na, features = "IL2RB", split.by = "pred.final")
+
+```
+
+
+```{r}
+
+malignant.only <- subset(T.cells, pred.final == "malignantClones")
+
+fastMNN_output <- readRDS("~/fastMNN_output.rds")
+keep <- malignant.only$barcode
+fastMNN_output <- fastMNN_output[, (colnames(fastMNN_output) %in% keep)]
+malignant.only <- subset(malignant.only, barcode %in% fastMNN_output@colData@rownames)
+out <- fastMNN_output
+rm(fastMNN_output)
+
+set.seed(123)
+umap <- runUMAP(x = out, dimred = "corrected")
+umap.malig <- CreateDimReducObject(embeddings = umap@int_colData$reducedDims@listData$UMAP, 
+                            loadings = umap@int_colData$reducedDims@listData$UMAP, 
+                            projected = umap@int_colData$reducedDims@listData$UMAP, 
+                            assay = "RNA", 
+                            key = "umap.malig")
+malignant.only[["umap.malig"]] <- umap.malig
+
+
+knn.gr <- makeKNNGraph(out@int_colData$reducedDims$corrected, k = 10)
+
+clusters <- cluster_leiden(graph = knn.gr,objective_function = "modularity",weights = NULL,resolution_parameter = 0.5,beta = 0.01,initial_membership = NULL,n_iterations = 2,vertex_weights = NULL)
+com <- membership(communities = clusters)
+malignant.only$knn.leiden.malig.5 <- com
+
+clusters <- cluster_leiden(graph = knn.gr,objective_function = "modularity",weights = NULL,resolution_parameter = 1,beta = 0.01,initial_membership = NULL,n_iterations = 2,vertex_weights = NULL)
+com <- membership(communities = clusters)
+malignant.only$knn.leiden.malig1 <- com
+
+clusters <- cluster_leiden(graph = knn.gr,objective_function = "modularity",weights = NULL,resolution_parameter = 2,beta = 0.01,initial_membership = NULL,n_iterations = 2,vertex_weights = NULL)
+com <- membership(communities = clusters)
+malignant.only$knn.leiden.malig2 <- com
+
+DimPlot(malignant.only, reduction = "umap.malig", group.by = "knn.leiden.malig.5", raster = F)
+DimPlot(malignant.only, reduction = "umap.malig", group.by = "knn.leiden.malig1", raster = F)
+DimPlot(malignant.only, reduction = "umap.malig", group.by = "knn.leiden.malig2", raster = F)
+DimPlot(malignant.only, reduction = "umap.malig", group.by = "Dx", raster = F)
+DimPlot(malignant.only, reduction = "umap.malig", group.by = "Tissue", raster = F)
+
+scCustomize::FeaturePlot_scCustom(seurat_object = malignant.only, features = "CD4", reduction = "umap.malig")
+scCustomize::FeaturePlot_scCustom(seurat_object = malignant.only, features = "CD8A", reduction = "umap.malig")
+scCustomize::FeaturePlot_scCustom(seurat_object = malignant.only, features = "CD8B", reduction = "umap.malig")
+
+scCustomize::FeaturePlot_scCustom(seurat_object = malignant.only, features = "NKG7", reduction = "umap.malig")
+scCustomize::FeaturePlot_scCustom(seurat_object = malignant.only, features = "GZMA", reduction = "umap.malig")
+scCustomize::FeaturePlot_scCustom(seurat_object = malignant.only, features = "GZMB", reduction = "umap.malig")
+scCustomize::FeaturePlot_scCustom(seurat_object = malignant.only, features = "GNLY", reduction = "umap.malig")
+
+# Central Memory
+scCustomize::FeaturePlot_scCustom(seurat_object = malignant.only, features = "PTPRC", reduction = "umap.malig")
+scCustomize::FeaturePlot_scCustom(seurat_object = malignant.only, features = "CCR7", reduction = "umap.malig")
+scCustomize::FeaturePlot_scCustom(seurat_object = malignant.only, features = "SELL", reduction = "umap.malig")
+
+# Tissue Resident Memory
+scCustomize::FeaturePlot_scCustom(seurat_object = malignant.only, features = "CD69", reduction = "umap.malig")
+scCustomize::FeaturePlot_scCustom(seurat_object = malignant.only, features = "ITGAE", reduction = "umap.malig")
+
+# Central Memory
+scCustomize::FeaturePlot_scCustom(seurat_object = malignant.only, features = "PTPRC", reduction = "umap.malig")
+scCustomize::FeaturePlot_scCustom(seurat_object = malignant.only, features = "CCR7", reduction = "umap.malig")
+scCustomize::FeaturePlot_scCustom(seurat_object = malignant.only, features = "SELL", reduction = "umap.malig")
+
+# Tissue Resident Memory
+scCustomize::FeaturePlot_scCustom(seurat_object = malignant.only, features = "CD69", reduction = "umap.malig")
+scCustomize::FeaturePlot_scCustom(seurat_object = malignant.only, features = "ITGAE", reduction = "umap.malig")
+
+
+scCustomize::FeaturePlot_scCustom(seurat_object = malignant.only, features = "CD7", reduction = "umap.malig")
+scCustomize::FeaturePlot_scCustom(seurat_object = malignant.only, features = "TRDC", reduction = "umap.malig")
+DimPlot(malignant.only, reduction = "umap.malig", group.by = "Patient.ID", raster = F)
+
+DimPlot(malignant.only, reduction = "umap.malig", group.by = "cloneType", raster = F)+NoLegend()
+DimPlot(malignant.only, reduction = "umap.T", group.by = "cloneType", raster = F)+NoLegend()
+
+Idents(malignant.only) <- malignant.only$knn.leiden.malig1
+markers.all.malig <- FindAllMarkers(object = malignant.only)
+markers.all.malig$cluster <- as.numeric(markers.all.malig$cluster)
+DimPlot(malignant.only, reduction = "umap.malig", group.by = "knn.leiden.malig1", raster = F, label = T)
+
+
+
+################################################################################
+# Make metagene expression correlation heatmap
+################################################################################
+
+############# GPU-enabled ###########################
+malignant.only <- subset(T.cells, pred.final == "malignantClones")
+x <- malignant.only@assays$RNA@data
+x <- replace(x, x == 0, NA)
+summary(rowSums(x))
+med <- which(rowSums(x) > 91.4)
+random <- sample(1:182411, 10000, replace=FALSE)
+
+x <- x[med,random]
+
+x.gpu <- GPUmatrix::as.gpu.matrix(x)
+out <- GPUmatrix::cor(x = t(x.gpu), method = "pearson")
+out <- as.matrix(out)
+
+png(file = "~/out.GPU.png", width = 2000, height = 2000)
+pheatmap::pheatmap(mat = out, cluster_cols = T, cluster_rows = T)
+dev.off()
+
+sig_values <- which(out>=0.6, arr.in=TRUE)
+df <- cbind.data.frame(colIDs = colnames(out)[sig_values[, 1]],
+                 rowIDs = rownames(out)[sig_values[, 2]], 
+                 values = out[sig_values])
+
+df$same <- df$colIDs == df$rowIDs
+df <- subset(df, same == FALSE)
+table(df$colIDs)
+df2 <- as.data.frame.array(table(df$colIDs))
+colnames(df2) <- "count"
+df2 <- subset(df2, count > 2)
+
+keep <- unique(rownames(df2))
+
+
+
+out.subset <- out[which(rownames(out) %in% keep), which(rownames(out) %in% keep)]
+png(file = "~/out.GPU.spearman.subset.png", width = 3000, height = 3000)
+pheatmap::pheatmap(mat = out.subset, cluster_cols = T, cluster_rows = T)
+dev.off()
+
+
+```
+
+
+
+
+```{r}
+################ Make Dx specific UMAPs and clusters ##########################
+
+mf <- subset(malignant.only, Dx == "MF")
+ss <- subset(malignant.only, Dx == "SS")
+fmf <- subset(malignant.only, Dx == "FMF")
+pcalcl <- subset(malignant.only, Dx == "PCALCL")
+
+fastMNN_output <- readRDS("~/fastMNN_output.rds")
+
+list <- c("mf", "ss", "fmf", "pcalcl")
+list <- toupper(list)
+for(i in seq_along(list)){
+  dx <- list[i]
+  tmp <- subset(malignant.only, Dx == dx)
+keep <- tmp$barcode
+fastMNN_output.2 <- fastMNN_output[, (colnames(fastMNN_output) %in% keep)]
+tmp <- subset(tmp, barcode %in% fastMNN_output.2@colData@rownames)
+out <- fastMNN_output.2
+set.seed(124313)
+umap <- runUMAP(x = out, dimred = "corrected")
+umap.dx <- CreateDimReducObject(embeddings = umap@int_colData$reducedDims@listData$UMAP, 
+                            loadings = umap@int_colData$reducedDims@listData$UMAP, 
+                            projected = umap@int_colData$reducedDims@listData$UMAP, 
+                            assay = "RNA", 
+                            key = "umap.dx")
+tmp[["umap.dx"]] <- umap.dx
+
+knn.gr <- makeKNNGraph(out@int_colData$reducedDims$corrected)
+clusters <- cluster_leiden(graph = knn.gr,objective_function = "modularity",weights = NULL,resolution_parameter = 0.5,beta = 0.01,initial_membership = NULL,n_iterations = 2,vertex_weights = NULL)
+com <- membership(communities = clusters)
+tmp$knn.leiden.dx.5 <- com
+
+clusters <- cluster_leiden(graph = knn.gr,objective_function = "modularity",weights = NULL,resolution_parameter = 1,beta = 0.01,initial_membership = NULL,n_iterations = 2,vertex_weights = NULL)
+com <- membership(communities = clusters)
+tmp$knn.leiden.dx1 <- com
+
+clusters <- cluster_leiden(graph = knn.gr,objective_function = "modularity",weights = NULL,resolution_parameter = 2,beta = 0.01,initial_membership = NULL,n_iterations = 2,vertex_weights = NULL)
+com <- membership(communities = clusters)
+tmp$knn.leiden.dx2 <- com
+
+clusters <- cluster_leiden(graph = knn.gr,objective_function = "modularity",weights = NULL,resolution_parameter = 3,beta = 0.01,initial_membership = NULL,n_iterations = 2,vertex_weights = NULL)
+com <- membership(communities = clusters)
+tmp$knn.leiden.dx3 <- com
+
+saveRDS(object = tmp, file = paste0("~/", dx, ".rds"))
+
+}
+
+
+```
+
+
+```{r}
+
+PCALCL <- readRDS("~/PCALCL.rds")
+DimPlot(PCALCL, reduction = "umap.dx", group.by = "knn.leiden.dx.5")
+DimPlot(PCALCL, reduction = "umap.dx", group.by = "knn.leiden.dx3")
+Idents(PCALCL) <- PCALCL$knn.leiden.dx.5
+markers.PCALCL <- FindAllMarkers(PCALCL)
+
+FeaturePlot_scCustom(seurat_object = PCALCL, features = "CD4")
+FeaturePlot_scCustom(seurat_object = PCALCL, features = "CD4", reduction = "umap.dx")
+FeaturePlot_scCustom(seurat_object = PCALCL, features = "CD8A")
+FeaturePlot_scCustom(seurat_object = PCALCL, features = "CD8A", reduction = "umap.dx")
+FeaturePlot_scCustom(seurat_object = PCALCL, features = "CD8B")
+FeaturePlot_scCustom(seurat_object = PCALCL, features = "CD8B", reduction = "umap.dx")
+
+FMF <- readRDS("~/FMF.rds")
+DimPlot(FMF, reduction = "umap.dx", group.by = "knn.leiden.dx.5")
+DimPlot(FMF, reduction = "umap.dx", group.by = "knn.leiden.dx3")
+Idents(FMF) <- FMF$knn.leiden.dx.5
+markers.FMF <- FindAllMarkers(FMF)
+
+FeaturePlot_scCustom(seurat_object = FMF, features = "CD4")
+FeaturePlot_scCustom(seurat_object = FMF, features = "CD4", reduction = "umap.dx")
+FeaturePlot_scCustom(seurat_object = FMF, features = "CD8A")
+FeaturePlot_scCustom(seurat_object = FMF, features = "CD8A", reduction = "umap.dx")
+FeaturePlot_scCustom(seurat_object = FMF, features = "CD8B")
+FeaturePlot_scCustom(seurat_object = FMF, features = "CD8B", reduction = "umap.dx")
+
+MF <- readRDS("~/MF.rds")
+DimPlot(MF, reduction = "umap.dx", group.by = "knn.leiden.dx.5", raster = F)
+DimPlot(MF, reduction = "umap.dx", group.by = "knn.leiden.dx3", raster = F)
+Idents(MF) <- MF$knn.leiden.dx.5
+markers.MF <- FindAllMarkers(MF, only.pos = T, logfc.threshold = 0.5)
+
+FeaturePlot_scCustom(seurat_object = MF, features = "CD4")
+FeaturePlot_scCustom(seurat_object = MF, features = "CD4", reduction = "umap.dx")
+FeaturePlot_scCustom(seurat_object = MF, features = "CD8A")
+FeaturePlot_scCustom(seurat_object = MF, features = "CD8A", reduction = "umap.dx")
+FeaturePlot_scCustom(seurat_object = MF, features = "CD8B")
+FeaturePlot_scCustom(seurat_object = MF, features = "CD8B", reduction = "umap.dx")
+
+SS <- readRDS("~/SS.rds")
+DimPlot(SS, reduction = "umap.dx", group.by = "knn.leiden.dx.5", raster = F)
+DimPlot(SS, reduction = "umap.dx", group.by = "knn.leiden.dx3", raster = F)
+Idents(SS) <- SS$knn.leiden.dx.5
+markers.SS <- FindAllMarkers(SS, only.pos = T, logfc.threshold = 0.5)
+
+FeaturePlot_scCustom(seurat_object = SS, features = "CD4")
+FeaturePlot_scCustom(seurat_object = SS, features = "CD4", reduction = "umap.dx")
+FeaturePlot_scCustom(seurat_object = SS, features = "CD8A")
+FeaturePlot_scCustom(seurat_object = SS, features = "CD8A", reduction = "umap.dx")
+FeaturePlot_scCustom(seurat_object = SS, features = "CD8B")
+FeaturePlot_scCustom(seurat_object = SS, features = "CD8B", reduction = "umap.dx")
+
+
+FeaturePlot_scCustom(seurat_object = malignant.only, features = "TRBC1")
+FeaturePlot_scCustom(seurat_object = malignant.only, features = "TRBC2")
+
+```
+
+
+
+```{r}
+
+adt <- subset(T.cells, nCount_ADT > 0)
+table(T.cells$orig.ident)
+
+DefaultAssay(adt) <- "ADT"
+protein <- as.vector(unique(adt@assays$ADT@data@Dimnames[1]))
+protein <- protein[[1]]
+for(i in seq_along(protein)){
+  tmp <- protein[i]
+FeaturePlot_scCustom(adt, features = tmp)
+ggsave(paste0("~/adt.print/", tmp, ".png"))
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+# Github personal download key is below:
+# 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
+#remotes::install_github('satijalab/seurat-wrappers')
+malignant.only <- subset(T.cells, pred.final == "malignantClones")
+malignant.path <- subset(malignant.only, Path.Stage == "IB" | Path.Stage == "II" |Path.Stage == "IIB" |Path.Stage == "IIIA" |Path.Stage == "IVA")
+skin.malignant.path <- subset(malignant.path, Tissue == "skin")
+blood.malignant.path <- subset(malignant.path, Tissue == "blood")
+DimPlot(skin.malignant.path, group.by = "knn.leiden.T1", split.by = "Path.Stage", raster = F)
+DimPlot(blood.malignant.path, group.by = "knn.leiden.T1", split.by = "Path.Stage", raster = F)
+
+table(skin.malignant.path$Path.Stage)
+df <- data.frame(cell_type=skin.malignant.path$Path.Stage)
+table(df$cell_type)
+df$barcode <- rownames(df)
+df <- df %>% group_by(cell_type) %>% slice_sample(n=500, replace = F)
+skin.malignant.path.ss <- subset(skin.malignant.path, barcode %in% df$barcode)
+
+freq_table <- skin.malignant.path.ss[[]]
+freq_table <- freq_table[,c("knn.leiden.T.5", "knn.leiden.T2", "Path.Stage")]
+zzz <- freq_table %>%
+    group_by(knn.leiden.T.5, Path.Stage) %>%
+    summarise(n = n())
+ggplot(zzz, aes(fill=Path.Stage, y=n, x=knn.leiden.T.5)) + 
+    geom_bar(position="fill", stat="identity")+
+  theme(axis.text.x = element_text(angle = 90))
+
+DimPlot(skin.malignant.path.ss, group.by = "knn.leiden.T.5", split.by = "Path.Stage", raster = F)
+
+######## Pseudotime for skin.staging ############
+cds2 <- skin.malignant.path.ss
+cds2@assays$ADT <- NULL
+cds2@reductions$UMAP <- cds2@reductions$umap.T
+SCE <- as.SingleCellExperiment(cds2)
+cds2 <- as.cell_data_set(cds2)
+
+cds2 <- cluster_cells(cds2, reduction_method = "UMAP")
+plot_cells(cds2, show_trajectory_graph = F)
+plot_cells(cds2, show_trajectory_graph = F, color_cells_by = "partition")
+
+rowData(cds2)$gene_name <- rownames(cds2)
+rowData(cds2)$gene_short_name <- rowData(cds2)$gene_name
+
+
+gene_fits <- fit_models(cds = cds2, model_formula_str = "~Path.Stage", cores = 30)
+fits.co <- coefficient_table(gene_fits)
+timepoint.terms <- subset(fits.co, term != "(Intercept)")
+timepoint.terms <- timepoint.terms %>% filter (q_value < 0.0005) %>%
+         select(gene_short_name, term, q_value, estimate)
+timepoint.terms <- timepoint.terms[order(timepoint.terms$q_value),]
+top10 <- head(unique(timepoint.terms$gene_short_name), 10)
+top10 <- c(top10, "CD7", "TRBV20-1")
+
+cds2.subset <- cds2[rowData(cds2)$gene_short_name %in% top10,]
+plot_genes_violin(cds2.subset, group_cells_by="Path.Stage", ncol=5, panel_order = top10, log_scale = T, normalize = T) +
+      theme(axis.text.x=element_text(angle=45, hjust=1))
+```
+
+
+```{r}
+pt36 <- subset(T.cells, Patient.ID == "Pt36")
+
+fastMNN_output <- readRDS("~/fastMNN_output.rds")
+keep <- pt36$barcode
+fastMNN_output <- fastMNN_output[, (colnames(fastMNN_output) %in% keep)]
+pt36 <- subset(pt36, barcode %in% fastMNN_output@colData@rownames)
+out <- fastMNN_output
+rm(fastMNN_output)
+
+set.seed(123453)
+umap <- scater::runUMAP(x = out, dimred = "corrected")
+umap.pt36 <- CreateDimReducObject(embeddings = umap@int_colData$reducedDims@listData$UMAP, 
+                            loadings = umap@int_colData$reducedDims@listData$UMAP, 
+                            projected = umap@int_colData$reducedDims@listData$UMAP, 
+                            assay = "RNA", 
+                            key = "umap.pt36")
+benign[["umap.pt36"]] <- umap.pt36
+
+
+pt36 <- subset(pt36, pred.final == "malignantClones")
+DefaultAssay(pt36) <- "RNA"
+FeaturePlot(object = pt36, features = "PTPRC")
+FeaturePlot(object = pt36, features = "IL7R")
+FeaturePlot(object = pt36, features = "SELL")
+
+DimPlot(object = pt36, group.by = "knn.leiden.T1", split.by = "Timepoint")
+DimPlot(object = pt36, group.by = "cloneType")
+
+table(pt36$has.tcr, pt36$Timepoint)
+
+table(pt36$Timepoint)
+df <- data.frame(cell_type=pt36$Timepoint)
+table(df$cell_type)
+df$barcode <- rownames(df)
+df <- df %>% group_by(cell_type) %>% slice_sample(n=500, replace = F)
+pt36.ss <- subset(pt36, barcode %in% df$barcode)
+DimPlot(pt36.ss, split.by = "Timepoint", group.by = "knn.leiden.T2")
+
+cds <- pt36.ss
+cds@assays$ADT <- NULL
+cds@reductions$UMAP <- cds@reductions$umap.T
+SCE <- as.SingleCellExperiment(cds)
+cds <- as.cell_data_set(cds)
+
+cds <- cluster_cells(cds, reduction_method = "UMAP")
+plot_cells(cds, show_trajectory_graph = F)
+plot_cells(cds, show_trajectory_graph = F, color_cells_by = "partition")
+
+rowData(cds)$gene_name <- rownames(cds)
+rowData(cds)$gene_short_name <- rowData(cds)$gene_name
+
+
+gene_fits <- fit_models(cds = cds, model_formula_str = "~Timepoint", cores = 30)
+fits.co <- coefficient_table(gene_fits)
+timepoint.terms <- fits.co %>% filter(term == "Timepoint1"|term == "Timepoint2"|term == "Timepoint3"|term == "Timepoint4")
+timepoint.terms <- timepoint.terms %>% filter (q_value < 0.0005) %>%
+         select(gene_short_name, term, q_value, estimate)
+timepoint.terms <- timepoint.terms[order(timepoint.terms$q_value),]
+top10 <- head(unique(timepoint.terms$gene_short_name), 10)
+
+cds.subset <- cds[rowData(cds)$gene_short_name %in% top10,]
+plot_genes_violin(cds.subset, group_cells_by="Timepoint", ncol=5, panel_order = top10, log_scale = T, normalize = T) +
+      theme(axis.text.x=element_text(angle=45, hjust=1))
+
+```
+
+
+```{r}
+cds <- learn_graph(cds, use_partition = F)
+cds <- order_cells(cds)
+
+plot_cells(cds = cds, color_cells_by = "pseudotime")
+
+cds_pt_res <- graph_test(cds, neighbor_graph = "principal_graph", cores = 32)
+cds.subset.pt.res <- subset(cds_pt_res, q_value < 0.01)
+cds.subset.pt.res <- cds.subset.pt.res[order(-cds.subset.pt.res$morans_test_statistic),]
+top10 <- head(x=rownames(cds.subset.pt.res), 10)
+
+plot_cells(cds, genes = c(top10), show_trajectory_graph = F, label_cell_groups = F, label_leaves = F, reduction_method = "UMAP")
+
+cds.subset <- choose_cells(cds)
+cds.subset_pt_res <- graph_test(cds.subset, neighbor_graph = "principal_graph", cores = 32)
+cds.subset_pt_res <- subset(cds.subset_pt_res, q_value < 0.01)
+cds.subset_pt_res <- cds.subset_pt_res[order(-cds.subset_pt_res$morans_test_statistic),]
+
+
+plot_cells(cds.subset, genes = c(top10), show_trajectory_graph = F, label_cell_groups = F, label_leaves = F, reduction_method = "UMAP")
+
+cds.subset.subset <- cds[rowData(cds)$gene_short_name %in% c(top10)]
+
+plot_genes_in_pseudotime(cds_subset = cds.subset.subset, panel_order = c(top10))
+
+DimPlot(pt36, group.by = "knn.leiden.T2", label = T)
+table(pt36$knn.leiden.T2)
+Idents(pt36) <- pt36$knn.leiden.T2
+markers.pt36 <- FindAllMarkers(object = pt36)
+markers.pt36$cluster <- as.numeric(markers.pt36$cluster)
+
+c20 <- subset(pt36, knn.leiden.T2 == "20")
+FeaturePlot_scCustom(pt36, features = "CD4")
+FeaturePlot_scCustom(pt36, features = "CD8A")
+FeaturePlot_scCustom(pt36, features = "CD8B")
+FeaturePlot_scCustom(pt36, features = "CCL5")
+FeaturePlot_scCustom(pt36, features = "NKG7")
+FeaturePlot_scCustom(pt36, features = "LRRN3")
+```
+
+
+
+```{r}
+DimPlot(T.cells, group.by = "knn.leiden.T2", raster = F)
+VlnPlot(object = T.cells, features = "TRDC", group.by = "knn.leiden.T2", slot = "counts", y.max = 15, pt.size = 0)
+ggsave("~/TRDC.violin.png", height = 2000, width = 4000, units = "px")
+
+DimPlot(T.cells, group.by = "knn.leiden.T.5", raster = F, label = T)
+DotPlot(object = T.cells, features = c("TRDC", "TRDJ1", "TRDJ2", "TRDJ3", "TRDV1", "TRDV2", "TRDV3"), group.by = "knn.leiden.T.5")
+
+DimPlot(T.cells, group.by = "knn.leiden.T1", raster = F, label = T)
+DotPlot(object = T.cells, features = c("TRDC", "TRDJ1", "TRDJ2", "TRDJ3", "TRDV1", "TRDV2", "TRDV3"), group.by = "knn.leiden.T1")
+
+DimPlot(T.cells, group.by = "knn.leiden.T2", raster = F, label = T)
+DotPlot(object = T.cells, features = c("TRDC", "TRDJ1", "TRDJ2", "TRDJ3", "TRDV1", "TRDV2", "TRDV3"), group.by = "knn.leiden.T2")
+
+
+mat.pt.knn.T2 <- (as.matrix(log(table(T.cells$orig.ident, T.cells$knn.leiden.T2))))
+mat.pt.knn.T2[is.infinite(mat.pt.knn.T2)] <- 0
+pheatmap::pheatmap(mat.pt.knn.T2, cluster_cols = T, cluster_rows = T)
+
+mat.pt.knn.T2.malig <- (as.matrix(log(table(malignant.only$orig.ident, malignant.only$knn.leiden.T2))))
+mat.pt.knn.T2.malig[is.infinite(mat.pt.knn.T2.malig)] <- 0
+pheatmap::pheatmap(mat.pt.knn.T2.malig, cluster_cols = T, cluster_rows = T)
+
+freq_table <- malignant.only[[]]
+freq_table <- freq_table[,c("orig.ident", "CTgene", "CTaa")]
+zzz <- freq_table %>%
+    group_by(orig.ident, CTaa) %>%
+    summarise(n = n())
+ggplot(zzz, aes(fill=CTaa, y=n, x=orig.ident)) + 
+    geom_bar(position="fill", stat="identity")+
+  theme(axis.text.x = element_text(angle = 90))+NoLegend()+
+  coord_flip()
+ggsave("~/prop.ctaa.orig.ident.png", height = 3000, width = 1800, units = "px")
+table(zzz$orig.ident)
+
+table(T.cells$orig.ident, T.cells$tcr.and.new.clones)
+
+```
+
+```{r}
+# Function to count unique words while ignoring semicolons
+count_unique_words <- function(text) {
+  # Split the text on semicolons and unlist the result
+  words <- unlist(strsplit(text, ";"))
+  # Remove any leading or trailing whitespace
+  words <- trimws(words)
+  return(words)
+}
+
+# Apply the function to the DataFrame column and combine the results into a single character vector
+all_words <- unlist(lapply(s76@meta.data$v_gene, count_unique_words))
+
+# Count unique words and their occurrences
+word_counts <- table(all_words)
+
+# Convert the result to a data frame
+result_df <- data.frame(Word = names(word_counts), Count = as.vector(word_counts))
+result_df$total <- sum(result_df$Count)
+result_df$percent <- 100*result_df$Count/result_df$total
+hyper <- subset(result_df, percent > 5)
+hyper.keep <- hyper$Word
+# Print the result
+print(result_df)
+
+
+# Add a new column "keep" with TRUE/FALSE values
+s76@meta.data$keep <- apply(s76@meta.data, 1, function(row) {
+  any(sapply(strsplit(row["v_gene"], ";")[[1]], function(v) v %in% hyper.keep))
+})
+
+s76.train <- subset(s76, cloneType != "none")
+s76.train$combine <- paste0(s76.train$cloneType, s76.train$keep)
+table(s76.train$combine)
+unique(s76$cloneType)
+s76.train <- subset(s76.train, combine != "Hyperexpanded (0.1 < X <= 1)FALSE" & combine != "Medium (0.001 < X <= 0.01)TRUE" & combine != "Rare (0 < X <= 1e-04)TRUE" & combine != "Small (1e-04 < X <= 0.001)TRUE" & combine != "Large (0.01 < X <= 0.1)TRUE")
+s76.train$combine2 <- paste0(s76.train$cloneType, s76.train$new.clones)
+
+test <- setdiff(s76$barcode, s76.train$barcode)
+
+s76.test <- subset(s76, barcode %in% test)
+
+intersect(x = s76.train$barcode, s76.test$barcode)
+
+
+table(s76.train$cloneType, s76.train$new.clones)
+
+label <- s76.train$keep
+label <- as.numeric(label)
+  
+tcr <- quietTCRgenes(s76.train@assays[["RNA"]]@data@Dimnames[[1]])
+train <- s76.train@assays$RNA@data
+train <- train[tcr,]
+  
+tcr <- quietTCRgenes(s76.test@assays[["RNA"]]@data@Dimnames[[1]])
+test <- s76.test@assays$RNA@data
+test <- test[tcr,]
+
+bstSparse <- xgboost(data = t(train), label = label, max.depth = 4, eta = .01, nthread = 16, nrounds = 5000, early_stopping_rounds = 8, objective = "binary:logistic", device = "cuda")
+importance_matrix <- xgb.importance(model = bstSparse)
+importance_matrix$orig.ident <- "s76"
+importance_matrix$Gain <- importance_matrix$Gain *100
+  
+avg <- AverageExpression(s76.train, assays = "RNA", slot = "counts", features = importance_matrix$Feature, group.by = "keep")
+#importance_matrix$larger.malig <- avg$RNA.malignantClones > avg$RNA.none
+  
+pred <- predict(object = bstSparse, newdata = t(test))
+names(pred) <- test@Dimnames[[2]]
+
+s76.test$s76.pred.xgboost <- pred
+s76.test$s76.pred <- s76.test$s76.pred.xgboost >0.5
+
+table(s76.test$cloneType, s76.test$s76.pred)
+table(s76.test$new.clones, s76.test$s76.pred)
+table(s76.test$keep, s76.test$s76.pred)
+hist(s76.test$s76.pred.xgboost, breaks = 50)
+```
+
+
+```{r}
+s76 <- subset(T.cells, orig.ident == "S76")
+s76 <- import_vdj(input = s76, vdj_dir = "~/s76.vdj")
+
+s76.train <- subset(s76, cloneType != "none")
+
+result <- grepl("TRAV41;TRBV7-2", s76.train$v_gene)
+
+s76.train$malig <- result
+
+patterns <- c("^TRAV41$", "^TRBV7-2$", "^TRAV41;TRBV7-2$")
+result2 <- grepl(paste(patterns, collapse = "|"), s76.train$v_gene)
+
+
+s76.train$match <- result2
+
+s76.train$combine <- paste0(s76.train$malig, s76.train$match)
+s76.train$combine2 <- paste0(s76.train$cloneType, s76.train$new.clones)
+
+table(s76.train$combine2)
+
+s76.train <- subset(s76.train, combine != "FALSETRUE")
+s76.train <- subset(s76.train, combine2 != "Rare (0 < X <= 1e-04)malignantClones" & combine2 != "Small (1e-04 < X <= 0.001)malignantClones" & combine2 != "Medium (0.001 < X <= 0.01)malignantClones")
+
+table(s76.train$combine2)
+
+test <- setdiff(s76$barcode, s76.train$barcode)
+
+s76.test <- subset(s76, barcode %in% test)
+
+
+intersect(x = s76.train$barcode, s76.test$barcode)
+
+
+table(s76.train$cloneType, s76.train$new.clones)
+
+label <- s76.train$new.clones
+label <- label == "malignantClones"
+label <- as.numeric(label)
+  
+tcr <- quietTCRgenes(s76.train@assays[["RNA"]]@data@Dimnames[[1]])
+train <- s76.train@assays$RNA@data
+train <- train[tcr,]
+  
+tcr <- quietTCRgenes(s76.test@assays[["RNA"]]@data@Dimnames[[1]])
+test <- s76.test@assays$RNA@data
+test <- test[tcr,]
+
+bstSparse <- xgboost(data = t(train), label = label, max.depth = 4, eta = .1, nthread = 16, nrounds = 500, early_stopping_rounds = 8, objective = "binary:logistic", device = "cuda")
+importance_matrix <- xgb.importance(model = bstSparse)
+importance_matrix$orig.ident <- "s76"
+  
+#avg <- as.data.frame(AverageExpression(s76.train, assays = "RNA", slot = "counts", features = importance_matrix$Feature, group.by = "new.clones"))
+#importance_matrix$larger.malig <- avg$RNA.malignantClones > avg$RNA.none
+  
+pred <- predict(object = bstSparse, newdata = t(test))
+names(pred) <- test@Dimnames[[2]]
+
+s76.test$s76.pred.xgboost <- pred
+s76.test$s76.pred <- s76.test$s76.pred.xgboost >0.5
+
+table(s76.test$cloneType, s76.test$s76.pred)
+table(s76.test$new.clones, s76.test$s76.pred)
+saveRDS(object = s76.test, file = "~/s76.test.rds")
+```
+
+
+```{r}
+####### Rewrite clones calling method #######################################
+T.cells$has.tcr <- T.cells$cloneType != "none"
+T.cells$malignant.hyperonly <- T.cells$cloneType == "Hyperexpanded (0.1 < X <= 1)"
+T.cells$tcr.and.malig <- paste0(T.cells$has.tcr, T.cells$malignant.hyperonly)
+table <- as.data.frame.matrix(table(T.cells$orig.ident, T.cells$tcr.and.malig))
+
+s17 <- subset(T.cells, orig.ident == "S17")
+pt5 <- subset(T.cells, Patient.ID == "Pt5")
+s76 <- subset(T.cells, orig.ident == "S76")
+s10 <- subset(T.cells, orig.ident == "S10")
+
+DimPlot(s10, group.by = "knn.leiden.T2")
+DimPlot(s10, group.by = "cloneType", split.by = "cloneType")
+FeaturePlot_scCustom(s10, features = "TRDC", split.by = "cloneType")
+none.s10 <- subset(s10, cloneType == "none")
+DimPlot(none.s10, group.by = "knn.leiden.T2")
+DimPlot(none.s10, group.by = "Monaco.labels")
+DimPlot(none.s10, group.by = "PT.annot")
+FeaturePlot_scCustom(none.s10, features = "TRDC", split.by = "cloneType")
+FeaturePlot_scCustom(none.s10, features = "TRAC", split.by = "cloneType")
+
+features <- FindVariableFeatures(s10)
+none.s10 <- RunUMAP(object = none.s10, features = features@assays[["RNA"]]@var.features)
+DimPlot(none.s10, group.by = "knn.leiden.T2", reduction = "umap")
+DimPlot(none.s10, group.by = "Monaco.labels", reduction = "umap")
+DimPlot(none.s10, group.by = "PT.annot", reduction = "umap")
+FeaturePlot_scCustom(none.s10, features = "TRDC", reduction = "umap")
+FeaturePlot_scCustom(none.s10, features = "TRAC", reduction = "umap")
+
+which(rownames(none.s10@assays$RNA@counts) == "TRDC")
+which(rownames(none.s10@assays$RNA@counts) == "TRAC")
+x <- none.s10@assays$RNA@counts[9789,]
+y <- none.s10@assays$RNA@counts[9790,]
+plot(x, y)
+
+tcr.genes <- Trex::quietTCRgenes(rownames(T.cells@assays$RNA@counts))
+tcr.genes <- setdiff(rownames(T.cells@assays$RNA@counts), tcr.genes)
+tcr.genes
+gd <- c("TRDC", "TRDJ1", "TRDJ2", "TRDJ3")
+none.s10 <- AddModuleScore(object = none.s10, features = list(gd), name = "GD3_genes")
+
+
+FeaturePlot_scCustom(none.s10, features = "GD3_genes1")
+```
+
+
+```{r}
+# TCR Alpha Chain
+TRAC <- grep(pattern = "TRAC", x = rownames(T.cells@assays$RNA@counts))
+TRAC <- rownames(T.cells@assays$RNA@counts)[TRAC]
+
+TRAD <- grep(pattern = "TRAD", x = rownames(T.cells@assays$RNA@counts))
+TRAD <- rownames(T.cells@assays$RNA@counts)[TRAD]
+
+TRAJ <- grep(pattern = "TRAJ", x = rownames(T.cells@assays$RNA@counts))
+TRAJ <- rownames(T.cells@assays$RNA@counts)[TRAJ]
+
+TRAV <- grep(pattern = "TRAV", x = rownames(T.cells@assays$RNA@counts))
+TRAV <- rownames(T.cells@assays$RNA@counts)[TRAV]
+
+TRA <- c(TRAC, TRAD, TRAJ, TRAV)
+TRA <- TRA[-c(2:4)]
+
+# TCR Beta Chain
+TRBC <- grep(pattern = "TRBC", x = rownames(T.cells@assays$RNA@counts))
+TRBC <- rownames(T.cells@assays$RNA@counts)[TRBC]
+
+TRBD <- grep(pattern = "TRBD", x = rownames(T.cells@assays$RNA@counts))
+TRBD <- rownames(T.cells@assays$RNA@counts)[TRBD]
+
+TRBJ <- grep(pattern = "TRBJ", x = rownames(T.cells@assays$RNA@counts))
+TRBJ <- rownames(T.cells@assays$RNA@counts)[TRBJ]
+
+TRBV <- grep(pattern = "TRBV", x = rownames(T.cells@assays$RNA@counts))
+TRBV <- rownames(T.cells@assays$RNA@counts)[TRBV]
+
+TRB <- c(TRBC, TRBD, TRBJ, TRBV)
+
+# TCR Gamma Chain
+TRGC <- grep(pattern = "TRGC", x = rownames(T.cells@assays$RNA@counts))
+TRGC <- rownames(T.cells@assays$RNA@counts)[TRGC]
+
+TRGD <- grep(pattern = "TRGD", x = rownames(T.cells@assays$RNA@counts))
+TRGD <- rownames(T.cells@assays$RNA@counts)[TRGD]
+
+TRGJ <- grep(pattern = "TRGJ", x = rownames(T.cells@assays$RNA@counts))
+TRGJ <- rownames(T.cells@assays$RNA@counts)[TRGJ]
+
+TRGV <- grep(pattern = "TRGV", x = rownames(T.cells@assays$RNA@counts))
+TRGV <- rownames(T.cells@assays$RNA@counts)[TRGV]
+
+TRG <- c(TRGC, TRGD, TRGJ, TRGV)
+TRG <- TRG[-c(3,8)]
+
+# TCR Delta Chain
+TRDC <- grep(pattern = "TRDC", x = rownames(T.cells@assays$RNA@counts))
+TRDC <- rownames(T.cells@assays$RNA@counts)[TRDC]
+
+TRDD <- grep(pattern = "TRDD", x = rownames(T.cells@assays$RNA@counts))
+TRDD <- rownames(T.cells@assays$RNA@counts)[TRDD]
+
+TRDJ <- grep(pattern = "TRDJ", x = rownames(T.cells@assays$RNA@counts))
+TRDJ <- rownames(T.cells@assays$RNA@counts)[TRDJ]
+
+TRDV <- grep(pattern = "TRDV", x = rownames(T.cells@assays$RNA@counts))
+TRDV <- rownames(T.cells@assays$RNA@counts)[TRDV]
+
+TRD <- c(TRDC, TRDD, TRDJ, TRDV)
+
+TRAB <- c(TRA, TRB)
+TRGD <- c(TRG, TRD)
+TCR.all <- c(TRAB, TRGD)
+
+s10 <- AddModuleScore(object = s10, features = list(TRAB), name = "TRAB")
+s10 <- AddModuleScore(object = s10, features = list(TRGD), name = "TRGD")
+s10 <- AddModuleScore(object = s10, features = list(TCR.all), name = "TCR.all")
+s10 <- AddModuleScore(object = s10, features = list(TRD), name = "TRD")
+s10$gd.dif <- s10$TRGD1 - s10$TRAB1
+FeaturePlot_scCustom(s10, features = "TRAB1")
+FeaturePlot_scCustom(s10, features = "TRGD1")
+FeaturePlot_scCustom(s10, features = "TCR.all1")
+FeaturePlot_scCustom(s10, features = "gd.dif")
+plot(x = s10$gd.dif, y = s10$TRD1)
+plot(x = s10$gd.dif, y = s10$TRAB1)
+
+data <- T.cells@assays$RNA@data
+T.cells@assays$RNA@data <- T.cells@assays$RNA@counts
+T.cells <- AddModuleScore(object = T.cells, features = list(TRAB), name = "TRAB", assay = "RNA")
+T.cells <- AddModuleScore(object = T.cells, features = list(TRGD), name = "TRGD")
+T.cells <- AddModuleScore(object = T.cells, features = list(TCR.all), name = "TCR.all")
+T.cells <- AddModuleScore(object = T.cells, features = list(TRDC), name = "TRDC")
+T.cells$gd.dif <- T.cells$TRGD1 - T.cells$TRAB1
+FeaturePlot(T.cells, features = "TRAB1", raster = F, max.cutoff = 'q80', min.cutoff = 'q50')
+FeaturePlot(T.cells, features = "TRGD1", raster = F, max.cutoff = 'q80', min.cutoff = 'q30')
+FeaturePlot(T.cells, features = "TRDC1", raster = F, max.cutoff = 'q80', min.cutoff = 'q5')
+
+FeaturePlot(T.cells, features = "TCR.all1", raster = F, max.cutoff = 'q80', min.cutoff = 'q.5')
+FeaturePlot(T.cells, features = "gd.dif", raster = F, max.cutoff = 'q80', min.cutoff = 'q50')
+plot(x = T.cells$TRAB1, y = T.cells$TRGD1)
+```
+
+```{r}
+table <- as.data.frame.matrix(table(T.cells$orig.ident, T.cells$tcr.and.malig))
+```
+
+
+
+
+
+```{r}
+library(reticulate)
+library(Trex)
+reticulate::conda_list()
+
+#reticulate::virtualenv_create("CTCL")
+reticulate::use_virtualenv("CTCL")
+
+
+py_install("tensorflow")
+
+
+
+
+trex <- Trex::annotateDB(sc = T.cells, chains = "TRA")
+DimPlot(object = trex, group.by = "TRA_Epitope.species", raster = F)
+ggsave("~/trex.tra.png", height = 2000, width = 18000, units = "px", limitsize = F)
+
+trex <- Trex::annotateDB(sc = T.cells, chains = "TRB")
+DimPlot(object = trex, group.by = "TRB_Epitope.species", raster = F)
+ggsave("~/trex.trb.png", height = 2000, width = 30000, units = "px", limitsize = F)
+
+pt36 <- subset(T.cells, Patient.ID == "Pt36")
+pt36.ss <- subset(pt36, cloneType != "none")
+pt36.ss <- subset(pt36.ss, percent.mt < 3)
+pt36.ss <- runTrex(pt36, chains = "TRB", AA.properties = "AF", reduction.name = "Trex")
+
+DimPlot(object = pt36.ss, reduction = "umap.T", group.by = "cloneType")
+DimPlot(object = pt36.ss, reduction = "Trex", group.by = "cloneType")
+
+noise <- rnorm(nrow(pt36.ss@reductions$Trex), mean = 0, sd = 0.01)
+
+pt36.ss@reductions$Trex@cell.embeddings <- pt36.ss@reductions$Trex@cell.embeddings - noise
+pt36.ss@reductions$Trex@feature.loadings <- pt36.ss@reductions$Trex@feature.loadings - noise
+pt36.ss@reductions$Trex@feature.loadings.projected <- pt36.ss@reductions$Trex@feature.loadings.projected - noise
+
+pt36.ss <- RunTSNE(pt36.ss, reduction = "Trex",  reduction.key = "Trex.tsne_")
+pt36.ss <- RunUMAP(pt36.ss, reduction = "Trex",  reduction.key = "Trex.umap_", dims = c(1:30))
+DimPlot(object = pt36.ss, reduction = "umap", group.by = "cloneType")
+DimPlot(object = pt36.ss, reduction = "tsne", group.by = "cloneType")
+DimPlot(object = pt36.ss, reduction = "umap.T", group.by = "cloneType")
+DimPlot(object = pt36.ss, reduction = "Trex", group.by = "cloneType")
+
+pt36.ss <- FindVariableFeatures(pt36.ss)
+features <- pt36.ss@assays$RNA@var.features
+features <- quietTCRgenes(features)
+pt36.ss <- RunPCA(object = pt36.ss, assay = "RNA", features = features)
+
+pt36.ss <- FindMultiModalNeighbors(pt36.ss, 
+                                     reduction.list = list("pca", "Trex"), 
+                                     dims.list = list(1:50, 1:30), 
+                                     modality.weight.name = "RNA.weight")
+                                     
+pt36.ss <- RunUMAP(pt36.ss, 
+                     nn.name = "weighted.nn", 
+                     reduction.name = "wnn.umap", 
+                     reduction.key = "wnnUMAP_")
+
+DimPlot(object = pt36.ss, reduction = "umap", group.by = "cloneType")
+DimPlot(object = pt36.ss, reduction = "tsne", group.by = "cloneType")
+DimPlot(object = pt36.ss, reduction = "umap.T", group.by = "cloneType")
+DimPlot(object = pt36.ss, reduction = "Trex", group.by = "cloneType")
+DimPlot(object = pt36.ss, reduction = "wnn.umap", group.by = "cloneType")
+DimPlot(object = pt36.ss, reduction = "wnn.umap", split.by = "cloneType", group.by = "pred.final")
+FeaturePlot(object = pt36.ss, reduction = "wnn.umap", features = "RNA.weight")
+
+
+
+pt36.ss <- Seurat::FindClusters(object = pt36.ss, graph.name = "wknn", resolution = c(0.2, 0.4, 0.8, 1.2))
+
+DimPlot(object = pt36.ss, reduction = "wnn.umap", group.by = "cloneType")
+DimPlot(object = pt36.ss, reduction = "wnn.umap", split.by = "cloneType", group.by = "pred.final")
+FeaturePlot(object = pt36.ss, reduction = "wnn.umap", features = "RNA.weight")
+DimPlot(object = pt36.ss, reduction = "wnn.umap", group.by = "wknn_res.0.2")
+DimPlot(object = pt36.ss, reduction = "wnn.umap", group.by = "wknn_res.0.4")
+DimPlot(object = pt36.ss, reduction = "wnn.umap", group.by = "wknn_res.0.8")
+DimPlot(object = pt36.ss, reduction = "wnn.umap", group.by = "wknn_res.1.2")
+
+Idents(pt36.ss) <- pt36.ss$wknn_res.0.2
+markers.pt36.ss <- FindMarkers(object = pt36.ss, ident.1 = "0", ident.2 = "1")
+
+DimPlot(object = pt36.ss, reduction = "wnn.umap", group.by = "cloneType")
+DimPlot(object = pt36.ss, reduction = "wnn.umap", split.by = "cloneType", group.by = "pred.final")
+FeaturePlot(object = pt36.ss, reduction = "wnn.umap", features = "RNA.weight")
+DimPlot(object = pt36.ss, reduction = "wnn.umap", group.by = "wknn_res.0.2")
+DimPlot(object = pt36.ss, reduction = "wnn.umap", split.by = "orig.ident")
+DimPlot(object = pt36.ss, reduction = "wnn.umap", group.by = "Timepoint")
+DimPlot(object = pt36.ss, reduction = "wnn.umap", group.by = "CTaa")+NoLegend()
+DimPlot(object = pt36.ss, reduction = "wnn.umap", group.by = "pred.final")+NoLegend()
+mat.aa <- as.data.frame.matrix(table(pt36.ss$CTaa, pt36.ss$wknn_res.0.2))
+
+pt36.malig <- subset(pt36.ss, wknn_res.0.2 != "2")
+Idents(pt36.malig) <- pt36.malig$wknn_res.0.2
+markers.pt36.malig <- FindAllMarkers(object = pt36.malig, only.pos = T)
+
+# Assuming you have a dataframe 'markers.pt36.malig' with columns 'cluster' and 'avg_log2FC'
+
+out <- markers.pt36.malig %>%
+  group_by(cluster) %>%
+  arrange(-avg_log2FC, .by_group = TRUE) %>%
+  slice_head(n = 10)
+
+DoHeatmap(object = pt36.malig, features = out$gene)
+DimPlot(pt36.malig, group.by = "wknn_res.0.2", reduction = "wnn.umap")
+DimPlot(pt36.malig, group.by = "Timepoint", reduction = "wnn.umap")
+
+```
+
+
+
+
+
+
+
+
+
+
+```{r}
+meta <- s76@meta.data
+s124 <- subset(T.cells, orig.ident == "S124")
+s124 <- subset(asdf, orig.ident == "S124")
+
+s10.11 <- subset(T.cells, orig.ident == "S10"|orig.ident == "S11")
+
+DimPlot(s10.11, group.by = "knn.leiden.T2")
+DimPlot(s10.11, group.by = "cloneType", split.by = "cloneType")+NoLegend()
+FeaturePlot(s10.11, features = )
+
+DimPlot(s124, group.by = "cloneType", raster = F)
+
+table(s124$cloneType, s124$knn.leiden)
+```
+
+
+```{r}
+meta <- T.cells[[]]
+
+table <- as.data.frame.matrix(table(T.cells$orig.ident, T.cells$tcr.and.malig))
+hc.remove <- which(rownames(table) %in% hc.orig.ident)
+table <- table[-hc.remove,]
+table.dx <- as.data.frame.matrix(table(T.cells$orig.ident, T.cells$Dx))
+hc <- subset(table.dx, HC >0)
+hc.orig.ident <- rownames(hc)
+origins <- rownames(table)
+origins <- origins[1]
+out.list <- list()
+for(i in seq_along(origins)) {
+  tmp <- meta[meta$orig.ident == "S1",]
+  if(length(which(is.na(tmp$CTaa) == TRUE)) == nrow(tmp)) {
+    next()
+  }
+   
+  counts <- tmp %>%
+            filter(!is.na(CTaa)) %>%
+            group_by(CTaa) %>%
+            dplyr::count() %>%
+            as.data.frame()
+  if(max(counts$n) < 5) {
+    next()
+  }
+ 
+  denominator <- nrow(tmp[!is.na(tmp$CTaa),])
+  top <- counts %>%
+    slice_max(order_by = n, n = 10)
+  top$prop <- top$n/denominator
+  if(max(top$prop) < .05) {
+    next()
+  }
+  top <- top[top$prop > .09,]
+  top <- top[top$n > 3,]
+  topchain <- top$CTaa
+  topA <- stringr::str_split(top$CTaa, "_", simplify = TRUE)[1:nrow(top), 1]
+  topB <- stringr::str_split(top$CTaa, "_", simplify = TRUE)[1:nrow(top), 2]
+  chainA <- stringr::str_split(tmp$CTaa, "_", simplify = TRUE)[,1]
+  chainB <- stringr::str_split(tmp$CTaa, "_", simplify = TRUE)[,2]
+  chainA[chainA == "NA"] <- NA
+  chainB[chainB == "NA"] <- NA
+  chainB[chainB == ""] <- NA
+
+  a.pos <- which(chainA %in% topA)
+  b.pos <- which(chainB %in% topB)
+  both <- sort(unique(c(a.pos, b.pos)))
+  
+  meta.add <- data.frame(row.names = rownames(tmp[both,]), major_clone = rep("malignantClones", length(both)), new.proportion = rep(length(both)/denominator, length(both)))
+  out.list[[i]] <- meta.add
+}
+
+list <- c(1:length(out.list))
+rbind <- data.frame()
+for(i in seq_along(list)){
+rbind <- rbind(rbind, out.list[[i]])
+}
+clones <- as.vector(rbind$major_clone)
+names(clones) <- rownames(rbind)
+T.cells$new.clones <- clones
+
+test <- T.cells$new.clones
+test[is.na(test)] <- "none"
+T.cells$new.clones <- test
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+Idents(T.cells) <- T.cells$knn.leiden.T1
+markers.all <- FindAllMarkers(object = T.cells, assay = "RNA", only.pos = T)
+
+table(T.cells$Dx, T.cells$pred.final)
+
+df <- data.frame(cell_type=T.cells$tcr.and.new.clones)
+table(df$cell_type)
+df$barcode <- rownames(df)
+df <- df %>% group_by(cell_type) %>% slice_sample(n=20000, replace = F)
+asdf <- subset(T.cells, barcode %in% df$barcode)
+
+DimPlot(object = asdf, group.by = "knn.leiden.T1")
+asdf.remove.na <- subset(asdf, pred.final == "malignantClones"| pred.final == "none")
+DimPlot(object = asdf.remove.na, group.by = "knn.leiden.T1", split.by = "pred.final", label = T, shuffle = T)
+DimPlot(object = asdf, group.by = "knn.leiden.T1", split.by = "Tissue")
+DimPlot(object = asdf, group.by = "knn.leiden.T1", split.by = "Dx")
+
+table(asdf$Dx, asdf$pred)
+
+```
+
+
+
+```{r}
+FeaturePlot(object = play, features = "percent.mt", raster = F)
+FeaturePlot(object = play, features = "percent.rb", raster = F)
+FeaturePlot(object = play, features = "nCount_RNA", raster = F)
+FeaturePlot(object = play, features = "nFeature_RNA", raster = F)
+FeaturePlot(object = play, features = "db.score", raster = F)
+FeaturePlot(object = play, features = "Frequency", raster = F)
+FeaturePlot(object = play, features = "cnv.total", raster = F)
+
+
+play.sct <- SCTransform(object = play, return.only.var.genes = F)
+
+fastMNN_output <- readRDS("~/fastMNN_output.rds")
+keep <- play.sct$barcode
+fastMNN_output <- fastMNN_output[, (colnames(fastMNN_output) %in% keep)]
+play.sct <- subset(play.sct, barcode %in% fastMNN_output@colData@rownames)
+out <- fastMNN_output
+rm(fastMNN_output)
+
+set.seed(123)
+umap <- runUMAP(x = out, dimred = "corrected")
+umap.T.sct <- CreateDimReducObject(embeddings = umap@int_colData$reducedDims@listData$UMAP, 
+                            loadings = umap@int_colData$reducedDims@listData$UMAP, 
+                            projected = umap@int_colData$reducedDims@listData$UMAP, 
+                            assay = "SCT", 
+                            key = "umap.T.sct")
+play.sct[["umap.T.sct"]] <- umap.T.sct
+DimPlot(play.sct, reduction = "umap.T.sct", raster = F)
+DimPlot(play.sct, reduction = "umap.T", raster = F)
+
+
+knn.gr <- makeKNNGraph(out@int_colData$reducedDims$corrected, k = 10)
+
+clusters <- cluster_leiden(graph = knn.gr,objective_function = "modularity",weights = NULL,resolution_parameter = 1,beta = 0.01,initial_membership = NULL,n_iterations = 2,vertex_weights = NULL)
+com <- membership(communities = clusters)
+play.sct$sct.knn.leiden.T1 <- com
+
+DimPlot(play.sct, reduction = "umap.T.sct", group.by = "sct.knn.leiden.T1", raster = F)
+DimPlot(play.sct, reduction = "umap.T", group.by = "sct.knn.leiden.T1", raster = F)
+
+scCustomize::FeaturePlot_scCustom(play.sct, reduction = "umap.T", features = "NKG7")
+scCustomize::FeaturePlot_scCustom(play.sct, reduction = "umap.T.sct", features = "NKG7")
+scCustomize::FeaturePlot_scCustom(play.sct, reduction = "umap.T", features = "CD8A")
+scCustomize::FeaturePlot_scCustom(play.sct, reduction = "umap.T.sct", features = "CD8A")
+scCustomize::FeaturePlot_scCustom(play.sct, reduction = "umap.T", features = "CD8B")
+scCustomize::FeaturePlot_scCustom(play.sct, reduction = "umap.T.sct", features = "CD8B")
+scCustomize::FeaturePlot_scCustom(play.sct, reduction = "umap.T", features = "CD4")
+scCustomize::FeaturePlot_scCustom(play.sct, reduction = "umap.T.sct", features = "CD4")
+scCustomize::FeaturePlot_scCustom(play.sct, reduction = "umap.T", features = "TRDC")
+scCustomize::FeaturePlot_scCustom(play.sct, reduction = "umap.T.sct", features = "TRDC")
+
+DimPlot(play.sct, reduction = "umap.T.sct", group.by = "pred.final", raster = F, split.by = "pred.final")
+DimPlot(play.sct, reduction = "umap.T", group.by = "pred.final", raster = F, split.by = "pred.final")
+
+DimPlot(play.sct, reduction = "umap.T.sct", group.by = "cloneType", raster = F, split.by = "cloneType")
+DimPlot(play.sct, reduction = "umap.T", group.by = "cloneType", raster = F, split.by = "cloneType")
+
+DimPlot(play.sct, reduction = "umap.T.sct", group.by = "Dx", raster = F, split.by = "Dx")
+DimPlot(play.sct, reduction = "umap.T", group.by = "Dx", raster = F, split.by = "Dx")
+
+DimPlot(play.sct, reduction = "umap.T.sct", group.by = "Tissue", raster = F, split.by = "Tissue")
+DimPlot(play.sct, reduction = "umap.T", group.by = "Tissue", raster = F, split.by = "Tissue")
+
+DimPlot(play.sct, reduction = "umap.T.sct", group.by = "pred.final", raster = F, split.by = "pred.final")
+DimPlot(play.sct, reduction = "umap.T", group.by = "pred.final", raster = F, split.by = "pred.final")
+
+
+play.sct2 <- SCTransform(object = play, return.only.var.genes = F, do.correct.umi = F)
+
+DefaultAssay(play.sct2) <- "SCT"
+scCustomize::FeaturePlot_scCustom(play.sct2, reduction = "umap.T", features = "NKG7", slot = "data")
+scCustomize::FeaturePlot_scCustom(play.sct2, reduction = "umap.T", features = "NKG7", slot = "counts")
+scCustomize::FeaturePlot_scCustom(play.sct2, reduction = "umap.T", features = "NKG7", slot = "scale.data")
+
+DefaultAssay(play.sct2) <- "RNA"
+
+scCustomize::FeaturePlot_scCustom(play.sct2, reduction = "umap.T", features = "NKG7", slot = "data")
+scCustomize::FeaturePlot_scCustom(play.sct2, reduction = "umap.T", features = "NKG7", slot = "counts")
+scCustomize::FeaturePlot_scCustom(play.sct2, reduction = "umap.T", features = "NKG7", slot = "scale.data")
+
+play.sct2.scale <- ScaleData(object = play.sct2, assay = "RNA", do.scale = T, do.center = T)
+DefaultAssay(play.sct2.scale) <- "RNA"
+
+scCustomize::FeaturePlot_scCustom(play.sct2.scale, reduction = "umap.T", features = "NKG7", slot = "data")
+scCustomize::FeaturePlot_scCustom(play.sct2.scale, reduction = "umap.T", features = "NKG7", slot = "counts")
+scCustomize::FeaturePlot_scCustom(play.sct2.scale, reduction = "umap.T", features = "NKG7", slot = "scale.data")
+
+play.sct2.scale <- ScaleData(object = play.sct2, assay = "SCT", do.scale = T, do.center = T)
+DefaultAssay(play.sct2.scale) <- "SCT"
+
+scCustomize::FeaturePlot_scCustom(play.sct2.scale, reduction = "umap.T", features = "NKG7", slot = "data")
+scCustomize::FeaturePlot_scCustom(play.sct2.scale, reduction = "umap.T", features = "NKG7", slot = "counts")
+scCustomize::FeaturePlot_scCustom(play.sct2.scale, reduction = "umap.T", features = "NKG7", slot = "scale.data")
+
+
+
+```
+
+
+```{r}
+library(CellChat)
+options(stringsAsFactors = T)
+unique(pt36$Monaco.pruned.labels)
+condition <- pt36$pred.final == "malignantClones"
+pt36$Monaco.pruned.labels[condition] <- "malignantClones"
+Idents(pt36) <- pt36$Monaco.pruned.labels
+meta <- pt36@meta.data
+pt36$Monaco.labels <- Idents(pt36)
+
+pt36$Monaco.labels <- droplevels(pt36$Monaco.labels, exclude = setdiff(levels(pt36$Monaco.labels),unique(pt36$Monaco.labels)))
+
+levels(Idents(pt36))
+table(pt36$Monaco.pruned.labels)
+
+Idents(pt36) <- droplevels(Idents(pt36), exclude = setdiff(Idents(pt36),unique(meta$HPCA.pruned.labels)))
+
+cellchat <- createCellChat(object = pt36, meta = meta, group.by = "Monaco.pruned.labels")
+
+CellChatDB <- CellChatDB.human
+CellChatDB.use <- CellChatDB
+cellchat@DB <- CellChatDB.use
+cellchat <- CellChat::subsetData(object = cellchat)
+cellchat <- identifyOverExpressedGenes(cellchat)
+cellchat <- identifyOverExpressedInteractions(cellchat)
+cellchat <- projectData(cellchat, PPI.human)
+
+cellchat@idents
+cellchat@idents <- droplevels(cellchat@idents, exclude = setdiff(levels(cellchat@idents),unique(pt36$Monaco.labels)))
+
+cellchat <- computeCommunProb(cellchat)
+
+#df.net <- subsetCommunication(cellchat, slot.name = "netP")
+#df.net <- subsetCommunication(cellchat, sources.use = c(1,2), targets.use = c(4,5))
+#df.net <- subsetCommunication(cellchat, signaling = c("WNT", "TGFb"))
+
+cellchat <- computeCommunProbPathway(cellchat)
+cellchat <- aggregateNet(cellchat)
+groupSize <- as.numeric(table(cellchat@idents))
+par(mfrow = c(1,2), xpd=TRUE)
+
+png(file = "~/cellchat.png", width = 3000, height = 3000)
+netVisual_circle(cellchat@net$count, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Number of interactions")
+dev.off()
+
+
+png(file = "~/cellchat.weight.png", width = 3000, height = 3000)
+netVisual_circle(cellchat@net$weight, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Interaction weights/strength")
+dev.off()
+
+
+mat <- cellchat@net$weight
+rownames(mat) <- str_replace(string = rownames(mat), pattern = "/", "_")
+par(mfrow = c(3,4), xpd=TRUE)
+for (i in 1:nrow(mat)) {
+  mat2 <- matrix(0, nrow = nrow(mat), ncol = ncol(mat), dimnames = dimnames(mat))
+  mat2[i, ] <- mat[i, ]
+  png(file = paste0("~/cellchat/", rownames(mat)[i], "mat.png"), width = 3000, height = 3000)
+  netVisual_circle(mat2, vertex.weight = groupSize, weight.scale = T, edge.weight.max = max(mat), title.name = rownames(mat)[i])
+  dev.off()
+}
+
+mat <- cellchat@net$count
+rownames(mat) <- str_replace(string = rownames(mat), pattern = "/", "_")
+par(mfrow = c(3,4), xpd=TRUE)
+for (i in 1:nrow(mat)) {
+  mat2 <- matrix(0, nrow = nrow(mat), ncol = ncol(mat), dimnames = dimnames(mat))
+  mat2[i, ] <- mat[i, ]
+  png(file = paste0("~/cellchat/count.", rownames(mat)[i], "mat.png"), width = 3000, height = 3000)
+  netVisual_circle(mat2, vertex.weight = groupSize, weight.scale = T, edge.weight.max = max(mat), title.name = rownames(mat)[i])
+  dev.off()
+}
+
+#################################################
+
+pathways <- unique(cellchat@netP[["pathways"]])
+pathways.show <- c("CD40")
+
+netVisual_aggregate(cellchat, signaling = pathways.show, layout = "circle")
+
+for(i in seq_along(pathways.show)){
+  png(file = paste0("~/cellchat/", pathways.show[i], "mat.png"), width = 3000, height = 3000)
+  par(mfrow=c(1,1))
+  netVisual_aggregate(cellchat, signaling = pathways.show[i], layout = "chord")
+  dev.off()
+}
+
+
+par(mfrow=c(1,1))
+netVisual_heatmap(cellchat, signaling = pathways.show, color.heatmap = "Reds")
+#> Do heatmap based on a single object
+
+levels(cellchat@idents)
+netVisual_bubble(cellchat, sources.use = c(1:21), targets.use = 7, remove.isolate = FALSE)
+
+netVisual_chord_gene(cellchat, sources.use = 1, targets.use = 7, lab.cex = 0.5,legend.pos.y = 30)
+
+plotGeneExpression(cellchat, signaling = "CD40")
+```
+
+
+```{r}
+fastMNN_output <- readRDS("~/fastMNN_output.rds")
+benign <- subset(T.cells, pred.final == "none")
+keep <- benign$barcode
+fastMNN_output <- fastMNN_output[, (colnames(fastMNN_output) %in% keep)]
+benign <- subset(benign, barcode %in% fastMNN_output@colData@rownames)
+out <- fastMNN_output
+rm(fastMNN_output)
+
+set.seed(123453)
+umap <- scater::runUMAP(x = out, dimred = "corrected")
+umap.benign <- CreateDimReducObject(embeddings = umap@int_colData$reducedDims@listData$UMAP, 
+                            loadings = umap@int_colData$reducedDims@listData$UMAP, 
+                            projected = umap@int_colData$reducedDims@listData$UMAP, 
+                            assay = "RNA", 
+                            key = "umap.benign")
+benign[["umap.benign"]] <- umap.benign
+
+DimPlot(benign, reduction = "umap.benign", group.by = "knn.leiden.T2", raster = F)
+FeaturePlot(benign, features = "CD4", raster = F, reduction = "umap.benign")
+FeaturePlot(benign, features = "CD8A", raster = F, reduction = "umap.benign")
+FeaturePlot(benign, features = "NKG7", raster = F, reduction = "umap.benign")
+FeaturePlot(benign, features = "TRDC", raster = F, reduction = "umap.benign")
+
+
+
+
+
+knn.gr <- makeKNNGraph(out@int_colData$reducedDims$corrected)
+clusters <- cluster_leiden(graph = knn.gr,objective_function = "modularity",weights = NULL,resolution_parameter = 0.5,beta = 0.01,initial_membership = NULL,n_iterations = 2,vertex_weights = NULL)
+com <- membership(communities = clusters)
+benign$knn.leiden.benign.5 <- com
+
+clusters <- cluster_leiden(graph = knn.gr,objective_function = "modularity",weights = NULL,resolution_parameter = 1,beta = 0.01,initial_membership = NULL,n_iterations = 2,vertex_weights = NULL)
+com <- membership(communities = clusters)
+benign$knn.leiden.benign1 <- com
+
+clusters <- cluster_leiden(graph = knn.gr,objective_function = "modularity",weights = NULL,resolution_parameter = 2,beta = 0.01,initial_membership = NULL,n_iterations = 2,vertex_weights = NULL)
+com <- membership(communities = clusters)
+benign$knn.leiden.benign2 <- com
+
+DimPlot(benign, group.by = "knn.leiden.benign.5", raster = F, reduction = "umap.benign")
+#DimPlot(benign, group.by = "knn.leiden.benign1", raster = F, reduction = "umap.benign")
+DimPlot(benign, group.by = "knn.leiden.benign2", raster = F, reduction = "umap.benign", label = T)
+
+FeaturePlot(benign, features = "percent.mt", reduction = "umap.benign", raster = F)
+DimPlot(benign, group.by = "cloneType", split.by = "cloneType",raster = F, reduction = "umap.benign")
+DimPlot(benign, group.by = "predictions.malig", split.by = "predictions.malig", raster = F, reduction = "umap.benign")
+FeaturePlot(benign, features = "cnv.total", reduction = "umap.benign", raster = F)
+
+Idents(benign) <- benign$knn.leiden.benign.5
+markers.benign.5 <- FindAllMarkers(object = benign, only.pos = T)
+
+Idents(benign) <- benign$knn.leiden.benign2
+markers.benign2 <- FindAllMarkers(object = benign, only.pos = T)
+markers.benign2$cluster <- as.numeric(markers.benign2$cluster)
+```
+
+
+
+```{r}
+# Quantitative approach to integration
+library(lisi)
+
+df <- data.frame(cell_type=asdf$orig.ident)
+table(df$cell_type)
+df$barcode <- rownames(df)
+df <- df %>% group_by(cell_type) %>% slice_sample(n=1000, replace = F)
+asdf.ss2 <- subset(asdf, barcode %in% df$barcode)
+
+umap.int <- asdf.ss2@reductions$umap
+
+split <- SplitObject(object = asdf.ss, split.by = "orig.ident")
+features <- SelectIntegrationFeatures(object.list = split)
+asdf.ss <- ScaleData(asdf.ss)
+asdf.ss <- RunPCA(asdf.ss, features = features)
+asdf.ss <- RunUMAP(object = asdf.ss, reduction = "pca", dims = c(1:50))
+asdf.ss@reductions$umap.int <- umap.int
+
+DimPlot(asdf.ss, reduction = "umap", group.by = "Patient.ID")+NoLegend()
+DimPlot(asdf.ss, reduction = "umap.int", group.by = "Patient.ID")+NoLegend()
+
+lisi.res <- lisi::compute_lisi(X = asdf.ss@reductions$umap@cell.embeddings, meta_data = asdf.ss@meta.data, label_colnames = "orig.ident")
+
+lisi.res.int <- lisi::compute_lisi(X = asdf.ss@reductions$umap.int@cell.embeddings, meta_data = asdf.ss@meta.data, label_colnames = "orig.ident")
+
+
+hist(lisi.res$orig.ident, breaks = 50)
+hist(lisi.res.int$orig.ident, breaks = 50)
+
+lisi.res.int$run <- "Post-integration"
+lisi.res$run <- "Pre-integration"
+
+
+lisi.combine <- rbind(lisi.res, lisi.res.int)
+
+desired_order <- c("Pre-integration", "Post-integration")
+
+lisi.combine$run <- factor(lisi.combine$run, levels = desired_order)
+
+ggplot(lisi.combine, aes(x = run, y = orig.ident)) +
+  geom_violin() +
+  labs(title = "Violin Plot of LISI Score Pre and Post-Integration", subtitle = "p-value < 2.2e-16",
+       x = "",
+       y = "LISI Score") +
+  theme_minimal()+
+    theme(
+    axis.title = element_text(size = 16),  # Adjust the size as needed
+    axis.text = element_text(size = 14),   # Adjust the size as needed
+    plot.title = element_text(size = 18)   # Adjust the size as needed
+  )
+
+wilcox.test(x = lisi.res$orig.ident, y = lisi.res.int$orig.ident)
+
+```
+
+
+
+```{r}
+pred <- subset(T.cells, pred.final != "NA")
+pred$pred.final.has.tcr <- paste0(pred$pred.final, pred$has.tcr)
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "FAS")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "FASLG")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "PDCD1")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "CD274")
+
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "PTPRC")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "AHNAK")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "ITK")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "ZAP70")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "FYN")
+
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "GAPDH")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "GTSF1")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "PTTG1")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "ZAP70")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "FYN")
+
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "PDCD1")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "HAVCR2")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "CTLA4")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "CTLA4")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "TIGIT")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "TCF7")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "LGALS9")
+
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "CFLAR")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "CFLAR-AS1")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "TNFSF8")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "TNFRSF8")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "PLCG1")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "TCF7")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "LGALS9")
+
+
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "FAS")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "CFLAR")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "MAPK1")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "MAPK8")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "MAPK9")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "MAPK10")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "LAT")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "GRB2")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "HRAS")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "KRAS")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "NRAS")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "PLCG1")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "GSDMA")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "GSDMB")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "GSDMC")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "GSDMD")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "GSDME")
+
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "NLRP3")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "HSP90AA1")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "HSP90AB1")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "HSP90B1")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "CASP3")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "CASP6")
+
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "KIR3DL2")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "LILRA1")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "LILRA2")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "LILRA4")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "LILRA5")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "LILRA6")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "LILRB1")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "LILRB2")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "LILRB3")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "LILRB4")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "LILRB5")
+
+
+
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "KIR2DL1")
+FeaturePlot(object = pred, split.by = "pred.final.has.tcr", raster = F, features = "KIR2DL1")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "KIR2DL3")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "KIR2DL4")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "KIR3DL1")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "KIR3DL2")
+FeaturePlot(object = pred, split.by = "pred.final.has.tcr", raster = F, features = "KIR3DL2")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "KIR3DL3")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "KIR3DX1")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "NCAM1")
+
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "DNMT1")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "DNMT3A")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "DNMT3B")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "IL15RA")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "IL15")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "STAT5A")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "STAT5B")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "ITIM")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "ITAM")
+
+Idents(pred) <- pred$pred.final.has.tcr
+unique(Idents(pred))
+markers.lost.tcr <- FindMarkers(object = pred, ident.1 = "malignantClonesTRUE", ident.2 = "malignantClonesFALSE", min.pct = 0.05, logfc.threshold = 0.1)
+```
+
+
+```{r}
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "CD1a")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "DNTT")
+
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "TNFRSF8")
+FeaturePlot(object = pred, split.by = "pred.final", raster = F, features = "DNTT")
+```
+
+
+```{r}
+# djvdj
+library(djvdj)
+
+s76 <- subset(T.cells, orig.ident == "S76")
+s76 <- djvdj::import_vdj(input = s76, vdj_dir = "~/")
+s76 <- djvdj::calc_diversity(input = s76, data_col = "cdr3")
+s76 <- djvdj::calc_frequency(input = s76, data_col = "cdr3")
+
+mds <- djvdj::calc_mds(input = s76, data_col = "cdr3", cluster_col = "knn.leiden")
+s76 <- djvdj::define_clonotypes(input = s76, data_cols = "v_gene")
+djvdj::plot_clone_frequency(input = s76, data_col = "cdr3")
+djvdj::plot_frequency(s76, "cdr3")
+djvdj::plot_gene_pairs(s76, data_col = "cdr3", chains = c("TRA", "TRB"))
+table(mds$knn.leiden, mds$cloneType)
+djvdj::plot_mds(mds, data_col = "cdr3", cluster_col = "knn.leiden")
+djvdj::plot_similarity(input = s76, data_col = "cdr3", cluster_col = "knn.leiden")
+djvdj::plot_motifs(input = s76, data_col = "cdr3", cluster_col = "knn.leiden", chain = "TRB")
+djvdj::plot_rarefaction(input = s76, data_col = "cdr3")
+
+s76.pairs <- djvdj::calc_gene_pairs(input = s76, data_col = "cdr3", chains = c("TRA", "TRB"))
+
+table(s76$n_chains, s76$new.clones)
+```
+
+
+## ScVelo
+
+### virtual ennv setup
+
+```{r}
+#scVelo
+use_virtualenv("~/.virtualenvs/r-reticulate")
+
+reticulate::py_config()
+library(reticulate)
+use_python("~/virtualenvs/scvelo/bin/python3.10")
+
+
+mpl <- import("matplotlib", as = "mpl")
+np <- import("numpy", as = "np")
+scv <- import("scvelo", as = "scv")
+
+adata <- scv$datasets$pancreas()
+
+emb <- adata$obsm['X_umap']
+clusters <- adata$obs$clusters
+rownames(emb) <- names(clusters) <- adata$obs_names$values
+
+## get clusters, convert to colors
+col <- rainbow(length(levels(clusters)), s=0.8, v=0.8)
+cell.cols <- col[clusters]
+names(cell.cols) <- names(clusters)
+
+## simple plot
+plot(emb, col=cell.cols, pch=16,
+     xlab='UMAP X', ylab='UMAP Y')
+legend(x=-13, y=0, 
+       legend=levels(clusters),
+       col=col, 
+       pch=16)
+
+
+```
+
+
+
+
+```{r}
+
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

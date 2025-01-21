@@ -1,0 +1,510 @@
+---
+title: "add.new.data"
+output: html_document
+date: "2024-12-06"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+
+
+```{r}
+library(Seurat)
+library(SeuratDisk)
+library(rhdf5)
+library(dplyr)
+library(stringr)
+library(scRepertoire)
+library(BiocParallel)
+library(scDblFinder)
+h5ad_file <- "~/hpchome/ctcl4.4/CTCL_all_final_portal_tags.h5ad"
+
+# Convert the `.h5ad` file to `.h5Seurat` format
+#Convert(h5ad_file, dest = "h5Seurat", overwrite = TRUE)
+
+sobj <- LoadH5Seurat(file="~/hpchome/ctcl4.4/CTCL_all_final_portal_tags.h5seurat",  meta.data = FALSE, misc = FALSE)
+obs <- h5read("~/hpchome/ctcl4.4/CTCL_all_final_portal_tags.h5seurat", "/meta.data")
+
+meta <- data.frame(lapply(names(obs), function(x) { 
+  if (length(obs[[x]])==2) 
+    obs[[x]][['categories']][ifelse(obs[[x]][['codes']] >= 0, obs[[x]][['codes']] + 1, NA)]
+  else 
+    as.numeric(obs[[x]])
+}
+), row.names=Cells(sobj))
+colnames(meta) <- names(obs)
+
+sobj <- AddMetaData(sobj, meta)
+
+table(sobj$donor)
+```
+
+
+
+```{r}
+sobj@reductions$umap <- sobj@reductions$scVI_MDE
+
+DimPlot(sobj, group.by = "donor")+NoLegend()
+DimPlot(sobj, group.by = "cell_type")+NoLegend()
+FeaturePlot(sobj, features = "CD3E")
+FeaturePlot(sobj, features = "CD4")
+FeaturePlot(sobj, features = "CD8A")
+
+rna <- as.data.frame(rownames(sobj))
+VlnPlot(sobj, features = c("nCount_raw_counts", "nFeature_raw_counts"), pt.size = 0)
+```
+
+
+```{r}
+CTCL_seurat.merged <- readRDS("~/hpchome/SAVE/CTCL_seurat.merged.rds")
+colnames(CTCL_seurat.merged@meta.data)
+```
+
+
+```{r}
+# List of CTCL numbers (1 to 8)
+ctcl_numbers <- 1:8
+
+# Initialize an empty list to store the data
+file_list <- list()
+
+# Loop through each CTCL number
+for (i in ctcl_numbers) {
+  # Check the number of files for the current CTCL (3 or 4 files)
+  for (j in 1:4) {
+    file_path <- paste0("~/hpchome/ctcl4.4/CTCL_vdj/filtered_contig_annotations_CTCL", i, "_VDJ", j, ".csv")
+    
+    # Check if the file exists
+    if (file.exists(file_path)) {
+      # Read the CSV file and store it in the list
+      file_name <- paste0("S", i, ".", j)  # Create a dynamic variable name
+      file_list[[file_name]] <- read.csv(file_path)
+    }
+  }
+}
+
+# Check the structure of file_list to verify
+str(file_list)
+```
+
+
+
+```{r}
+list <- c(paste0("CTCL", 1:8))
+keep <- subset(sobj, donor %in% list)
+df <- as.data.frame(colnames(keep))
+
+keep$barcode_number <- str_extract(colnames(keep), "(?<=-)[^_]+")
+
+table(keep$barcode_number)
+
+keep$donor_and_number <- paste0(keep$donor, "_", keep$barcode_number)
+
+table(keep$donor_and_number)
+
+ss <- subset(keep, donor_and_number == "CTCL1_0")
+
+table(keep$donor_and_number)
+colnames(keep)
+names(file_list)
+```
+
+
+```{r}
+file_list <- lapply(file_list, function(df) {
+  df$barcode <- str_replace(df$barcode, "-.*", "")
+  return(df)
+})
+```
+
+
+
+```{r}
+colnames(keep)
+file_list$S1.1$barcode
+keep$barcode_simple <- str_replace(colnames(keep), "-.*", "")
+keep$barcode_simple
+```
+
+
+```{r}
+unique(keep$donor_and_number)
+
+#ss <- subset(keep, donor_and_number == "CTCL2_31")
+
+samples <- unique(keep$donor_and_number)
+# Precompute barcode_simple subsets for all samples to avoid repeated subsetting
+sample_barcodes <- lapply(samples, function(sample) {
+  subset(keep, donor_and_number == sample)$barcode_simple
+})
+
+# Name the list by sample for easier reference
+names(sample_barcodes) <- samples
+
+# Use sapply to compute overlaps, minimizing repetitive operations
+overlap_counts_df <- sapply(file_list, function(df) {
+  sapply(sample_barcodes, function(barcodes) {
+    # Use fast vectorized set operations
+    length(intersect(barcodes, df$barcode))
+  })
+})
+
+```
+
+
+```{r}
+# Ensure overlap_counts_df is a matrix or dataframe
+overlap_counts_df <- as.data.frame(overlap_counts_df)
+rownames(overlap_counts_df) <- samples
+
+# Convert to the desired format
+result <- apply(overlap_counts_df, 1, function(row) {
+  # Find the column (file_list item) with the maximum count
+  max_col <- names(row)[which.max(row)]
+  max_count <- max(row)
+  c(max_col, max_count)
+})
+
+# Convert the result to a dataframe
+result_df <- data.frame(
+  Sample = rownames(overlap_counts_df),
+  MaxColumn = result[1, ],
+  MaxCount = as.numeric(result[2, ])
+)
+
+# Display the result
+print(result_df)
+
+
+
+filtered_result_df <- result_df %>%
+  group_by(MaxColumn) %>%
+  filter(MaxCount == max(MaxCount)) %>%
+  slice(1) %>%  # In case of ties, take the first one
+  ungroup()
+
+# Display the filtered dataframe
+print(filtered_result_df)
+
+file_list.save <- file_list
+
+saveRDS(file_list.save, "~/hpchome/ctcl4.4/file_list.save.rds")
+```
+
+
+
+
+```{r}
+file_list <- lapply(names(file_list), function(name) {
+  # Get the corresponding sample name from filtered_result_df for the current file
+  sample_name <- filtered_result_df$Sample[filtered_result_df$MaxColumn == name]
+  
+  # Append the sample name to the barcodes in the current file
+  file_list[[name]]$barcode <- paste0(file_list[[name]]$barcode, "_", sample_name)
+  
+  # Return the updated dataframe
+  file_list[[name]]
+})
+
+names(file_list) <- names(filtered_result_df$MaxColumn)
+names(file_list) <- names(file_list.save)
+
+intersect(names(file_list), filtered_result_df$MaxColumn)
+setdiff(names(file_list), filtered_result_df$MaxColumn)
+
+
+file_list$S1.1$barcode
+
+keep$barcode_match <- paste0(keep$barcode_simple, "_", keep$donor_and_number)
+
+keep$barcode_match
+
+intersect(file_list$S1.1$barcode, keep$barcode_match)
+
+colnames(keep) <- keep$barcode_match
+```
+
+
+
+```{r}
+combined.TCR <- combineTCR(file_list, 
+                           samples = c(filtered_result_df$Sample),
+                           removeNA = FALSE, 
+                           removeMulti = FALSE, 
+                           filterMulti = TRUE)
+
+colnames(keep) <- paste0(keep$donor_and_number, "_", colnames(keep))
+
+intersect(combined.TCR$CTCL1_1$barcode, colnames(keep))
+
+table(keep$donor_and_number)
+split.keep <- SplitObject(keep, split.by = "donor_and_number")
+
+
+merged_list <- list()
+
+valid_samples <- filtered_result_df$Sample
+for(i in seq_along(valid_samples)){
+  tmp <- valid_samples[i]
+  merged_list[[tmp]] <- combineExpression(combined.TCR[tmp], split.keep[[tmp]], chain = "both", cloneCall = "gene", proportion = TRUE)
+}
+
+screp.merge <- merge(merged_list[[1]], merged_list[-1])
+
+
+sobj.ss <- subset(sobj, donor %in% list)
+sobj.ss$barcode_number <- str_extract(colnames(sobj.ss), "(?<=-)[^_]+")
+table(sobj.ss$barcode_number)
+sobj.ss$donor_and_number <- paste0(sobj.ss$donor, "_", sobj.ss$barcode_number)
+
+
+sobj.ss$barcode_simple <- str_replace(colnames(sobj.ss), "-.*", "")
+colnames(sobj.ss) <- paste0(sobj.ss$barcode_simple, "_", sobj.ss$donor_and_number)
+colnames(sobj.ss) <- paste0(sobj.ss$donor_and_number, "_", colnames(sobj.ss))
+
+colnames(sobj.ss)
+
+sobj.meta.data <- AddMetaData(sobj.ss, screp.merge@meta.data[,17:23])
+
+DimPlot(sobj.meta.data, group.by = "cloneSize")
+
+#sobj.meta.data$cloneSize[is.na(sobj.meta.data$cloneSize)] <- "None"
+
+DimPlot(sobj.meta.data, group.by = "donor")
+table(sobj.meta.data$cloneSize, sobj.meta.data$cell_type)
+
+new.meta.save <- sobj.meta.data@meta.data
+saveRDS(new.meta.save, "~/hpchome/ctcl4.4/new.meta.save2.rds")
+```
+
+
+```{r}
+table(sobj$donor)
+
+
+ctcl.new <- sobj.meta.data
+ctcl.new@assays$RNA <- ctcl.new@assays$raw_counts
+ctcl.new@assays$raw_counts <- NULL
+
+table(ctcl.new$donor)
+
+more.samples <- c(paste0("CTCL", 9:18))
+ctcl.other <- subset(sobj, donor %in% more.samples)
+
+ctcl.other@assays$RNA <- ctcl.other@assays$raw_counts
+ctcl.other@assays$raw_counts <- NULL
+
+
+
+ctcl.new.final <- merge(ctcl.new, ctcl.other)
+#saveRDS(ctcl.new.final, "~/hpchome/ctcl4.4/ctcl.new.final.rds")
+
+table(ctcl.new.final$donor)
+
+
+plot(ctcl.new.final$nCount_raw_counts[1:100], ctcl.new.final$nCount_RNA[1:100])
+plot(ctcl.new.final$nFeature_raw_counts[1:100], ctcl.new.final$nFeature_RNA[1:100])
+```
+
+
+
+
+```{r}
+ctcl.new.final$nCount_RNA <- ctcl.new.final$nCount_raw_counts
+
+ctcl.new.final$nCount_raw_counts <- NULL
+ctcl.new.final$nFeature_raw_counts <- NULL
+ctcl.new.final$n_counts <- NULL
+
+list <- unique(ctcl.new.final$donor)
+
+new.seurat.list <- list()
+
+ss <- subset(ctcl.new.final, donor == "CTCL1")
+ss[["percent.mt"]] <- PercentageFeatureSet(ss, pattern = "^MT-")
+ss[["percent.rb"]] <- PercentageFeatureSet(ss, pattern = "^RBS|RPL")
+
+VlnPlot(ss, features = "percent.mt")
+VlnPlot(ss, features = "percent.rb")
+
+gene_sums <- as.data.frame(rowSums(ctcl.new.final@assays$RNA))
+
+
+
+counts_matrix <- GetAssayData(ctcl.new.final, slot = "counts", assay = "RNA")
+nFeature_RNA_manual <- colSums(counts_matrix > 0)
+ctcl.new.final$nFeature_RNA_manual <- nFeature_RNA_manual
+
+plot(ctcl.new.final$nFeature_RNA[1:1000], ctcl.new.final$nFeature_RNA_manual[1:1000])
+
+
+VlnPlot(ctcl.new.final, features = "nFeature_RNA", pt.size = 0)
+VlnPlot(ctcl.new.final, features = "nFeature_RNA_manual", pt.size = 0)
+
+df <- data.frame("auto" = ctcl.new.final$nFeature_RNA, "man" = ctcl.new.final$nFeature_RNA_manual)
+df$dif <- df$auto - df$man
+max(df$dif)
+
+ctcl.new.final$nFeature_RNA <- ctcl.new.final$nFeature_RNA_manual
+
+list <- list[9:18]
+for(i in seq_along(list)){
+  tmp <- subset(ctcl.new.final, donor == list[i])
+  tmp <- subset(tmp, subset = nFeature_RNA > 100) #filter out low count/feature cells
+  tmp[["percent.mt"]] <- PercentageFeatureSet(tmp, pattern = "^MT-")
+  tmp[["percent.rb"]] <- PercentageFeatureSet(tmp, pattern = "^RBS|RPL")
+  standev <- sd(log(tmp$nFeature_RNA))*2 #cutting off above standard deviation of 2
+  mean <- mean(log(tmp$nFeature_RNA))
+  cut <- round(exp(standev+mean))
+  tmp <- subset(tmp, subset = percent.mt < 15 & nFeature_RNA < cut)
+  sce <- as.SingleCellExperiment(tmp)
+  sce <- scDblFinder(sce, BPPARAM=MulticoreParam(16))
+  doublets <- data.frame(db.class = sce$scDblFinder.class, db.score = sce$scDblFinder.score)
+  rownames(doublets) <- rownames(sce@colData)
+  tmp <- AddMetaData(tmp, doublets)
+  new.seurat.list[i+8] <- tmp
+}
+
+list <- unique(ctcl.new.final$donor)
+
+names(new.seurat.list) <- list
+
+final.all <- merge(new.seurat.list[[1]], new.seurat.list[-1])
+
+table(final.all$donor)
+saveRDS(final.all, "~/hpchome/ctcl4.4/SO_ctcl.new.final.filtered.rds")
+```
+
+
+
+```{r}
+final.all <- readRDS("~/hpchome/ctcl4.4/SO_ctcl.new.final.filtered.rds")
+CTCL_seurat.merged <- readRDS("~/hpchome/SAVE/CTCL_seurat.merged.rds")
+
+final.all$barcode <- paste0(final.all$barcode_simple, final.all$donor_and_number)
+
+meta.orig <- CTCL_seurat.merged@meta.data
+meta.orig <- meta.orig[,c(1:5,8,9,21:27)]
+
+meta.final <- final.all@meta.data
+meta.final <- meta.final[,c(2,11:17,19,20:23,25)]
+
+setdiff(colnames(meta.final), colnames(meta.orig))
+
+colnames(meta.final)
+
+colnames(meta.final)[1] <- "orig.ident"
+colnames(meta.final)[8] <- "Frequency"
+colnames(meta.final)[9] <- "cloneType"
+
+setdiff(colnames(meta.final), colnames(meta.orig))
+intersect(colnames(meta.final), colnames(meta.orig))
+
+
+CTCL_seurat.merged@meta.data <- meta.orig
+final.all@meta.data <- meta.final
+
+
+saveRDS(final.all, "~/hpchome/ctcl4.4/SO_ctcl.new.final.filtered.rds")
+saveRDS(CTCL_seurat.merged, "~/hpchome/ctcl4.4/CTCL_seurat.merged.final.rds")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

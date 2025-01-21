@@ -1,0 +1,250 @@
+---
+title: CTCL atlas Data Processing of Individual runs
+author: 
+- name: Nick Borcherding
+  email: ncborch@gmail.com
+  affiliation: Washington University in St. Louis, School of Medicine, St. Louis, MO, USA
+date: "April 17, 2022"
+output:
+  BiocStyle::html_document:
+    toc_float: true
+
+---
+
+```{r, echo=FALSE, results="hide", message=FALSE}
+knitr::opts_chunk$set(error=FALSE, message=FALSE, warning=FALSE)
+library(BiocStyle)
+```
+
+
+# Loading Libraries
+
+In general I like to load libraries here that we will use universally or during the intitation process, and then call other libraries when we need them in the code chunks that are relevant. 
+
+```{r setup, include=FALSE}
+suppressPackageStartupMessages(library(Seurat))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(gridExtra))
+suppressPackageStartupMessages(library(viridis))
+suppressPackageStartupMessages(library(scDblFinder))
+suppressPackageStartupMessages(library(BiocParallel))
+suppressPackageStartupMessages(library(RColorBrewer))
+suppressPackageStartupMessages(library(ProjecTILs))
+suppressPackageStartupMessages(library(scGate))
+suppressPackageStartupMessages(library(Matrix))
+suppressPackageStartupMessages(library(SingleR))
+suppressPackageStartupMessages(library(celldex))
+suppressPackageStartupMessages(library(scRepertoire))
+suppressPackageStartupMessages(library(stringr))
+
+source("./R/sparse.merger.R")
+```
+
+
+***
+
+# Loading and Processing the Data
+
+## Load, filter and combine Data
+```{r eval=FALSE}
+dir.create("./qc")
+"%!in%" <- Negate("%in%")
+
+file_list <- list.files("./data/sequencingRuns")
+file_list <- file_list[-which(file_list %in% c("S82","Icon\r"))]
+processed.data <- list.files("./data/processedData")
+processed.data <- stringr::str_remove(processed.data, ".rds")
+file_list <- file_list[file_list %!in% processed.data]
+pt.directory <- readxl::read_xlsx("./summaryInfo/File.Inventory.xlsx")
+
+###########################
+#Load Annotation Reference
+###########################
+PT.ref <- load.reference.map("./annotation/ref_TILAtlas_mouse_v1.rds")
+HPCA <- HumanPrimaryCellAtlasData()
+Monaco <- MonacoImmuneData()
+scGate_models_DB <- get_scGateDB()
+
+list <- NULL
+for(i in seq_along(file_list)) {
+  #Samples S31-S53 are not in the traditional 10x filtered matrices format
+  #Here is have made if/else statements to load the data differently
+  #Also to remove any prefix associated with barcodes in those experiments
+  if(file_list[i] %in% paste0("S", 45:53)) {
+    tmp <- read.csv(paste0("./data/sequencingRuns/", file_list[i], "/counts.csv.gz"), row.names = 1)
+    colnames(tmp) <- stringr::str_split(colnames(tmp), "_", simplify = TRUE)[,2]
+  } else if (file_list[i] %in% paste0("S", 31:44)) {
+     tmp <- read.delim(paste0("./data/sequencingRuns/", file_list[i], "/GEX.tsv.gz"), row.names = 1)
+    colnames(tmp) <- stringr::str_split(colnames(tmp), "_", simplify = TRUE)[,2]
+  } else if (file_list[i] %in% paste0("S", 119:126)) {
+    h5 <- Read10X_h5(paste0("./data/sequencingRuns/", file_list[i], "/raw_feature_bc_matrix.h5"))
+    if(class(h5) == "list") {
+
+      tmp <- h5[[1]]
+      ADT <- h5[[2]]
+      joint.bcs <- intersect(colnames(tmp), colnames(ADT))
+
+      # Subset RNA and HTO counts by joint cell barcodes
+      tmp <- tmp[, joint.bcs]
+      ADT<- as.matrix(ADT[, joint.bcs])
+    } else {
+      tmp <- h5
+    }
+  } else if (file_list[i] %in% c("S54", "S55")) {
+      tmp <- read.table(paste0("./data/sequencingRuns/", file_list[i], "/cDNA.txt"))
+      rownames(tmp) <- str_remove_all(rownames(tmp), "hg19_")
+  } else { #Traditional 10x format loading here (majority of the runs)
+    tmp <-  Read10X(paste0("./data/sequencingRuns/", file_list[i]))
+  }
+
+    ##Ocassionally there are data sets that have the "MT-" removed in front of mitochondrial genes - this is a quick fix for that
+    mito <- c("ATP8", "ATP6", "CO1", "CO2", "CO3", "CYB", "ND1", "ND2", "ND3", "ND4L", "ND4", "ND5", "ND6", "RNR2", "TA", "TR", "TN", "TD", "TC", "TE", "TQ", "TG", "TH", "TI", "TL1", "TL2", "TK", "TM", "TF", "TP", "TS1", "TS2", "TT", "TW", "TY", "TV", "RNR1")
+
+    x <- which(rownames(tmp) %in% mito)
+    if (length(x) > 0) {
+      y <- rownames(tmp)[x] 
+      y<- paste0("MT-", y)
+      rownames(tmp)[x] <- y
+    }
+    tmp <- CreateSeuratObject(counts = tmp, project = file_list[i])
+    tmp <- subset(tmp, subset = nFeature_RNA > 100) #filter out low count/feature cells
+    tmp  <- RenameCells(object = tmp , new.names = paste0(file_list[i], "_", rownames(tmp[[]])))
+    
+    ########################################################
+    #SCT Tansform the count data and regress mito/ribo genes
+    #######################################################
+    tmp[["percent.mt"]] <- PercentageFeatureSet(tmp, pattern = "^MT-")
+    tmp[["percent.rb"]] <- PercentageFeatureSet(tmp, pattern = "^RBS|RPL")
+    tmp <- SCTransform(tmp,
+                        vars.to.regress = c('percent.mt', 'percent.rb', "nFeature_RNA"), 
+                       vst.flavor = "v2",
+                       min_cells = 3, 
+                       verbose = FALSE)
+    
+    p1 <- VlnPlot(object = tmp, features = c("nCount_RNA")) + theme(legend.position = "none")
+    p2 <- VlnPlot(object = tmp, features = c("nFeature_RNA")) + theme(legend.position = "none")
+    p3 <- VlnPlot(object = tmp, features = c("percent.mt")) + theme(legend.position = "none")
+    
+    pdf(paste0("./qc/", file_list[i], ".pdf"), height = 8, width=12)
+    grid.arrange(p1, p2, p3, ncol = 3)
+    dev.off()
+    
+    DefaultAssay(tmp) <- "RNA"
+    ###########################
+    #Here is the filtering step
+    ############################
+    standev <- sd(log(tmp$nFeature_RNA))*2 #cutting off above standard deviation of 2
+    mean <- mean(log(tmp$nFeature_RNA))
+    cut <- round(exp(standev+mean))
+    tmp <- subset(tmp, subset = percent.mt < 15 & nFeature_RNA < cut)
+    
+    ###########################################
+    #Estimate Doublets for Each Sequencing Run
+    ############################################
+    sce <- as.SingleCellExperiment(tmp)
+    sce <- scDblFinder(sce, BPPARAM=MulticoreParam(3))
+    doublets <- data.frame(db.class = sce$scDblFinder.class, db.score = sce$scDblFinder.score)
+    rownames(doublets) <- rownames(sce@colData)
+    tmp <- AddMetaData(tmp, doublets)
+    rm(sce)
+    
+    
+    #############################################
+    #Projectil Annotation of Cell Types
+    #############################################
+     gate.check <- scGate(tmp, 
+                  model = scGate_models_DB$human$generic$Tcell.alphabeta)
+      if (length(which(gate.check$is.pure == "Pure")) > 0) {
+      
+          query.projected <- make.projection(tmp, 
+                                             ref = PT.ref, 
+                                             scGate_model = scGate_models_DB$human$generic$Tcell.alphabeta,
+                                             ncores = 1)
+          
+          #Lapply across list of Seurat objects
+          query.projected <- cellstate.predict(ref = PT.ref, query =query.projected , reduction = "umap", ndim = 2)
+            meta.pt <- query.projected[[]][c("functional.cluster", "functional.cluster.conf")]
+            colnames(meta.pt) <- c("PT.annot", "PT.score")
+            rownames(meta.pt) <- stringr::str_remove(rownames(meta.pt), "Q_")
+          tmp <- AddMetaData(tmp, meta.pt)
+          rm(query.projected)
+      } else {
+        tmp$PT.annot <- NA
+        tmp$PT.score <- NA
+      }
+    #############################################
+    #Singler Annotation of Cell Types
+    #############################################
+      
+    tmp.2 <- tmp@assays[["RNA"]]@counts
+    ####This approach for matrix conversion saves some memory
+    tmp.2 <- tmp.2[tabulate(summary(tmp.2)$i) != 0, , drop = FALSE]
+    com.res1 <- SingleR(tmp.2, ref=HPCA, labels=HPCA$label.fine, assay.type.test=1)
+  
+    df <- data.frame("labels" = com.res1$labels, "pruned.labels" = com.res1$pruned.labels)
+    rownames(df) <- rownames(com.res1)
+    colnames(df) <- paste0("HPCA.", colnames(df))
+    tmp <- AddMetaData(tmp,  df)
+  
+    
+    com.res2 <- SingleR(tmp.2, ref=Monaco, labels=Monaco$label.fine, assay.type.test=1)
+    df <- data.frame("labels" = com.res2$labels, "pruned.labels" = com.res2$pruned.labels)
+    rownames(df) <- rownames(com.res1)
+    colnames(df) <- paste0("Monaco.", colnames(df))
+    tmp <- AddMetaData(tmp,  df)
+    rm(tmp.2)
+    rm(df)
+    
+    #################################
+    #Adding Protein-level Data
+    #################################
+    #Samples S31-44 have protein-level quantifications
+    #That can be added to the Seurat objects
+    #This will be incredibly useful in defining subtypes later
+    if (file_list[i] %in% paste0("S", 31:44)) { 
+      ADT <- read.delim(paste0("./data/sequencingRuns/", file_list[i], "/ADT.tsv.gz"), row.names = 1)
+      colnames(ADT) <- stringr::str_split(colnames(ADT), "_", simplify = TRUE)[,2]
+      cell.barcodes <- stringr::str_split(rownames(tmp[[]]), "_", simplify = TRUE)[,2]
+      ADT <- ADT[,colnames(ADT) %in% cell.barcodes ]
+      colnames(ADT) <- paste0(file_list[i], "_", colnames(ADT))
+      adt_assay <- CreateAssayObject(counts = ADT)
+      tmp[["ADT"]] <- adt_assay
+    
+    }
+    
+    if (file_list[i] %in% c("S54", "S55")) {
+      ADT <- read.csv(paste0("./data/sequencingRuns/", file_list[i], "/ADT.csv"), row.names = 1)
+      ADT <- ADT[-c(50:52),]
+      cell.barcodes <- stringr::str_split(rownames(tmp[[]]), "_", simplify = TRUE)[,2]
+      ADT <- ADT[,colnames(ADT) %in% cell.barcodes ]
+      cell.barcodes.not.ADT <- cell.barcodes[cell.barcodes %!in% colnames(ADT)]
+      emp.matrix <- Matrix(data = 0, 
+                         nrow = nrow(ADT), 
+                         ncol = length(cell.barcodes.not.ADT),
+                         dimnames = list(rownames(ADT), cell.barcodes.not.ADT),
+                         sparse = TRUE)
+      ADT <- merge.sparse(list(ADT, emp.matrix))
+      
+      colnames(ADT) <- paste0(file_list[i], "_", colnames(ADT))
+      adt_assay <- CreateAssayObject(counts = ADT)
+      tmp[["ADT"]] <- adt_assay
+    }
+    
+    if (file_list[i] %in% paste0("S", 119:126) && !is.null(ADT)) {
+      cell.barcodes <- stringr::str_split(rownames(tmp[[]]), "_", simplify = TRUE)[,2]
+      ADT <- ADT[,colnames(ADT) %in% cell.barcodes ]
+      colnames(ADT) <-  paste0(file_list[i], "_", colnames(ADT))
+      adt_assay <- CreateAssayObject(counts = ADT)
+      tmp[["ADT"]] <- adt_assay
+    }
+    ADT <- NULL
+    #################################
+    #Saving Preliminary Seurat Object
+    #################################
+    saveRDS(tmp, paste0("./data/processedData/", file_list[i], ".rds"))
+    
+}
+```
+
+

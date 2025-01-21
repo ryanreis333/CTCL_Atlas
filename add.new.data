@@ -1,0 +1,149 @@
+---
+title: "add.new.data"
+output: html_document
+date: "2024-12-06"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+
+
+
+
+```{r}
+library(Seurat)
+library(SeuratDisk)
+h5ad_file <- "~/hpchome/ctcl4.4/CTCL_all_final_portal_tags.h5ad"
+
+# Convert the `.h5ad` file to `.h5Seurat` format
+Convert(h5ad_file, dest = "h5Seurat", overwrite = TRUE)
+
+# Load the `.h5Seurat` file as a Seurat object
+seurat_object <- LoadH5Seurat("~/hpchome/ctcl4.4/CTCL_all_final_portal_tags.h5seurat", meta.data = T, commands = F, misc = F, tools = F)
+
+# Explore the Seurat object
+print(seurat_object)
+
+seurat_object@reductions$scVI_MDE
+DimPlot(seurat_object, reduction = "scVI_MDE")
+
+rna <- as.data.frame(rownames(seurat_object))
+FeaturePlot(seurat_object, features = "CD3E", reduction = "scVI_MDE")
+FeaturePlot(seurat_object, features = "MS4A1", reduction = "scVI_MDE")
+FeaturePlot(seurat_object, features = "KIR3DL3", reduction = "scVI_MDE")
+FeaturePlot(seurat_object, features = "KIR2DL4", reduction = "scVI_MDE")
+FeaturePlot(seurat_object, features = "CXCL13", reduction = "scVI_MDE")
+FeaturePlot(seurat_object, features = "AIRE", reduction = "scVI_MDE")
+```
+
+
+```{r}
+BiocManager::install("zellkonverter")
+library(zellkonverter)
+ad <- readH5AD("~/hpchome/ctcl4.4/CTCL_all_final_portal_tags.h5ad")
+
+asdf <- CreateSeuratObject(counts = t(ad$X), meta.data = ad$obs)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,340 @@
+---
+title: "ctcl.xgboost"
+output: html_document
+date: "2024-10-02"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+
+
+
+```{r}
+
+```{r}
+table(t.cells$new.clones)
+df <- as.data.frame.matrix(table(t.cells$orig.ident, t.cells$new.clones))
+df.query <- subset(df, Malignant > 10 & Non_malignant > 10)
+```
+
+
+```{r}
+colnames(t.cells@assays$RNA@layers$data) <- colnames(t.cells@assays$RNA)
+rownames(t.cells@assays$RNA@layers$data) <- rownames(t.cells@assays$RNA)
+
+df.pred.xgboost <- matrix(nrow = nrow(df.query), ncol = 5)
+
+
+rna <- as.data.frame(rownames(asdf))
+colnames(rna) <- "genes"
+genes <- rna$genes
+tcr_genes <- c(grep("^TRA", genes, v=T), 
+                grep("^TRB",genes,v=T),
+                grep("^TRD", genes, v=T), 
+                grep("^TRG", genes, v=T))
+
+
+
+list <- rownames(df.query)
+
+for(i in seq_along(list)){
+  tmp <- list[i]
+  ss.present <- subset(t.cells, orig.ident == tmp & new.clones %in% c("Non_malignant", "Malignant"))
+  
+  ss.present$fivefold <- 1:5
+  for(j in seq_along(1:5)){
+    hold.out <- subset(ss.present, fivefold == j)
+    train <- subset(ss.present, fivefold != j)
+
+    label <- train$new.clones
+    label <- label == "Malignant"
+    label <- as.numeric(label)
+    
+    mat.in <- train@assays$RNA@layers$data
+    rownames(mat.in) <- rownames(train)
+    keep.genes <- setdiff(rownames(train), tcr_genes)
+    mat.in <- mat.in[keep.genes,]
+    
+    mat.hold <- hold.out@assays$RNA@layers$data
+    rownames(mat.hold) <- rownames(hold.out)
+    mat.hold <- mat.hold[keep.genes,]
+  
+    bstSparse <- xgboost(data = t(mat.in), label = label, max.depth = 6, eta = 0.3, nthread = 30, nrounds = 500, early_stopping_rounds = 25, objective = "binary:logistic")
+    importance_matrix <- xgb.importance(model = bstSparse)
+    importance_matrix$orig.ident <- tmp
+    importance_matrix$round <- j
+    
+    avg <- as.data.frame(AverageExpression(train, assays = "RNA", group.by = "new.clones"))
+    avg <- avg[importance_matrix$Feature, ]
+    importance_matrix$larger.malig <- avg$RNA.Malignant > avg$RNA.Non.malignant
+    
+    pred <- predict(object = bstSparse, newdata = t(mat.hold))
+    hold.out$pred.score.xgboost <- pred
+    hold.out$pred.xgboost <- hold.out$pred.score.xgboost >0.5
+    
+    predictions <- hold.out$pred.score.xgboost
+    names(predictions) <- hold.out$barcode
+    
+    right <- sum(hold.out$pred.xgboost == 1 & hold.out$new.clones == "Malignant")
+    right2 <- sum(hold.out$pred.xgboost == 0 & hold.out$new.clones == "Non_malignant")
+    total <- ncol(hold.out)
+    correct <- (right + right2) / total *100
+    df.pred.xgboost[i,j] <- correct
+    
+    if(i == 1 & j == 1){
+      mat.all <- importance_matrix
+      next()
+    }
+    
+    mat.all <- rbind(mat.all, importance_matrix)
+    } 
+}
+saveRDS(mat.all, file = "importance.matrix.all.rds")
+rownames(df.pred.xgboost) <- rownames(df.query)
+colnames(df.pred.xgboost) <- c("Round_1", "Round_2", "Round_3", "Round_4", "Round_5")
+
+df.pred <- subset(df.query, missing > 10)
+list <- rownames(df.pred)
+
+all.predictions <- numeric()
+for(i in seq_along(list)){
+  tmp <- list[i]
+  subset <- subset(t.cells, orig.ident == tmp)
+  ss.present <- subset(subset, new.clones %in% c("Non_malignant", "Malignant"))
+  ss.missing <- subset(subset, new.clones == "missing")
+  label <- ss.present$new.clones
+  label <- label == "Malignant"
+  label <- as.numeric(label)
+  mat.in <- ss.present@assays$RNA@layers$data
+  rownames(mat.in) <- rownames(ss.present)
+  
+  keep.genes <- setdiff(rownames(mat.in), tcr_genes)
+  mat.in <- mat.in[keep.genes,]
+    
+  mat.missing <- ss.missing@assays$RNA@layers$data
+  rownames(mat.missing) <- rownames(ss.missing)
+  mat.missing <- mat.missing[keep.genes,]
+  
+  bstSparse <- xgboost(data = t(mat.in), label = label, max.depth = 6, eta = 0.3, nthread = 30, nrounds = 500, early_stopping_rounds = 25, objective = "binary:logistic")
+  
+  pred <- predict(object = bstSparse, newdata = t(mat.missing))
+  names(pred) <- colnames(ss.missing)
+    
+  if(i == 1){
+    all.predictions <- pred
+    next()
+  }
+  all.predictions <- append(all.predictions, pred)
+  
+}
+saveRDS(all.predictions, file = "xgboost.all.predictions.rds")
+
+
+
+
+ss <- subset(t.cells, orig.ident %in% list)
+table(ss$new.clones)
+table(ss$new.clones, ss$orig.ident)
+
+
+all.predictions <- ifelse(all.predictions > 0.5, "Malignant", "Non_malignant")
+table(t.cells$new.clones)
+t.cells$new.clones2[t.cells$barcode %in% names(all.predictions)] <- all.predictions[names(all.predictions) %in% t.cells$barcode]
+table(t.cells$new.clones)
+
+table(ss$new.clones)
+
+table(ss$new.clones, ss$orig.ident)
+
+table(all.predictions)
+
+```
+
+
+```{r}
+# Global
+ss.present <- subset(t.cells, new.clones %in% c("Non_malignant", "Malignant"))
+table(ss.present$new.clones)
+label <- ss.present$new.clones
+label <- label == "Malignant"
+label <- as.numeric(label)
+mat.in <- ss.present@assays$RNA@layers$data
+rownames(mat.in) <- rownames(ss.present)
+  
+keep.genes <- setdiff(rownames(mat.in), tcr_genes)
+mat.in <- mat.in[keep.genes,]
+    
+bstSparse <- xgboost(data = t(mat.in), label = label, max.depth = 6, eta = 0.3, nthread = 30, nrounds = 1000, early_stopping_rounds = 25, objective = "binary:logistic")
+importance_matrix <- xgb.importance(model = bstSparse)
+avg <- as.data.frame(AverageExpression(ss.present, assays = "RNA", group.by = "new.clones"))
+avg <- avg[importance_matrix$Feature, ]
+importance_matrix$larger.malig <- avg$RNA.Malignant > avg$RNA.Non.malignant
+
+p <- xgb.plot.tree(model = bstSparse, render = T, trees = 0, feature_names = bstSparse$feature_names)
+
+png("xgboost.tree.png", height = 10000, width = 3000)
+
+library(rsvg)
+library(DiagrammeRsvg)
+rsvg_png(charToRaw(export_svg(p)), "xgboost.tree.png")
+
+
+
+importance_matrix$bin <- ifelse(importance_matrix$larger.malig == "TRUE", 1, -1)
+importance_matrix$Gain_Scaled <- importance_matrix$Gain * importance_matrix$bin
+
+top_15 <- importance_matrix %>%
+  dplyr::arrange(desc(Gain)) %>%
+  head(15)
+library(ggrepel)
+ggplot(data = importance_matrix, aes(x = Gain_Scaled, y = Cover)) +
+  geom_point() +  # Scatter plot
+  geom_label_repel(data = top_15, aes(label = Feature), size = 3, max.overlaps = 10, nudge_y = 0.0005)
+```
+
+
+
+
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
