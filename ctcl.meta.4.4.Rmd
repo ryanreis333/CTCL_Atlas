@@ -1,0 +1,2318 @@
+---
+title: "ctcl.meta.4.4"
+output: html_document
+date: "2024-09-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+
+
+```{r}
+install.packages("Seurat")
+install.packages("ggplot2")
+install.packages("dplyr")
+install.packages("Matrix")
+install.packages("gridExtra")
+install.packages("tidyr")
+install.packages("stringr")
+install.packages("devtools")
+install.packages("viridis")
+install.packages("reticulate")
+install.packages("igraph")
+install.packages("plotly")
+install.packages("BiocManager")
+BiocManager::install("clusterProfiler")
+remotes::install_github('satijalab/seurat-wrappers@community-vignette')
+devtools::install_github("immunogenomics/lisi")
+install.packages("remotes")
+devtools::install_github("ncborcherding/scRepertoire@dev")
+devtools::install_github("ncborcherding/Trex")
+install.packages("scCustomize")
+devtools::install_github("immunogenomics/presto")
+install.packages("xgboost")
+install.packages("readxl")
+install.packages("harmony")
+BiocManager::install("infercnv")
+remotes::install_github("carmonalab/GeneNMF")
+BiocManager::install("fgsea")
+BiocManager::install("msigdbr")
+BiocManager::install("UCell")
+devtools::install_github("ryanreis333/R2easygene")
+devtools::install_github("ryanreis333/R2easyviz")
+BiocManager::install("ComplexHeatmap")
+devtools::install_github("jinworks/CellChat")
+BiocManager::install ("scDblFinder")
+remotes::install_github("bnprks/BPCells/r")
+BiocManager:: install ("gypsum")
+BiocManager::install("celldex")
+remotes::install_github("carmonalab/scGate")
+BiocManager::install("SingleR")
+BiocManager::install("httr2", force = TRUE)
+update.packages()
+```
+
+
+```{r}
+suppressPackageStartupMessages(library(Seurat))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(Matrix))
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(gridExtra))
+suppressPackageStartupMessages(library(tidyr))
+suppressPackageStartupMessages(library(stringr))
+suppressPackageStartupMessages(library(viridis))
+suppressPackageStartupMessages(library(reticulate))
+suppressPackageStartupMessages(library(xgboost))
+suppressPackageStartupMessages(library(igraph))
+suppressPackageStartupMessages(library(plotly))
+suppressPackageStartupMessages(library(clusterProfiler))
+suppressPackageStartupMessages(library(SeuratWrappers))
+suppressPackageStartupMessages(library(scCustomize))
+suppressPackageStartupMessages(library(lisi))
+suppressPackageStartupMessages(library(plotly))
+suppressPackageStartupMessages(library(scRepertoire))
+suppressPackageStartupMessages(library(Trex))
+suppressPackageStartupMessages(library(readxl))
+suppressPackageStartupMessages(library(presto))
+suppressPackageStartupMessages(library(harmony))
+suppressPackageStartupMessages(library(infercnv))
+suppressPackageStartupMessages(library(GeneNMF))
+suppressPackageStartupMessages(library(R2easygene))
+suppressPackageStartupMessages(library(R2easyviz))
+suppressPackageStartupMessages(library(fgsea))
+suppressPackageStartupMessages(library(msigdbr))
+suppressPackageStartupMessages(library(UCell))
+suppressPackageStartupMessages(library(ggalluvial))
+suppressPackageStartupMessages(library(scDblFinder))
+suppressPackageStartupMessages(library(BPCells))
+suppressPackageStartupMessages(library(scGate))
+suppressPackageStartupMessages(library(SingleR))
+suppressPackageStartupMessages(library(celldex))
+```
+
+
+```{r}
+options(future.globals.maxSize = 10 * 1024^3)  # 2 GB
+#Read in new data
+final.all <- readRDS("~/hpchome/ctcl4.4/ctcl.new.final.rds")
+CTCL_seurat.merged <- readRDS("~/hpchome/ctcl4.4/CTCL_seurat.merged.final.rds")
+
+Idents(final.all) <- final.all$orig.ident
+asdf <- merge(final.all, CTCL_seurat.merged)
+
+library(dplyr)
+
+
+asdf$orig.ident <- as.character(asdf$orig.ident)
+# Update the orig.ident column directly
+asdf$orig.ident[asdf$orig.ident == "CTCL1"] <- "S153"
+asdf$orig.ident[asdf$orig.ident == "CTCL2"] <- "S154"
+asdf$orig.ident[asdf$orig.ident == "CTCL3"] <- "S155"
+asdf$orig.ident[asdf$orig.ident == "CTCL4"] <- "S156"
+asdf$orig.ident[asdf$orig.ident == "CTCL5"] <- "S157"
+asdf$orig.ident[asdf$orig.ident == "CTCL6"] <- "S158"
+asdf$orig.ident[asdf$orig.ident == "CTCL7"] <- "S159"
+asdf$orig.ident[asdf$orig.ident == "CTCL8"] <- "S160"
+asdf$orig.ident[asdf$orig.ident == "CTCL9"] <- "S161"
+asdf$orig.ident[asdf$orig.ident == "CTCL10"] <- "S162"
+asdf$orig.ident[asdf$orig.ident == "CTCL11"] <- "S163"
+asdf$orig.ident[asdf$orig.ident == "CTCL12"] <- "S164"
+asdf$orig.ident[asdf$orig.ident == "CTCL13"] <- "S165"
+asdf$orig.ident[asdf$orig.ident == "CTCL14"] <- "S166"
+asdf$orig.ident[asdf$orig.ident == "CTCL15"] <- "S167"
+asdf$orig.ident[asdf$orig.ident == "CTCL16"] <- "S168"
+asdf$orig.ident[asdf$orig.ident == "CTCL17"] <- "S169"
+asdf$orig.ident[asdf$orig.ident == "CTCL18"] <- "S170"
+
+
+table(asdf$orig.ident)
+```
+
+
+
+```{r}
+inventory <- readxl::read_xlsx("FileInventoryUpdatesRyan.xlsx")
+
+meta <- asdf[[]]
+meta$barcode <- colnames(asdf)
+df.samples <- as.data.frame(table(asdf$orig.ident))
+
+adt.assay <- GetAssayData(asdf, assay = "ADT")
+saveRDS(adt.assay, "~/hpchome/ctcl4.4/adt.assay.rds")
+
+asdf@assays$ADT <- NULL
+Idents(asdf) <- asdf$orig.ident
+
+#saveRDS(asdf, "~/hpchome/ctcl4.4/asdf.all.rds")
+asdf <- R2easygene::update_genes(Seurat_obj = asdf, select_assay = "RNA", return_seurat = T, min.cells = 3, min.features = 100)
+
+colnames(asdf@assays$RNA@layers$counts) <- colnames(asdf)
+rownames(asdf@assays$RNA@layers$counts) <- rownames(asdf)
+
+meta <- merge(meta, inventory[,1:14], by.x = "orig.ident", by.y = "Sample")
+
+barcodes <- meta$barcode
+rownames(meta) <- barcodes
+
+asdf[[]] <- meta
+
+asdf.new <- UpdateSeuratObject(asdf)
+asdf <- asdf.new
+
+VlnPlot(asdf, features = "percent.mt", pt.size = 0, y.max = 20)
+VlnPlot(asdf, features = "percent.rb", pt.size = 0)
+VlnPlot(asdf, features = "nCount_RNA", pt.size = 0, y.max = 30000)
+VlnPlot(asdf, features = "nFeature_RNA", pt.size = 0)
+VlnPlot(asdf, features = "HBB", pt.size = 0, y.max = 500)
+table(asdf$db.class)
+
+###############################################################################
+saveRDS(asdf, "~/hpchome/ctcl4.4/asdf.all.unfiltered.rds")
+asdf <- readRDS("~/hpchome/ctcl4.4/asdf.all.unfiltered.rds")
+###############################################################################
+
+asdf <- subset(asdf, percent.rb < 55 & db.class == "singlet")
+
+asdf <- NormalizeData(asdf)
+asdf <- FindVariableFeatures(asdf)
+asdf <- SketchData(
+  object = asdf,
+  ncells = 100000,
+  method = "LeverageScore",
+  sketched.assay = "sketch"
+)
+
+DefaultAssay(asdf) <- "sketch"
+
+asdf <- FindVariableFeatures(asdf)
+asdf <- NormalizeData(asdf)
+asdf <- ScaleData(asdf)
+asdf <- RunPCA(asdf, assay = "sketch")
+asdf <- RunHarmony(asdf, group.by.vars = "orig.ident", 
+				reduction = "pca", assay.use = "sketch", reduction.save = "harmony", ncores = 30)
+asdf <- RunUMAP(asdf, dims = 1:50, return.model = T, reduction = "harmony", reduction.name = "umap.harmony")
+asdf <- FindNeighbors(asdf, dims = 1:50, reduction = "harmony", assay = "sketch")
+asdf <- FindClusters(asdf, resolution = c(.1,.5,1), graph.name = "sketch_nn")
+
+
+##############################################################
+
+
+asdf <- ProjectData(
+  object = asdf,
+  assay = "RNA",
+  full.reduction = "pca.full",
+  sketched.assay = "sketch",
+  sketched.reduction = "harmony",
+  umap.model = "umap.harmony",
+  dims = 1:50,
+  refdata = list(sketch_nn_res.0.1 = "sketch_nn_res.0.1", sketch_nn_res.0.5 = "sketch_nn_res.0.5", sketch_nn_res.1 = "sketch_nn_res.1")
+)
+
+DimPlot(asdf, label = T, label.size = 3, reduction = "full.umap.harmony", group.by = "orig.ident", alpha = 0.1) + NoLegend()
+DimPlot(asdf, label = T, label.size = 3, reduction = "full.umap.harmony", group.by = "sketch_nn_res.0.1", alpha = 0.1) + NoLegend()
+DimPlot(asdf, label = T, label.size = 3, reduction = "full.umap.harmony", group.by = "sketch_nn_res.0.5", alpha = 0.1) + NoLegend()
+DimPlot(asdf, label = T, label.size = 3, reduction = "full.umap.harmony", group.by = "sketch_nn_res.1", alpha = 0.1) + NoLegend()
+
+DimPlot(asdf, reduction = "full.umap.harmony", group.by = "orig.ident", alpha = 0.1, pt.size = .1, raster = F) + NoLegend()
+ggsave("figs.final/int.umap.orig.ident.png", height = 5, width = 8)
+```
+
+
+
+
+
+
+
+```{r}
+Idents(asdf) <- asdf$sketch_nn_res.0.5
+
+levels(asdf@meta.data[["sketch_nn_res.0.5"]])
+asdf@meta.data[["sketch_nn_res.0.5"]] <- factor(asdf@meta.data[["sketch_nn_res.0.5"]], levels = sort(as.numeric(levels(asdf@meta.data[["sketch_nn_res.0.5"]]))))
+levels(asdf@meta.data[["sketch_nn_res.0.5"]])
+
+markers <- FindAllMarkers(asdf, assay = "sketch", only.pos = T, min.pct = .3)
+markers$dif <- markers$pct.1 - markers$pct.2
+markers.ss <- markers %>%
+  group_by(cluster) %>%
+  arrange(desc(dif), .by_group = TRUE) %>%
+  slice_head(n = 10)
+markers.ss <- markers.ss %>%
+  arrange(as.numeric(as.character(cluster)))
+
+unique(Idents(asdf))
+
+asdf <- RenameIdents(asdf, "0" = "T_Cells",
+                     "1" = "Fibroblasts",
+                     "2" = "Keratinocytes",
+                     "3" = "Macrophages",
+                     "4" = "T/NK_Cells",
+                     "5" = "Reactive_Kerat",
+                     "6" = "Vascular_Endo",
+                     "7" = "Myocyte",
+                     "8" = "B_Cells",
+                     "9" = "Plasma_Cells",
+                     "10" = "Monocytes",
+                     "11" = "Mitotic",
+                     "12" = "Dendritic_Cells",
+                     "13" = "Melanocytes",
+                     "14" = "Late_Kerat",
+                     "15" = "Lymph_Endo",
+                     "16" = "Glandular_Epi",
+                     "17" = "Erythrocytes",
+                     "18" = "Plasmacytoid_DC",
+                     "19" = "HSP_T_Cells",
+                     "20" = "Mast_Cells",
+                     "21" = "Platelets",
+                     "22" = "Inflam_Fibro",
+                     "25" = "Inflam_Kerat")
+asdf$celltype.specific <- Idents(asdf)
+Idents(asdf) <- asdf$sketch_nn_res.0.5
+
+asdf <- RenameIdents(asdf, "0" = "T_Cells",
+                     "1" = "Fibroblasts",
+                     "2" = "Keratinocytes",
+                     "3" = "Monocytes",
+                     "4" = "T_Cells",
+                     "5" = "Keratinocytes",
+                     "6" = "Vascular_Endo",
+                     "7" = "Myocyte",
+                     "8" = "B_Cells",
+                     "9" = "Plasma_Cells",
+                     "10" = "Monocytes",
+                     "11" = "Mitotic",
+                     "12" = "Dendritic_Cells",
+                     "13" = "Melanocytes",
+                     "14" = "Keratinocytes",
+                     "15" = "Lymph_Endo",
+                     "16" = "Glandular_Epi",
+                     "17" = "Erythrocytes",
+                     "18" = "Dendritic_Cells",
+                     "19" = "T_Cells",
+                     "20" = "Mast_Cells",
+                     "21" = "Platelets",
+                     "22" = "Fibroblasts",
+                     "25" = "Keratinocytes")
+asdf$celltype <- Idents(asdf)
+Idents(asdf) <- asdf$sketch_nn_res.0.5
+
+DimPlot(asdf, reduction = "full.umap.harmony", group.by = "celltype", alpha = 0.1, pt.size = .1, raster = F, shuffle = T)
+ggsave("figs.final/int.umap.celltype.png", height = 5, width = 9)
+DimPlot(asdf, reduction = "full.umap.harmony", group.by = "celltype.specific", alpha = 0.1, pt.size = .1, raster = F, shuffle = T)
+ggsave("figs.final/int.umap.celltype.specific.png", height = 5, width = 12)
+DimPlot(asdf, reduction = "full.umap.harmony", group.by = "cloneType", alpha = 0.1, pt.size = .1, raster = F, shuffle = T)
+ggsave("figs.final/int.umap.cloneType.png", height = 5, width = 10)
+DimPlot(asdf, reduction = "full.umap.harmony", group.by = "Dx", alpha = 0.1, pt.size = .1, raster = F, shuffle = T)
+ggsave("figs.final/int.umap.Dx.png", height = 5, width = 14)
+DimPlot(asdf, reduction = "full.umap.harmony", group.by = "Tissue", alpha = 0.1, pt.size = .1, raster = F, shuffle = T)
+ggsave("figs.final/int.umap.Tissue.png", height = 5, width = 9)
+
+DimPlot(asdf, reduction = "full.umap.harmony", group.by = "Tissue", alpha = 0.1, pt.size = .1, raster = F, shuffle = T, split.by = "Tissue")
+ggsave("figs.final/int.umap.split.Tissue.png", height = 5, width = 20)
+```
+
+
+```{r}
+Idents(asdf) <- asdf$Dx
+unique((Idents(asdf)))
+asdf <- RenameIdents(object = asdf,
+             "Mycosis fungoides" = "MF",
+             "Sezary Syndrome" = "SS",
+             "Healthy Control" = "HC",
+             "Primary Cutaneous Anaplastic Large Cell Lymphoma" = "PCALCL",
+             "Follicular Mycosis Fungoides" = "FMF")
+
+asdf$Dx <- Idents(asdf)
+
+asdf$has.tcr <- !is.na(asdf$cloneType)
+table(asdf$has.tcr)
+asdf$has.tcr <- ifelse(asdf$has.tcr == TRUE, "TCR_Detected", "No_TCR")
+table(asdf$has.tcr)
+
+asdf$hyper <- asdf$cloneType ==  "Hyperexpanded (0.1 < X <= 1)"
+table(asdf$hyper)
+asdf$hyper <- ifelse(asdf$hyper == TRUE, "Hyperexpanded", "Not_Hyperexpanded")
+table(asdf$hyper)
+asdf$tcr.and.hyper <- paste0(asdf$has.tcr, "_", asdf$hyper)
+table(asdf$tcr.and.hyper)
+asdf$tcr.and.hyper[asdf$tcr.and.hyper == "No_TCR_NA"] <- "No_TCR"
+table(asdf$tcr.and.hyper)
+
+table(asdf$Dx.final)
+
+asdf$cloneType.missing <- asdf$cloneType
+levels(asdf$cloneType.missing) <- c(levels(asdf$cloneType.missing), "missing")
+asdf$cloneType.missing[is.na(asdf$cloneType.missing)] <- "missing"
+asdf$cloneType.missing <- factor(x = asdf$cloneType.missing, levels = c("missing", "Rare (0 < X <= 1e-04)", "Small (1e-04 < X <= 0.001)", "Medium (0.001 < X <= 0.01)", "Large (0.01 < X <= 0.1)", "Hyperexpanded (0.1 < X <= 1)"))
+
+levels(asdf$cloneType.missing)
+
+
+
+asdf$Path.Stage.numeric <- ifelse(asdf$Path.Stage %in% c("IA", "IB", "I"), "Stage_I",
+                                  ifelse(asdf$Path.Stage %in% c("IIA", "IIB", "II"), "Stage_II",
+                                  ifelse(asdf$Path.Stage %in% c("IIIA", "IIIB", "III"), "Stage_III",
+                                  ifelse(asdf$Path.Stage %in% c("IVA", "IVB", "IV"), "Stage_IV", "HC"))))
+table(asdf$Path.Stage, asdf$Path.Stage.numeric)
+asdf$Path.Stage.bin <- ifelse(asdf$Path.Stage %in% c("IA", "IB", "IIA"), "Early_Stage",
+                                  ifelse(asdf$Path.Stage %in% c("IIB", "IIIA", "IIIB", "IVA", "IVB", "IV"), "Late_Stage", "HC"))
+table(asdf$Path.Stage, asdf$Path.Stage.bin)
+
+
+table(asdf$Sample.Type)
+asdf$Sample.Type.simple <- ifelse(asdf$Sample.Type %in% c("patch", "plaque", "patch/plaque"), "patch/plaque",
+                                  ifelse(asdf$Sample.Type %in% c("tumor", "nodule"), "tumor",
+                                  ifelse(asdf$Sample.Type %in% c("blood"), "blood",
+                                  ifelse(asdf$Sample.Type %in% c("erythroderma"), "erythroderma",
+                                  ifelse(asdf$Sample.Type %in% c("HC", "nonlesional", "resolved lesion"), "HC/non_lesional",
+                                  ifelse(asdf$Sample.Type %in% c("lymph node"), "lymph_node",
+                                  ifelse(asdf$Sample.Type %in% c("erythroderma"), "erythroderma",
+                                  ifelse(asdf$Sample.Type %in% c("lesional"), "lesional_NOS","HC"))))))))
+table(asdf$Sample.Type, asdf$Sample.Type.simple)
+
+df.sample.celltype <- as.data.frame.matrix(table(asdf$orig.ident, asdf$celltype))
+
+table(asdf$celltype)
+```
+
+
+
+
+```{r}
+t.cells <- subset(asdf, celltype %in% c("T_Cells", "Mitotic"))
+df.t.sample.hyper <- as.data.frame.matrix(table(t.cells$orig.ident, t.cells$hyper))
+# Subset the cells where CTgene is "NA.NA.NA_NA.NA.NA.NA"
+df.top <- as.data.frame(table(t.cells$CTgene))
+check <- subset(t.cells, CTgene %in% c("NA.NA.NA_NA.NA.NA.NA","NA_NA.NA.NA.NA","NA.NA.NA_NA"))
+table(check$orig.ident)
+df.top <- as.data.frame(table(check$CTaa))
+
+# Update CTgene for specific samples based on CTaa values
+target_samples <- c("S31", "S32", "S33", "S34", "S35", "S36", "S37", "S38", 
+                    "S39", "S40", "S41", "S42", "S43", "S44")
+
+t.cells$CTgene[t.cells$orig.ident %in% target_samples] <- 
+  t.cells$CTaa[t.cells$orig.ident %in% target_samples]
+
+# Split CTgene into alpha and beta chains
+t.cells$split.alpha <- stringr::str_split(t.cells$CTgene, "_", simplify = TRUE)[, 1]
+t.cells$split.beta <- stringr::str_split(t.cells$CTgene, "_", simplify = TRUE)[, 2]
+
+table(t.cells$cloneType)
+t.cells$cloneType[t.cells$Dx == "HC" & t.cells$cloneType == "Hyperexpanded (0.1 < X <= 1)"] <- "Large (0.01 < X <= 0.1)"
+table(t.cells$cloneType)
+
+
+df <- as.data.frame.matrix(table(t.cells$orig.ident, t.cells$hyper))
+
+remove <- rownames(df)[df$Hyperexpanded == 0 | df$Not_Hyperexpanded == 0]
+keep <- setdiff(rownames(df), remove)
+# Initialize storage for new clone assignments
+ss <- subset(t.cells, cloneType == "Hyperexpanded (0.1 < X <= 1)" & orig.ident %in% keep)
+  
+split.alpha <- ss$split.alpha
+names(split.alpha) <- ss$barcode
+split.alpha <- split.alpha[split.alpha != "" & !is.na(split.alpha) & split.alpha != "NA"]
+  
+split.beta <- ss$split.beta
+names(split.beta) <- ss$barcode
+split.beta <- split.beta[split.beta != "" & !is.na(split.beta) & split.beta != "NA"]
+
+
+
+list <- unique(ss$orig.ident)
+save.new.clones <- character()
+
+t.cells$new.clones.a <- NA
+t.cells$new.clones.b <- NA
+for (tmp in list) {
+  # Subset the cells by orig.ident
+  idx <- t.cells$orig.ident == tmp
+  
+  current_alpha <- t.cells$split.alpha[idx]
+  current_beta <- t.cells$split.beta[idx]
+  
+  alpha.top <- split.alpha[names(split.alpha) %in% t.cells$barcode[idx]]
+  alpha.top <- table(alpha.top)
+  alpha.top <- sort(alpha.top, decreasing = TRUE)
+  alpha.top <- names(alpha.top)[1]
+  
+  beta.top <- split.beta[names(split.beta) %in% t.cells$barcode[idx]]
+  beta.top <- table(beta.top)
+  beta.top <- sort(beta.top, decreasing = TRUE)
+  beta.top <- names(beta.top)[1]
+  
+  t.cells$new.clones.a[idx] <- current_alpha %in% alpha.top
+  t.cells$new.clones.b[idx] <- current_beta %in% beta.top
+}
+
+t.cells$new.clones <- ifelse(t.cells$new.clones.a | t.cells$new.clones.b, 
+                             "Malignant", "Non_malignant")
+t.cells$new.clones[t.cells$cloneType.missing == "missing"] <- "missing"
+t.cells$new.clones[t.cells$cloneType.missing == "Hyperexpanded (0.1 < X <= 1)" & t.cells$orig.ident %in% c("S58", "S59", "S60")] <- "Malignant"
+t.cells$new.clones[t.cells$CTaa == "NA_CSALGESYEQYF" & t.cells$orig.ident %in% c("S61", "S62", "S63", "S64")] <- "Malignant"
+t.cells$new.clones[t.cells$CTaa == "NA_CASSLALSGGAYNEQFF" & t.cells$orig.ident == "S3"] <- "Malignant"
+
+
+table(t.cells$new.clones, t.cells$orig.ident)
+table(t.cells$new.clones, t.cells$tcr.and.hyper)
+table(t.cells$new.clones)
+
+
+idx <- t.cells$orig.ident %in% remove
+table(t.cells$new.clones, t.cells$orig.ident)
+t.cells$new.clones[idx]
+
+
+#Read in final.clones
+final.clones <- readRDS(file = "final.clones.rds")
+########################
+
+
+
+t.cells$new.clones[idx] <- final.clones[match(t.cells$barcode[idx], names(final.clones))]
+table(t.cells$new.clones, t.cells$orig.ident)
+t.cells$new.clones[t.cells$Dx == "HC"] <- "Non_malignant"
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+final.clones <- readRDS(file = "final.clones.rds")
+
+rm(asdf.new, meta, new.obj, barcodes)
+gc()
+asdf$nCount_ADT <- NULL
+asdf$nCount_SCT <- NULL
+asdf$nFeature_ADT <- NULL
+asdf$nFeature_SCT <- NULL
+
+asdf$HPCA.pruned.labels <- stringr::word(string = asdf$HPCA.labels, sep = ":")
+Idents(asdf) <- asdf$Dx
+unique((Idents(asdf)))
+asdf <- RenameIdents(object = asdf,
+             "Mycosis fungoides" = "MF",
+             "Sezary Syndrome" = "SS",
+             "Healthy Control" = "HC",
+             "Primary Cutaneous Anaplastic Large Cell Lymphoma" = "PCALCL",
+             "Follicular Mycosis Fungoides" = "FMF")
+asdf$Dx <- Idents(asdf)
+Idents(asdf) <- asdf$knn.leiden
+asdf$has.tcr <- !is.na(asdf$cloneType)
+table(asdf$has.tcr)
+asdf$hyper <- asdf$cloneType ==  "Hyperexpanded (0.1 < X <= 1)"
+table(asdf$hyper)
+asdf$tcr.and.hyper <- paste0(asdf$has.tcr, asdf$hyper)
+
+
+table(asdf$Dx.final)
+asdf$Dx.final.simple <- ifelse(asdf$Dx.final %in% c("CD4_FMF"), "CD4_FMF",
+                             ifelse(asdf$Dx.final %in% c("CD4_MF"), "CD4_MF",
+                             ifelse(asdf$Dx.final %in% c("CD4_PCALCL"), "CD4_PCALCL",
+                             ifelse(asdf$Dx.final %in% c("CD4_SS"), "CD4_SS",
+                             ifelse(asdf$Dx.final %in% c("CD8_MF", "CD8A_MF"), "CD8_MF",
+                             ifelse(asdf$Dx.final %in% c("CD8A_GD_MF", "GD_MF"), "GD_CTCL",
+                             ifelse(asdf$Dx.final %in% c("CD8B_PCALCL"), "CD8_PCALCL",
+                             ifelse(asdf$Dx.final %in% c("CD8B_SS"), "CD8_SS",
+                             ifelse(asdf$Dx.final %in% c("DN_FMF"), "DN_FMF",
+                             ifelse(asdf$Dx.final %in% c("DN_MF"), "DN_MF",
+                             ifelse(asdf$Dx.final == "HC", "HC", NA)))))))))))
+table(asdf$Dx.final.simple, asdf$Dx.final)
+
+levels(asdf$cloneType) <- c(levels(asdf$cloneType), "missing")
+asdf$cloneType[is.na(asdf$cloneType)] <- "missing"
+asdf$cloneType <- factor(x = asdf$cloneType, levels = c("missing", "Rare (0 < X <= 1e-04)", "Small (1e-04 < X <= 0.001)", "Medium (0.001 < X <= 0.01)", "Large (0.01 < X <= 0.1)", "Hyperexpanded (0.1 < X <= 1)"))
+
+
+rna <- as.data.frame(rownames(asdf))
+colnames(rna) <- "genes"
+genes <- rna$genes
+ig_genes <- c(grep("^IGJ", genes, v=T), 
+                grep("^IGH",genes,v=T),
+                grep("^IGK", genes, v=T), 
+                grep("^IGL", genes, v=T))
+tcr_genes <- c(grep("^TRA", genes, v=T), 
+                grep("^TRB",genes,v=T),
+                grep("^TRD", genes, v=T), 
+                grep("^TRG", genes, v=T))
+mito <- grep("^MT-", genes, v=T)
+ribo <- c(grep("^RPL", genes, v=T), 
+                grep("^RPS",genes,v=T))
+cell.cycle <- c(cc.genes$s.genes, cc.genes$g2m.genes)
+other <- c(grep("^MTMR", genes, v=T), grep("^MTND", genes, v=T),"NEAT1","TMSB4X", "TMSB10")
+bad_genes = unique(c(ig_genes, tcr_genes, mito, ribo, cell.cycle, other))
+features.remove <- list(ig_genes, tcr_genes, mito, ribo, cell.cycle, other)
+rm(ig_genes, tcr_genes, mito, ribo, cell.cycle, other)
+
+asdf <- FindVariableFeatures(asdf, nfeatures = 3000, assay = "RNA", layer = "data")
+VariableFeatures(asdf) <- setdiff(VariableFeatures(asdf), bad_genes)
+asdf <- ScaleData(asdf, features = VariableFeatures(asdf))
+asdf <- RunPCA(asdf, features = VariableFeatures(asdf))
+set.seed(42)
+asdf <- RunHarmony(asdf, group.by.vars = "orig.ident", 
+				reduction = "pca", assay.use = "RNA", reduction.save = "harmony", ncores = 30)
+asdf <- RunUMAP(asdf, reduction = "harmony", assay = "RNA", dims = 1:30)
+asdf <- FindNeighbors(object = asdf, reduction = "umap", dims = 1:2)
+asdf <- FindClusters(asdf, resolution = 0.01)
+
+DimPlot(asdf, group.by = "orig.ident", raster = F, alpha = .3)+NoLegend()
+ggsave("~/hpchome/ctcl4.4/figs/umap.orig.ident.png", height = 10, width = 12)
+
+DimPlot(asdf, group.by = "RNA_snn_res.0.01", raster = F, alpha = .3)
+ggsave("~/hpchome/ctcl4.4/figs/umap.res.0.01.png", height = 10, width = 15)
+
+Idents(asdf) <- asdf$RNA_snn_res.0.01
+markers <- FindAllMarkers(object = asdf, only.pos = T, layer = "data", max.cells.per.ident = 1000, logfc.threshold = 1, min.pct = .2)
+markers$dif <- markers$pct.1 - markers$pct.2
+
+markers.ss <- markers %>%
+  group_by(cluster) %>%
+  arrange(desc(dif)) %>%
+  slice_head(n = 20)  
+#save.image(file = "~/hpchome/ctcl4.4.RData")
+DimPlot(asdf, group.by = "celltype", raster = T, alpha = .3, label = F)
+DimPlot(asdf, group.by = "RNA_snn_res.0.01", raster = T, alpha = .3, label = T)
+```
+
+
+```{r}
+Idents(asdf) <- asdf$RNA_snn_res.0.01
+asdf <- RenameIdents(object = asdf, 
+                     "0" = "T_NK_Cells",
+                      "1" = "T_NK_Cells",
+                      "2" = "T_NK_Cells",
+                      "3" = "T_NK_Cells",
+                      "4" = "Myeloid",
+                      "5" = "Fibroblasts",
+                      "6" = "Keratinocytes",
+                      "7" = "Endothelial",
+                      "8" = "B_Cells",
+                      "9" = "Muscle_Cells",
+                      "10" = "Neuronal",
+                      "11" = "T_NK_Cells",
+                      "12" = "Endothelial",
+                      "13" = "Endothelial")
+asdf$celltype <- Idents(asdf)
+DimPlot(asdf, group.by = "RNA_snn_res.0.01", label = T)+NoLegend()
+DimPlot(asdf, group.by = "celltype", label = T)+NoLegend()
+
+asdf$celltype <- Idents(asdf)
+DimPlot(asdf, split.by = "Tissue", raster = F, alpha = .3)
+ggsave("figs/umap.celltype.split.tissue.png", height = 5, width = 20)
+
+r2prop_plot(asdf, celltype = "celltype", reorder = T, orig.ident = "orig.ident")
+ggsave("figs/prop.plot.patient.png", height = 4, width = 20)
+```
+
+
+```{r}
+DimPlot(t.cells, split.by = "cloneType", group.by = "orig.ident")+NoLegend()
+ggsave("figs/umap.t.cells.orig.ident.split.clonetype.png", height = 5, width = 20)
+```
+
+
+
+
+```{r}
+#Run xgboost and save results
+```
+
+
+
+```{r}
+xgboost.all.predictions <- readRDS("xgboost.all.predictions.rds")
+
+xgboost.all.predictions <- ifelse(xgboost.all.predictions > 0.5, "Malignant", "Non_malignant")
+table(t.cells$new.clones)
+t.cells$new.clones[t.cells$barcode %in% names(xgboost.all.predictions)] <- xgboost.all.predictions[names(xgboost.all.predictions) %in% t.cells$barcode]
+table(t.cells$new.clones)
+
+asdf$new.clones <- t.cells$new.clones
+
+asdf$celltype.malig <- asdf$celltype
+table(asdf$celltype.malig)
+asdf$celltype.malig <- as.character(asdf$celltype.malig)
+asdf$celltype.malig[asdf$new.clones == "Malignant"] <- "Malignant"
+asdf$celltype.malig[asdf$new.clones == "Non_malignant"] <- "Non_malignant"
+table(asdf$celltype.malig)
+asdf <- subset(asdf, celltype.malig != "T_NK_Cells")
+
+saveRDS(asdf, file = "~/hpchome/ctcl4.4/updated_seurat_obj.rds")
+
+table(asdf$celltype, asdf$celltype.malig)
+```
+
+
+```{r}
+BiocManager::install("DESeq2")
+library(DESeq2)
+kerat <- subset(asdf, celltype == "Keratinocytes")
+table(kerat$orig.ident)
+kerat <- subset(kerat, Tissue != "blood")
+
+sample_counts <- kerat@meta.data %>%
+  count(orig.ident, name = "cell_count")
+
+# Identify samples with at least 10 cells
+valid_samples <- sample_counts %>%
+  filter(cell_count >= 10) %>%
+  pull(orig.ident)
+
+kerat <- subset(kerat, orig.ident %in% valid_samples)
+kerat.all <- kerat
+
+kerat <- AggregateExpression(object = kerat, assays = "RNA", return.seurat = T, group.by = "orig.ident")
+
+cluster_metadata <- kerat[[]]
+
+original_metadata <- kerat.all@meta.data
+aggregated_metadata <- original_metadata %>%
+  group_by(orig.ident) %>% # Adjust grouping as needed
+  summarize(across(everything(), ~paste(unique(.), collapse = ","))) %>%
+  column_to_rownames(var = "orig.ident") # Ensure rownames match pseudobulk identifiers
+
+# Add the aggregated metadata to the pseudobulk object
+kerat <- AddMetaData(kerat, metadata = aggregated_metadata)
+mat <- kerat@assays$RNA@layers$counts
+rownames(mat) <- rownames(kerat)
+colnames(mat) <- colnames(kerat)
+  
+dds <- DESeqDataSetFromMatrix(mat, 
+                              colData = cluster_metadata, 
+                              design = ~ Dx)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+asdf <- readRDS("~/hpchome/ctcl4.4/updated_seurat_obj.rds")
+library(CellChat)
+table(asdf$Sample.Type)
+patch.plaque <- subset(asdf, Sample.Type %in% c("patch", "patch/plaque", "plaque"))
+tumor <- subset(asdf, Sample.Type == "tumor")
+
+cc.pp <- CellChat::createCellChat(object = patch.plaque, group.by = "celltype.malig")
+cc.tumor <- CellChat::createCellChat(object = tumor, group.by = "celltype.malig")
+
+
+CellChatDB <- CellChatDB.human
+showDatabaseCategory(CellChatDB)
+CellChatDB.use <- CellChatDB
+
+cc.pp <- setIdent(cc.pp, ident.use = "celltype.malig") # set "labels" as default cell identity
+levels(cc.pp@idents) # show factor levels of the cell labels
+groupSize <- as.numeric(table(cc.pp@idents)) # number of cells in each cell group
+cc.pp@DB <- CellChatDB.use
+
+cc.pp <- subsetData(cc.pp) # This step is necessary even if using the whole database
+options(future.globals.maxSize = 12 * 1024^3) # 4 GiB
+future::plan("multisession", workers = 8) # do parallel
+cc.pp <- identifyOverExpressedGenes(cc.pp)
+cc.pp <- identifyOverExpressedInteractions(cc.pp)
+cc.pp <- computeCommunProb(cc.pp, type = "triMean", trim = 0.1)
+cc.pp <- filterCommunication(cc.pp, min.cells = 5)
+cc.pp <- computeCommunProbPathway(cc.pp)
+cc.pp <- aggregateNet(cc.pp)
+
+groupSize <- as.numeric(table(cc.pp@idents))
+par(mfrow = c(1,2), xpd=TRUE)
+netVisual_circle(cc.pp@net$count, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Number of interactions")
+netVisual_circle(cc.pp@net$weight, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Interaction weights/strength")
+
+
+cc.tumor <- setIdent(cc.tumor, ident.use = "celltype.malig") # set "labels" as default cell identity
+levels(cc.tumor@idents) # show factor levels of the cell labels
+groupSize <- as.numeric(table(cc.tumor@idents)) # number of cells in each cell group
+cc.tumor@DB <- CellChatDB.use
+
+cc.tumor <- subsetData(cc.tumor) # This step is necessary even if using the whole database
+options(future.globals.maxSize = 12 * 1024^3) # 4 GiB
+future::plan("multisession", workers = 1) # do parallel
+#future::plan(strategy = "sequential")
+cc.tumor <- identifyOverExpressedGenes(cc.tumor)
+cc.tumor <- identifyOverExpressedInteractions(cc.tumor)
+cc.tumor <- computeCommunProb(cc.tumor, type = "triMean", trim = 0.1)
+cc.tumor <- filterCommunication(cc.tumor, min.cells = 5)
+cc.tumor <- computeCommunProbPathway(cc.tumor)
+cc.tumor <- aggregateNet(cc.tumor)
+
+groupSize <- as.numeric(table(cc.tumor@idents))
+par(mfrow = c(1,2), xpd=TRUE)
+netVisual_circle(cc.tumor@net$count, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Number of interactions")
+netVisual_circle(cc.tumor@net$weight, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Interaction weights/strength")
+
+
+
+object.list <- list(PP = cc.pp, tumor = cc.tumor)
+object.list <- mergeCellChat(object.list, add.names = names(object.list))
+
+gg1 <- compareInteractions(object.list, show.legend = F, group = c(1,2))
+gg2 <- compareInteractions(object.list, show.legend = F, group = c(1,2), measure = "weight")
+gg1 + gg2
+
+netVisual_diffInteraction(object.list, weight.scale = T)
+netVisual_diffInteraction(object.list, weight.scale = T, measure = "weight")
+
+gg1 <- netVisual_heatmap(object.list)
+#> Do heatmap based on a merged object
+gg2 <- netVisual_heatmap(object.list, measure = "weight")
+#> Do heatmap based on a merged object
+gg1 + gg2
+
+
+gg1 <- rankNet(object.list, mode = "comparison", measure = "weight", sources.use = NULL, targets.use = NULL, stacked = T, do.stat = TRUE)
+gg2 <- rankNet(object.list, mode = "comparison", measure = "weight", sources.use = NULL, targets.use = NULL, stacked = F, do.stat = TRUE)
+
+gg1 + gg2
+
+
+
+netVisual_bubble(object.list, sources.use = 5, targets.use = c(1:9), comparison = c(1, 2), angle.x = 45)
+netVisual_bubble(object.list, sources.use = c(1:9), targets.use = 5, comparison = c(1, 2), angle.x = 45)
+
+gg1 <- netVisual_bubble(object.list, sources.use = 5, targets.use = c(1:9),  comparison = c(1, 2), max.dataset = 2, title.name = "Increased signaling in LS", angle.x = 45, remove.isolate = T)
+#> Comparing communications on a merged object
+gg2 <- netVisual_bubble(object.list, sources.use = 5, targets.use = c(1:9),  comparison = c(1, 2), max.dataset = 1, title.name = "Decreased signaling in LS", angle.x = 45, remove.isolate = T)
+#> Comparing communications on a merged object
+gg1
+gg2
+
+object.list2 <- list(cc.pp, cc.tumor)
+pathways.show <- c("CXCL") 
+weight.max <- getMaxWeight(object.list2, slot.name = c("netP"), attribute = pathways.show) # control the edge weights across different datasets
+par(mfrow = c(1,2), xpd=TRUE)
+for (i in 1:length(object.list2)) {
+  netVisual_aggregate(object.list2[[i]], signaling = pathways.show, layout = "circle", edge.weight.max = weight.max[1], edge.width.max = 10, signaling.name = paste(pathways.show, names(object.list2)[i]))
+}
+
+pathways.show <- c("CXCL") 
+par(mfrow = c(1,2), xpd=TRUE)
+ht <- list()
+for (i in 1:length(object.list2)) {
+  ht[[i]] <- netVisual_heatmap(object.list2[[i]], signaling = pathways.show, color.heatmap = "Reds",title.name = paste(pathways.show, "signaling ",names(object.list2)[i]))
+}
+#> Do heatmap based on a single object 
+#> 
+#> Do heatmap based on a single object
+ComplexHeatmap::draw(ht[[1]] + ht[[2]], ht_gap = unit(0.5, "cm"))
+
+object.list@meta$datasets = factor(object.list@meta$datasets, levels = c("PP", "tumor")) # set factor level
+plotGeneExpression(object.list, signaling = "CXCL", split.by = "datasets", colors.ggplot = T, type = "violin")
+
+selectK(object = cc.pp)
+cc.pp <- identifyCommunicationPatterns(object = cc.pp)
+```
+
+
+
+
+```{r}
+VlnPlot(tumor, features = "CD4", group.by = "celltype.malig")
+FeaturePlot(tumor, split.by = "celltype.malig", features = "CD4", order = T)
+ggsave("tmp.png", height = 5, width = 30)
+
+DimPlot(tumor, pt.size = .1, alpha = .3, raster = F)
+DimPlot(patch.plaque, pt.size = .1, alpha = .3, raster = F)
+```
+
+
+
+```{r}
+df <- as.data.frame.matrix(table(asdf$orig.ident, asdf$celltype.malig))
+df.ss <- subset(df, Malignant < 4000 & Malignant > 2000)
+ss <- subset(asdf, orig.ident %in% rownames(df.ss))
+
+
+ss.malig <- subset(ss, celltype.malig == "Malignant")
+
+split.malig <- SplitObject(ss.malig, split.by = "orig.ident")
+
+
+geneNMF.programs <- GeneNMF::multiNMF(split.malig, assay="RNA", slot="data", k=5:8, L1=c(0,0), nfeatures = 2000, scale = T, center = F)
+
+geneNMF.metaprograms <- GeneNMF::getMetaPrograms(geneNMF.programs,
+                                        max.genes=50,
+                                        hclust.method="ward.D2", 
+                                        min.confidence = 0.8, 
+                                        nMP = 12, 
+                                        specificity.weight = 1, weight.explained = 1,
+                                        metric = "jaccard")
+
+ph <- GeneNMF::plotMetaPrograms(geneNMF.metaprograms, jaccard.cutoff = c(0,0.8))
+png(filename = "tmp.png", height = 1000, width = 1000)
+ph
+dev.off()
+
+universe <- rownames(ss.malig)[rowSums(ss.malig) > .01*ncol(ss.malig)]
+top_p.c5 <- lapply(geneNMF.metaprograms$metaprograms.genes, function(program) {
+  runGSEA(program, universe=universe, category = "C5")
+})
+
+malig <- subset(asdf, celltype.malig == "Malignant")
+agg.asdf <- AggregateExpression(object = malig, return.seurat = T, group.by = "orig.ident")
+mat <- agg.asdf@assays[["RNA"]]@layers[["data"]]
+colnames(mat) <- colnames(agg.asdf)
+rownames(mat) <- rownames(agg.asdf)
+mat.out <- runPCA(data.use = t(mat), do.fast = T, dimPC = 50)
+agg.asdf@reductions$umap <- RunUMAP(object = mat.out)
+DimPlot(agg.asdf)+NoLegend()
+FeaturePlot(agg.asdf, features = "CD8A")
+FeaturePlot(agg.asdf, features = "TRDC")
+FeaturePlot(agg.asdf, features = "AIRE")
+FeaturePlot(agg.asdf, features = "KIR3DL2")
+
+list <- unique(asdf$celltype.malig)
+nmf.list <- list()
+for(i in seq_along(list)){
+  tmp <- list[i]
+  ss2 <- subset(ss, celltype.malig == tmp)
+  split.ss <- SplitObject(ss2, split.by = "orig.ident")
+  geneNMF.programs <- GeneNMF::multiNMF(split.ss, assay="RNA", slot="data", k=5:8, L1=c(0,0), nfeatures = 2000, scale = T, center = F)
+  geneNMF.metaprograms <- GeneNMF::getMetaPrograms(geneNMF.programs,
+                                        max.genes=50,
+                                        hclust.method="ward.D2", 
+                                        min.confidence = 0.8, 
+                                        nMP = 12, 
+                                        specificity.weight = 1, weight.explained = 1,
+                                        metric = "jaccard")
+  nmf.list[i] <- geneNMF.metaprograms
+}
+names(nmf.list) <- list
+```
+
+
+## Pseudobulk NMF analysis
+```{r}
+library(NMF)
+asdf$celltype.malig <- asdf$celltype
+table(asdf$celltype.malig)
+asdf$celltype.malig <- as.character(asdf$celltype.malig)
+asdf$celltype.malig[asdf$new.clones == "Malignant"] <- "Malignant"
+asdf$celltype.malig[asdf$new.clones == "Non_malignant"] <- "Non_Malignant"
+table(asdf$celltype.malig)
+asdf <- subset(asdf, celltype.malig != "T_NK_Cells")
+
+rna <- as.data.frame(rownames(asdf))
+colnames(rna) <- "genes"
+genes <- rna$genes
+ig_genes <- c(grep("^IGJ", genes, v=T), 
+                grep("^IGH",genes,v=T),
+                grep("^IGK", genes, v=T), 
+                grep("^IGL", genes, v=T))
+tcr_genes <- c(grep("^TRA", genes, v=T), 
+                grep("^TRB",genes,v=T),
+                grep("^TRD", genes, v=T), 
+                grep("^TRG", genes, v=T))
+mito <- grep("^MT-", genes, v=T)
+ribo <- c(grep("^RPL", genes, v=T), 
+                grep("^RPS",genes,v=T))
+cell.cycle <- c(cc.genes$s.genes, cc.genes$g2m.genes)
+other <- c(grep("^MTMR", genes, v=T), grep("^MTND", genes, v=T),"NEAT1","TMSB4X", "TMSB10")
+bad_genes = unique(c(ig_genes, tcr_genes, mito, ribo, cell.cycle, other))
+features.remove <- list(ig_genes, tcr_genes, mito, ribo, cell.cycle, other)
+rm(ig_genes, tcr_genes, mito, ribo, cell.cycle, other)
+
+################################################################################
+
+combine_matrices_list <- function(matrices_list) {
+  
+  # Step 1: Get all unique column names from all matrices
+  all_colnames <- Reduce(union, lapply(matrices_list, colnames))
+  
+  # Step 2: Align each matrix to the full set of column names, filling missing columns with NA
+  aligned_matrices <- lapply(matrices_list, function(mat) {
+    missing_cols <- setdiff(all_colnames, colnames(mat))
+    
+    # Add missing columns filled with NAs
+    if (length(missing_cols) > 0) {
+      mat <- cbind(mat, matrix(NA, nrow = nrow(mat), ncol = length(missing_cols),
+                               dimnames = list(NULL, missing_cols)))
+    }
+    
+    # Reorder columns to match all_colnames
+    mat <- mat[, all_colnames, drop = FALSE]
+    return(mat)
+  })
+  
+  # Step 3: Combine all aligned matrices by row
+  combined_matrix <- do.call(rbind, aligned_matrices)
+  
+  return(combined_matrix)
+}
+scale_matrix <- function(mat) {
+  min_val <- min(mat)  # Find the minimum value
+  max_val <- max(mat)  # Find the maximum value
+  scaled_mat <- (mat - min_val) / (max_val - min_val)  # Apply the scaling formula
+  return(scaled_mat)
+}
+
+################################################################################
+
+all.matrices <- list()
+list <- c("B-Cells","Endothelial","Fibroblasts","Keratinocytes","Muscle-Cells","Malignant","Myeloid","Non-Malignant")
+asdf$agg <- paste0(asdf$orig.ident, asdf$celltype.malig)
+df.sample.celltypes <- as.data.frame.matrix(table(asdf$celltype.malig, asdf$orig.ident))
+
+df.agg <- as.data.frame(table(asdf$agg))
+df.agg <- subset(df.agg, Freq > 20)
+
+asdf.ss <- subset(asdf, agg %in% df.agg$Var1)
+
+asdf.agg <- AggregateExpression(asdf.ss, return.seurat = T, group.by = c("orig.ident", "celltype.malig"))
+rm(asdf.ss)
+
+df.counts <- as.data.frame.matrix(table(asdf$celltype.malig, asdf$orig.ident))
+
+for(i in seq_along(list)){
+  tmp <- list[i]
+  ss.agg <- subset(asdf.agg, celltype.malig == tmp)
+  mat.ss.agg <- ss.agg@assays$RNA@layers$data
+  ss.agg <- FindVariableFeatures(ss.agg, nfeatures = 2000)
+  features <- VariableFeatures(ss.agg)
+  features <- setdiff(features, bad_genes)
+
+  colnames(mat.ss.agg) <- colnames(ss.agg)
+  rownames(mat.ss.agg) <- rownames(ss.agg)
+
+  mat.ss.agg <- mat.ss.agg[rowSums(mat.ss.agg) >10,]
+  mat.ss.agg <- mat.ss.agg[rownames(mat.ss.agg) %in% features,]
+  mat.ss.agg.scale <- mat.ss.agg
+
+  rownames(mat.ss.agg.scale) <- paste0(tmp, "_", rownames(mat.ss.agg.scale))
+
+  colnames(mat.ss.agg.scale) <- str_extract(colnames(mat.ss.agg.scale), "^[^_]+")
+  colnames(mat.ss.agg.scale) <- str_extract(colnames(mat.ss.agg.scale), "^[^_]+")
+  
+  mat.ss.agg.scale <- apply(mat.ss.agg.scale, 2, function(x) (x - min(x)) / (max(x) - min(x)))
+  all.matrices[[i]] <- mat.ss.agg.scale
+}
+names(all.matrices) <- list
+combined_matrix <- combine_matrices_list(all.matrices)
+
+y <- combined_matrix
+x <- y
+NA_values <- is.na(x)
+# Now a trick: as fixed dummy value (because NA values break other stuffs)
+x[NA_values] <- 123456789
+# run ls-nmf using weights that cancel out the missing values
+w <- matrix(1, nrow(x), ncol(x))
+w[NA_values] <- 0
+
+res <- nmf(x, 3:12, 'ls-nmf', weight = w, nrun = 100)
+
+plot(res)
+
+png("figs/plot.nmf.iter.png", height = 500, width = 750)
+plot(res)
+dev.off()
+
+# Select 6
+
+s <- rnmf(6, y)
+res6 <- nmf(x, 6, 'ls-nmf', weight = w, nrun = 100, seed = s)
+
+w6 <- res6@fit@W
+h6 <- res6@fit@H
+rownames(h6) <- paste0("NMF_",1:6)
+
+inventory <- readxl::read_xlsx("inventory.updated.xlsx")
+annotation_col = data.frame(Dx =inventory$Dx, Stage = inventory$Path.Stage, Tissue = inventory$Tissue, Study = inventory$`GEO Cohort`)
+rownames(annotation_col) <- inventory$Sample
+annotation_col$stage.bin <- ifelse(annotation_col$Stage %in% c("IA", "IB", "IIA"), "early",
+                                   ifelse(annotation_col$Stage == "HC", "HC", "late"))
+annotation_col <- annotation_col[rownames(annotation_col) %in% colnames(h6), , drop = FALSE]
+annotation_col <- annotation_col[,-2]
+
+png("figs/nmf.heatmap.h6.png", height = 600, width = 1000)
+pheatmap::pheatmap(h6, scale = "column", annotation_col = annotation_col, show_colnames = F)
+dev.off()
+
+################################################################################
+
+weight.matrix <- matrix(ncol = 8, nrow = 6)
+rows <- nrow(weight.matrix)
+columns <- ncol(weight.matrix)
+for(i in seq_along(1:rows)){
+  for(j in seq_along(1:columns)){
+    sum.celltype <- sum(w6[rownames(w6) %in% rownames(all.matrices[[j]]), i])
+    sum.total <- sum(w6[, i])
+    weight.matrix[i,j] <- sum.celltype/sum.total *100
+  }
+}
+colnames(weight.matrix) <- list
+rownames(weight.matrix) <- 1:6
+rownames(weight.matrix) <- paste0("NMF_", rownames(weight.matrix))
+
+pheatmap::pheatmap(weight.matrix, cluster_cols = F, cluster_rows = F, color = colorRampPalette(c("white", "black"))(50))
+
+################################################################################
+
+h6.scale <- scale_matrix(t(h6))
+umap_result <- uwot::umap(t(h6))
+umap_df <- as.data.frame(umap_result)  # Extract the UMAP layout
+colnames(umap_df) <- c("UMAP1", "UMAP2")
+
+umap_df$label <- rownames(t(h6))
+umap_df$Dx <- inventory$Dx[inventory$Sample %in% rownames(umap_df)]
+umap_df$Tissue <- inventory$Tissue[inventory$Sample %in% rownames(umap_df)]
+
+ggplot(umap_df, aes(x = UMAP1, y = UMAP2, colour = Path.Stage)) +
+  geom_point() +   # Scatter plot
+  theme_minimal() +
+  labs(title = "UMAP Plot", x = "UMAP 1", y = "UMAP 2")
+
+ggplot(umap_df, aes(x = UMAP1, y = UMAP2, colour = Dx)) +
+  geom_point() +   # Scatter plot
+  theme_minimal() +
+  labs(title = "UMAP Plot", x = "UMAP 1", y = "UMAP 2")
+
+################################################################################
+
+skin <- which(colnames(h6) %in% inventory$Sample[inventory$Tissue == "skin"])
+blood <- which(colnames(h6) %in% inventory$Sample[inventory$Tissue == "blood"])
+
+t.test(h6[1,skin], h6[1,blood])
+t.test(h6[2,skin], h6[2,blood])
+t.test(h6[3,skin], h6[3,blood])
+t.test(h6[4,skin], h6[4,blood])
+t.test(h6[5,skin], h6[5,blood])
+t.test(h6[6,skin], h6[6,blood])
+
+h6[6,skin]
+h6[6,blood]
+
+df.compare <- data.frame("Category" = c(rep("skin", length(h6[6,skin])), rep("blood", length(h6[6,blood]))), "Value" = c(h6[6,skin],h6[6,blood]))
+
+summary_stats <- df.compare %>%
+  group_by(Category) %>%
+  summarise(
+    mean_value = mean(Value),
+    lower_ci = mean(Value) - qt(0.975, df = n() - 1) * sd(Value) / sqrt(n()),
+    upper_ci = mean(Value) + qt(0.975, df = n() - 1) * sd(Value) / sqrt(n())
+  )
+# Create the plot
+ggplot(df.compare, aes(x = Category, y = Value, fill = Category)) +
+  geom_bar(stat = "summary", fun = "mean", position = "dodge", color = "black", width = 0.6) +
+  geom_point(position = position_jitter(width = 0.15), size = 2, alpha = 0.6) +  # Add raw data points
+  geom_errorbar(data = summary_stats, aes(x = Category, y = mean_value, ymin = lower_ci, ymax = upper_ci), width = 0.2) +  # Add CI bars
+  theme_minimal() +
+  labs(title = "", x = "", y = "Values") +
+  scale_fill_manual(values = c("skin" = "blue", "blood" = "red"))
+
+fill.matrix <- combined_matrix
+fill.matrix[is.na(combined_matrix)]<- -10
+pheatmap::pheatmap(fill.matrix, scale = "none", show_rownames = F, show_colnames = T, legend = F, cluster_cols = F)
+```
+
+
+```{r}
+# Repeat for just the skin samples
+
+combined_matrix.skin <- combined_matrix[,colnames(combined_matrix) %in% inventory$Sample[inventory$Tissue == "skin"]]
+
+fill.matrix <- combined_matrix.skin
+fill.matrix[is.na(combined_matrix.skin)]<- -10
+pheatmap::pheatmap(fill.matrix, scale = "none", show_rownames = F, show_colnames = T, legend = F, cluster_cols = F)
+
+
+y <- combined_matrix.skin
+x <- y
+NA_values <- is.na(x)
+# Now a trick: as fixed dummy value (because NA values break other stuffs)
+x[NA_values] <- 123456789
+# run ls-nmf using weights that cancel out the missing values
+w <- matrix(1, nrow(x), ncol(x))
+w[NA_values] <- 0
+
+#res.skin <- nmf(x, 3:12, 'ls-nmf', weight = w, nrun = 100)
+
+#plot(res)
+
+#png("figs/plot.nmf.iter.png", height = 500, width = 750)
+#plot(res)
+#dev.off()
+
+# Select 6
+
+s <- rnmf(6, y)
+res6.skin <- nmf(x, 6, 'ls-nmf', weight = w, nrun = 10, seed = s)
+
+w6.skin <- res6.skin@fit@W
+h6.skin <- res6.skin@fit@H
+rownames(h6.skin) <- paste0("NMF_",1:6)
+
+inventory <- readxl::read_xlsx("inventory.updated.xlsx")
+annotation_col = data.frame(Dx =inventory$Dx, Stage = inventory$Path.Stage, Tissue = inventory$Tissue, Study = inventory$`GEO Cohort`)
+rownames(annotation_col) <- inventory$Sample
+annotation_col$stage.bin <- ifelse(annotation_col$Stage %in% c("IA", "IB", "IIA"), "early",
+                                   ifelse(annotation_col$Stage == "HC", "HC", "late"))
+annotation_col <- annotation_col[rownames(annotation_col) %in% colnames(h6.skin), , drop = FALSE]
+
+png("figs/nmf.heatmap.h6.skin.png", height = 600, width = 1000)
+pheatmap::pheatmap(h6.skin, scale = "none", annotation_col = annotation_col, show_colnames = F)
+dev.off()
+
+
+hc <- which(colnames(h6.skin) %in% inventory$Sample[inventory$Dx == "Healthy Control"])
+table(inventory$Dx)
+mf <- which(colnames(h6.skin) %in% inventory$Sample[inventory$Sample.Type %in% c("patch", "plaque", "patch/plaque", "lesional") & inventory$Dx == "Mycosis fungoides"])
+
+t.test(h6.skin[1,hc], h6.skin[1,mf])
+t.test(h6.skin[2,hc], h6.skin[2,mf])
+t.test(h6.skin[3,hc], h6.skin[3,mf])
+t.test(h6.skin[4,hc], h6.skin[4,mf])
+t.test(h6.skin[5,hc], h6.skin[5,mf])
+t.test(h6.skin[6,hc], h6.skin[6,mf])
+
+
+df.compare <- data.frame("Category" = c(rep("HC", length(h6.skin[2,hc])), rep("MF", length(h6.skin[2,mf]))), "Value" = c(h6.skin[2,hc],h6.skin[2,mf]))
+
+summary_stats <- df.compare %>%
+  group_by(Category) %>%
+  summarise(
+    mean_value = mean(Value),
+    lower_ci = mean(Value) - qt(0.975, df = n() - 1) * sd(Value) / sqrt(n()),
+    upper_ci = mean(Value) + qt(0.975, df = n() - 1) * sd(Value) / sqrt(n())
+  )
+# Create the plot
+ggplot(df.compare, aes(x = Category, y = Value, fill = Category)) +
+  geom_bar(stat = "summary", fun = "mean", position = "dodge", color = "black", width = 0.6) +
+  geom_point(position = position_jitter(width = 0.15), size = 2, alpha = 0.6) +  # Add raw data points
+  geom_errorbar(data = summary_stats, aes(x = Category, y = mean_value, ymin = lower_ci, ymax = upper_ci), width = 0.2) +  # Add CI bars
+  theme_minimal() +
+  labs(title = "", x = "", y = "Values") +
+  scale_fill_manual(values = c("HC" = "blue", "MF" = "red"))
+
+
+
+
+w6.skin <- w6.skin[order(w6.skin[,2], decreasing = TRUE),]
+top100 <- head(rownames(w6.skin), 100)
+top100 <- sub(".*_", "", top100)
+go <- clusterProfiler::enrichGO(gene = top100, keyType = "SYMBOL", OrgDb = "org.Hs.eg.db", ont = "BP")
+
+
+plot(barplot(go, showCategory = 20,font.size = 10))
+
+################################################################################
+
+tumor <- which(colnames(h6.skin) %in% inventory$Sample[inventory$Sample.Type == "tumor"])
+table(inventory$Dx)
+pp <- which(colnames(h6.skin) %in% inventory$Sample[inventory$Sample.Type %in% c("patch", "plaque", "patch/plaque", "lesional")])
+
+t.test(h6.skin[1,tumor], h6.skin[1,pp])
+t.test(h6.skin[2,tumor], h6.skin[2,pp])
+t.test(h6.skin[3,tumor], h6.skin[3,pp])
+t.test(h6.skin[4,tumor], h6.skin[4,pp])
+t.test(h6.skin[5,tumor], h6.skin[5,pp])
+t.test(h6.skin[6,tumor], h6.skin[6,pp])
+
+
+
+df.compare <- data.frame("Category" = c(rep("tumor", length(h6.skin[1,tumor])), rep("pp", length(h6.skin[1,pp]))), "Value" = c(h6.skin[1,tumor],h6.skin[1,pp]))
+
+summary_stats <- df.compare %>%
+  group_by(Category) %>%
+  summarise(
+    mean_value = mean(Value),
+    lower_ci = mean(Value) - qt(0.975, df = n() - 1) * sd(Value) / sqrt(n()),
+    upper_ci = mean(Value) + qt(0.975, df = n() - 1) * sd(Value) / sqrt(n())
+  )
+# Create the plot
+ggplot(df.compare, aes(x = Category, y = Value, fill = Category)) +
+  geom_bar(stat = "summary", fun = "mean", position = "dodge", color = "black", width = 0.6) +
+  geom_point(position = position_jitter(width = 0.15), size = 2, alpha = 0.6) +  # Add raw data points
+  geom_errorbar(data = summary_stats, aes(x = Category, y = mean_value, ymin = lower_ci, ymax = upper_ci), width = 0.2) +  # Add CI bars
+  theme_minimal() +
+  labs(title = "", x = "", y = "Values") +
+  scale_fill_manual(values = c("tumor" = "blue", "pp" = "red"))
+```
+
+
+
+
+```{r}
+y <- combined_matrix.skin
+x <- y
+NA_values <- is.na(x)
+# Now a trick: as fixed dummy value (because NA values break other stuffs)
+x[NA_values] <- 0
+
+s <- rnmf(6, y)
+res6.skin.zero <- nmf(x, 6, nrun = 10, seed = s)
+
+w6.skin.zero <- res6.skin.zero@fit@W
+h6.skin.zero <- res6.skin.zero@fit@H
+rownames(h6.skin.zero) <- paste0("NMF_",1:6)
+
+inventory <- readxl::read_xlsx("inventory.updated.xlsx")
+annotation_col = data.frame(Dx =inventory$Dx, Stage = inventory$Path.Stage, Tissue = inventory$Tissue, Study = inventory$`GEO Cohort`)
+rownames(annotation_col) <- inventory$Sample
+annotation_col$stage.bin <- ifelse(annotation_col$Stage %in% c("IA", "IB", "IIA"), "early",
+                                   ifelse(annotation_col$Stage == "HC", "HC", "late"))
+annotation_col <- annotation_col[rownames(annotation_col) %in% colnames(h6.skin.zero), , drop = FALSE]
+
+png("figs/nmf.heatmap.h6.skin.zero.png", height = 600, width = 1000)
+pheatmap::pheatmap(h6.skin.zero, scale = "none", annotation_col = annotation_col, show_colnames = F)
+dev.off()
+
+
+
+df.compare <- data.frame("Category" = c(rep("tumor", length(h6.skin.zero[5,tumor])), rep("pp", length(h6.skin.zero[5,pp]))), "Value" = c(h6.skin.zero[5,tumor],h6.skin.zero[5,pp]))
+
+summary_stats <- df.compare %>%
+  group_by(Category) %>%
+  summarise(
+    mean_value = mean(Value),
+    lower_ci = mean(Value) - qt(0.975, df = n() - 1) * sd(Value) / sqrt(n()),
+    upper_ci = mean(Value) + qt(0.975, df = n() - 1) * sd(Value) / sqrt(n())
+  )
+# Create the plot
+ggplot(df.compare, aes(x = Category, y = Value, fill = Category)) +
+  geom_bar(stat = "summary", fun = "mean", position = "dodge", color = "black", width = 0.6) +
+  geom_point(position = position_jitter(width = 0.15), size = 2, alpha = 0.6) +  # Add raw data points
+  geom_errorbar(data = summary_stats, aes(x = Category, y = mean_value, ymin = lower_ci, ymax = upper_ci), width = 0.2) +  # Add CI bars
+  theme_minimal() +
+  labs(title = "", x = "", y = "Values") +
+  scale_fill_manual(values = c("tumor" = "blue", "pp" = "red"))
+```
+
+
+
+
+```{r}
+count_per_column <- colSums(df.counts > 20)
+names(count_per_column) <- colnames(df.counts)
+# Output the counts for each column
+print(count_per_column)
+complete <- names(count_per_column[count_per_column >5])
+complete <- intersect(complete, inventory$Sample[inventory$Tissue == "skin"])
+
+combined_matrix.complete <- combined_matrix[,colnames(combined_matrix) %in% complete]
+
+y <- combined_matrix.complete
+
+malig.rows <- which(rownames(x) %in% rownames(all.matrices[["Malignant"]]))
+x <- x[-malig.rows,]
+y <- x
+NA_values <- is.na(x)
+# Now a trick: as fixed dummy value (because NA values break other stuffs)
+x[NA_values] <- 123456789
+# run ls-nmf using weights that cancel out the missing values
+w <- matrix(1, nrow(x), ncol(x))
+w[NA_values] <- 0
+
+#res.skin <- nmf(x, 3:12, 'ls-nmf', weight = w, nrun = 100)
+
+#plot(res)
+
+#png("figs/plot.nmf.iter.png", height = 500, width = 750)
+#plot(res)
+#dev.off()
+
+# Select 6
+
+s <- rnmf(6, y)
+res6.complete <- nmf(x, 6, 'ls-nmf', weight = w, nrun = 10, seed = s)
+
+w6.complete <- res6.complete@fit@W
+h6.complete <- res6.complete@fit@H
+rownames(h6.complete) <- paste0("NMF_",1:6)
+
+inventory <- readxl::read_xlsx("inventory.updated.xlsx")
+annotation_col = data.frame(Dx =inventory$Dx, Stage = inventory$Path.Stage, Tissue = inventory$Tissue, Study = inventory$`GEO Cohort`)
+rownames(annotation_col) <- inventory$Sample
+annotation_col$stage.bin <- ifelse(annotation_col$Stage %in% c("IA", "IB", "IIA"), "early",
+                                   ifelse(annotation_col$Stage == "HC", "HC", "late"))
+annotation_col <- annotation_col[rownames(annotation_col) %in% colnames(h6.complete), , drop = FALSE]
+
+png("figs/nmf.heatmap.h6.complete.png", height = 600, width = 1000)
+pheatmap::pheatmap(h6.complete, scale = "column", annotation_col = annotation_col, show_colnames = F)
+dev.off()
+
+
+weight.matrix <- matrix(ncol = 7, nrow = 6)
+rows <- nrow(weight.matrix)
+columns <- ncol(weight.matrix)
+for(i in seq_along(1:rows)){
+  for(j in seq_along(1:columns)){
+    sum.celltype <- sum(w6.complete[rownames(w6.complete) %in% rownames(all.matrices[[j]]), i])
+    sum.total <- sum(w6.complete[, i])
+    weight.matrix[i,j] <- sum.celltype/sum.total *100
+  }
+}
+list <- list[-6]
+colnames(weight.matrix) <- list
+rownames(weight.matrix) <- 1:6
+rownames(weight.matrix) <- paste0("NMF_", rownames(weight.matrix))
+
+pheatmap::pheatmap(weight.matrix, cluster_cols = F, cluster_rows = F, color = colorRampPalette(c("white", "black"))(50))
+
+
+asdf.agg.sample <- AggregateExpression(object = asdf, group.by = "orig.ident",return.seurat = T)
+asdf.agg.sample <- FindVariableFeatures(asdf.agg.sample)
+asdf.agg.sample <- RunPCA(asdf.agg.sample)
+asdf.agg.sample <- ScaleData(asdf.agg.sample)
+asdf.agg.sample <- RunUMAP(asdf.agg.sample, dims = 1:30)
+
+asdf.agg.sample$Dx <- inventory$Dx
+asdf.agg.sample$Tissue <- inventory$Tissue
+asdf.agg.sample$GEO <- inventory$`GEO Cohort`
+
+DimPlot(asdf.agg.sample, group.by = "Tissue")
+DimPlot(asdf.agg.sample, group.by = "Dx")
+DimPlot(asdf.agg.sample, group.by = "GEO")
+
+VariableFeatures(asdf.agg.sample) <- setdiff(VariableFeatures(asdf.agg.sample), bad_genes)
+Idents(asdf.agg.sample) <- asdf.agg.sample$Tissue
+markers.tissue <- FindAllMarkers(asdf.agg.sample)
+markers.tissue$dif <- markers.tissue$pct.1 - markers.tissue$pct.2
+markers.tissue <- markers.tissue[order(markers.tissue$dif, decreasing = T),]
+markers.tissue <- subset(markers.tissue, cluster == "skin")
+feats <- c(head(markers.tissue$gene, 100), tail(markers.tissue$gene, 100))
+asdf.agg.sample <- ScaleData(asdf.agg.sample, features = feats)
+DoHeatmap(asdf.agg.sample, group.by = "Tissue", features = feats)
+```
+
+
+
+```{r}
+asdf.agg2 <- AggregateExpression(object = asdf, return.seurat = T, group.by = c("orig.ident", "celltype.malig"))
+```
+
+
+
+
+```{r}
+df.counts <- as.data.frame.matrix(table(asdf$celltype.malig, asdf$orig.ident))
+count_per_column <- colSums(df.counts > 20)
+names(count_per_column) <- colnames(df.counts)
+# Output the counts for each column
+print(count_per_column)
+complete <- names(count_per_column[count_per_column >5])
+complete <- intersect(complete, inventory$Sample[inventory$Tissue == "skin"])
+complete.ss <- sample(complete, 10)
+ss <- subset(asdf, orig.ident %in% complete.ss)
+
+
+
+fibroblasts <- subset(ss, celltype.malig == "Fibroblasts")
+fibroblasts <- FindVariableFeatures(fibroblasts, nfeatures = 2000)
+features <- setdiff(VariableFeatures(fibroblasts), bad_genes)
+
+fibroblasts.split <- SplitObject(fibroblasts, split.by = "orig.ident")
+geneNMF.programs <- GeneNMF::multiNMF(fibroblasts.split, assay="RNA", slot="data", k=5:8, L1=c(0,0), scale = F, center = F, hvg = features)
+geneNMF.metaprograms <- GeneNMF::getMetaPrograms(geneNMF.programs,
+                                        max.genes=50,
+                                        hclust.method="ward.D2", 
+                                        min.confidence = 0.8, 
+                                        nMP = 12, 
+                                        specificity.weight = 1, weight.explained = 1,
+                                        metric = "jaccard")
+
+GeneNMF::plotMetaPrograms(geneNMF.metaprograms, jaccard.cutoff = c(0,0.8))
+
+fibroblasts <- ScaleData(fibroblasts, features = features)
+fibroblasts <- AddModuleScore_UCell(obj = fibroblasts, features = geneNMF.metaprograms[["metaprograms.genes"]], ncores = 30, w_neg = 0, slot = "scale.data")
+
+FeaturePlot(fibroblasts, features = "MP1_UCell")
+FeaturePlot(fibroblasts, features = "MP7_UCell")
+FeaturePlot(fibroblasts, features = "MP2_UCell")
+FeaturePlot(fibroblasts, features = "MP12_UCell")
+FeaturePlot(fibroblasts, features = "MP6_UCell")
+
+
+ph <- GeneNMF::plotMetaPrograms(geneNMF.metaprograms, jaccard.cutoff = c(0,0.8))
+png(filename = "tmp.png", height = 1000, width = 1000)
+ph
+dev.off()
+```
+
+
+
+```{r}
+ss <- subset(asdf, orig.ident %in% complete)
+list <- unique(ss$celltype.malig)
+nmf.list <- list()
+for(i in seq_along(list)){
+  tmp <- list[i]
+  ss2 <- subset(ss, celltype.malig == tmp)
+  ss2 <- FindVariableFeatures(ss2, nfeatures = 2000)
+  features <- setdiff(VariableFeatures(ss2), bad_genes)
+  split.ss <- SplitObject(ss2, split.by = "orig.ident")
+  split.ss <- Filter(function(x) ncol(x) >= 25, split.ss)
+  geneNMF.programs <- GeneNMF::multiNMF(split.ss, assay="RNA", slot="data", k=5:8, L1=c(0,0), hvg = features, scale = T, center = F)
+  geneNMF.metaprograms <- GeneNMF::getMetaPrograms(geneNMF.programs,
+                                        max.genes=50,
+                                        hclust.method="ward.D2", 
+                                        min.confidence = 0.8, 
+                                        nMP = 12, 
+                                        specificity.weight = 1, weight.explained = 1,
+                                        metric = "jaccard")
+  nmf.list[[i]] <- geneNMF.metaprograms
+}
+names(nmf.list) <- list
+
+ss.agg <- AggregateExpression(ss, group.by = "orig.ident", return.seurat = T)
+
+ss.agg <- AddModuleScore_UCell(ss.agg, features = nmf.list$Endothelial[["metaprograms.genes"]], name = "Endothelial")
+ss.agg <- AddModuleScore_UCell(ss.agg, features = nmf.list$Myeloid[["metaprograms.genes"]], name = "Myeloid")
+ss.agg <- AddModuleScore_UCell(ss.agg, features = nmf.list$Fibroblasts[["metaprograms.genes"]], name = "Fibroblasts")
+ss.agg <- AddModuleScore_UCell(ss.agg, features = nmf.list$B_Cells[["metaprograms.genes"]], name = "B_Cells")
+ss.agg <- AddModuleScore_UCell(ss.agg, features = nmf.list$Non_Malignant[["metaprograms.genes"]], name = "Non_Malignant")
+ss.agg <- AddModuleScore_UCell(ss.agg, features = nmf.list$Malignant[["metaprograms.genes"]], name = "Malignant")
+ss.agg <- AddModuleScore_UCell(ss.agg, features = nmf.list$Muscle_Cells[["metaprograms.genes"]], name = "Muscle_Cells")
+ss.agg <- AddModuleScore_UCell(ss.agg, features = nmf.list$Keratinocytes[["metaprograms.genes"]], name = "Keratinocytes")
+ss.agg <- AddModuleScore_UCell(ss.agg, features = nmf.list$Neuronal[["metaprograms.genes"]], name = "Neuronal")
+ss.agg <- AddModuleScore_UCell(ss.agg, features = nmf.list$B_Cells[["metaprograms.genes"]], name = "B_Cells")
+
+mat.u.cell <- ss.agg@meta.data[,2:ncol(ss.agg@meta.data)]
+inventory <- readxl::read_xlsx("inventory.updated.xlsx")
+annotation_col = data.frame(Dx =inventory$Dx, Stage = inventory$Path.Stage, Tissue = inventory$Tissue, Study = inventory$`GEO Cohort`)
+rownames(annotation_col) <- inventory$Sample
+annotation_col$stage.bin <- ifelse(annotation_col$Stage %in% c("IA", "IB", "IIA"), "early",
+                                   ifelse(annotation_col$Stage == "HC", "HC", "late"))
+annotation_col.ss <- annotation_col[rownames(annotation_col) %in% colnames(ss.agg), , drop = FALSE]
+
+pheatmap::pheatmap(t(mat.u.cell), scale = "row", annotation_col = annotation_col.ss)
+
+png(filename = "figs/nmf.iter.heatmap.png", height = 1000, width = 1000)
+pheatmap::pheatmap(t(mat.u.cell), scale = "row", annotation_col = annotation_col.ss)
+dev.off()
+
+check <- t(mat.u.cell)
+tumor <- which(colnames(check) %in% inventory$Sample[inventory$Sample.Type == "tumor"])
+pp <- which(colnames(check) %in% inventory$Sample[inventory$Sample.Type %in% c("patch", "plaque", "patch/plaque", "lesional")])
+
+for(i in 1:90){
+  out <- t.test(check[i,tumor], check[i,pp])
+  if(i == 1){
+    out.all <- out[["p.value"]]
+    next()
+  }
+  out.all <- append(out.all, out[["p.value"]])
+}
+
+df.out.all <- as.data.frame(out.all)
+rownames(df.out.all) <- rownames(check)
+t.test(check[73,tumor], check[73,pp])
+t.test(check[2,tumor], check[2,pp])
+t.test(check[3,tumor], check[3,pp])
+t.test(check[4,tumor], check[4,pp])
+t.test(check[5,tumor], check[5,pp])
+t.test(check[6,tumor], check[6,pp])
+
+
+GeneNMF::plotMetaPrograms(nmf.list$B_Cells, jaccard.cutoff = c(0,0.8))
+
+b.cells <- AddModuleScore_UCell(b.cells, features = nmf.list$B_Cells[["metaprograms.genes"]])
+b.cells <- subset(asdf, celltype.malig == "B_Cells")
+
+FeaturePlot(object = b.cells, features = "MP1_UCell")
+FeaturePlot(object = b.cells, features = "MP2_UCell")
+FeaturePlot(object = b.cells, features = "MP3_UCell")
+FeaturePlot(object = b.cells, features = "MP4_UCell")
+FeaturePlot(object = b.cells, features = "MP5_UCell")
+FeaturePlot(object = b.cells, features = "MP6_UCell")
+FeaturePlot(object = b.cells, features = "MP7_UCell")
+FeaturePlot(object = b.cells, features = "MP8_UCell")
+FeaturePlot(object = b.cells, features = "MP9_UCell")
+
+FeaturePlot(object = b.cells, features = "MP3_UCell", split.by = "Sample.Type")
+ggsave("tmp.png", height = 4, width = 25)
+
+
+FeaturePlot(object = asdf, features = "MRPS12", split.by = "Dx")
+ggsave("tmp.png", height = 4, width = 15)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+inventory2 <- inventory
+
+table(inventory2$Dx.final)
+inventory2$Dx.final.simple <- ifelse(inventory2$Dx.final %in% c("CD4_FMF"), "CD4_FMF",
+                             ifelse(inventory2$Dx.final %in% c("CD4_MF"), "CD4_MF",
+                             ifelse(inventory2$Dx.final %in% c("CD4_PCALCL"), "CD4_PCALCL",
+                             ifelse(inventory2$Dx.final %in% c("CD4_SS"), "CD4_SS",
+                             ifelse(inventory2$Dx.final %in% c("CD8_MF", "CD8A_MF"), "CD8_MF",
+                             ifelse(inventory2$Dx.final %in% c("CD8A_GD_MF", "GD_MF"), "GD_CTCL",
+                             ifelse(inventory2$Dx.final %in% c("CD8B_PCALCL"), "CD8_PCALCL",
+                             ifelse(inventory2$Dx.final %in% c("CD8B_SS"), "CD8_SS",
+                             ifelse(inventory2$Dx.final %in% c("DN_FMF"), "DN_FMF",
+                             ifelse(inventory2$Dx.final %in% c("DN_MF"), "DN_MF",
+                             ifelse(inventory2$Dx.final == "HC", "HC", NA)))))))))))
+
+
+inventory2$Dx <- factor(inventory2$Dx)
+inventory2$cd4_cd8 <- factor(inventory2$cd4_cd8)
+inventory2$Dx.final.simple <- factor(inventory2$Dx.final.simple)
+
+inventory_count <- inventory2 %>%
+  group_by(Dx, cd4_cd8, Dx.final.simple) %>%
+  summarise(n = n(), .groups = 'drop')
+
+levels(inventory_count$Dx)
+inventory_count$Dx <- factor(inventory_count$Dx, 
+                             levels = c("Healthy Control","Primary Cutaneous Anaplastic Large Cell Lymphoma",
+                                        "Follicular Mycosis Fungoides",
+                                        "Sezary Syndrome",
+                                        "Mycosis fungoides"))
+levels(inventory_count$cd4_cd8)
+inventory_count$cd4_cd8 <- factor(inventory_count$cd4_cd8, 
+                             levels = c("HC","NEGATIVE",
+                                        "CD8B",
+                                        "CD8A",
+                                        "CD8",
+                                        "CD4"
+                                        ))
+levels(inventory_count$Dx.final.simple)
+inventory_count$Dx.final.simple <- factor(inventory_count$Dx.final.simple, 
+                             levels = c("CD8_PCALCL",
+                                        "CD4_PCALCL",
+                                        "DN_FMF",
+                                        "CD4_FMF",
+                                        "CD8_SS",
+                                        "CD4_SS",
+                                        "GD_CTCL",
+                                        "DN_MF",
+                                        "CD8_MF",
+                                        "CD4_MF",
+                                        "HC"))
+
+
+ggplot(data = inventory_count,
+       aes(axis1 = Dx,       # First variable
+           axis2 = cd4_cd8,  # Second variable
+           axis3 = Dx.final.simple, # Third variable
+           y = n)) +         # y defines the height of the flows
+  geom_alluvium(aes(fill = Dx.final.simple)) +      # Alluvial flows, colored by Dx.final
+  geom_stratum() +                           # Strata on each axis
+  geom_text(stat = "stratum",                # Labels for strata
+            aes(label = after_stat(stratum))) +
+  scale_x_discrete(limits = c("Dx", "CD4/CD8", "Dx.final.simple"),  # Correct axis labels
+                   expand = c(0.15, 0.05)) + # Expand spacing between the axes
+  theme_void()
+ggsave("~/hpchome/ctcl4.4/figs/alluvial.dx.png", height = 10, width = 8)
+
+rm(inventory2, inventory_count)
+```
+
+
+```{r}
+table(t.cells$cloneType, t.cells$new.clones)
+
+# Ensure the order of barcodes in xgboost.all.predictions.new.clones is aligned with t.cells
+matching_indices <- match(t.cells$barcode, names(xgboost.all.predictions.new.clones))
+
+# Only update non-NA matches
+t.cells$final.clones <- NA
+t.cells$final.clones[!is.na(matching_indices)] <- xgboost.all.predictions.new.clones[matching_indices[!is.na(matching_indices)]]
+
+t.cells$final.clones[t.cells$barcode %in% names(xgboost.all.predictions.new.clones)] <- xgboost.all.predictions.new.clones
+
+xgboost.all.predictions.new.clones
+
+t.cells.new <- e$t.cells
+
+final.clones <- t.cells.new$final.clones
+saveRDS(object = final.clones, file = "final.clones.rds")
+t.cells$final.clones <- final.clones
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+asdf$celltype.malig <- asdf$celltype
+table(asdf$celltype.malig)
+asdf$celltype.malig <- as.character(asdf$celltype.malig)
+asdf$celltype.malig[asdf$new.clones == "Malignant"] <- "Malignant"
+asdf$celltype.malig[asdf$new.clones == "Non_malignant"] <- "Non_Malignant"
+table(asdf$celltype.malig)
+asdf <- subset(asdf, celltype.malig != "T_NK_Cells")
+
+df.counts <- as.data.frame.matrix(table(asdf$celltype.malig, asdf$orig.ident))
+count_per_column <- colSums(df.counts > 20)
+names(count_per_column) <- colnames(df.counts)
+# Output the counts for each column
+print(count_per_column)
+complete <- names(count_per_column[count_per_column >5])
+inventory <- readxl::read_xlsx("inventory.updated.xlsx")
+complete <- intersect(complete, inventory$Sample[inventory$Tissue == "skin"])
+ss <- subset(asdf, orig.ident %in% complete)
+
+
+ss2 <- subset(ss, Dx == "MF")
+
+hc <- subset(ss, Dx == "HC")
+
+
+
+list <- unique(hc$orig.ident)
+list2 <- unique(ss2$orig.ident)
+
+s1 <- subset(ss2, orig.ident == "S1")
+
+s1.ss <- subset(s1, barcode %in% sample(s1$barcode, 100))
+agg.s1 <- AggregateExpression(s1.ss)
+s1.ss2 <- subset(s1, barcode %in% sample(s1$barcode, 100))
+agg.s1.2 <- AggregateExpression(s1.ss2)
+
+intersect(s1.ss2$barcode, s1.ss$barcode)
+
+
+
+
+
+sample1 <- sample(s1$barcode, 100)
+s1.ss <- subset(s1, barcode %in% sample1)
+agg.s1 <- AggregateExpression(s1.ss)
+agg.s1 <- as.matrix(agg.s1[["RNA"]])
+
+
+sample2 <- sample(s1$barcode, 100)
+s1.ss2 <- subset(s1, barcode %in% sample2)
+agg.s1.2 <- AggregateExpression(s1.ss2)
+agg.s1.2 <- as.matrix(agg.s1.2[["RNA"]])
+
+
+
+
+intersect(s1.ss2$barcode, s1.ss$barcode)
+
+all <- cbind(agg.s1, agg.s1.2)
+
+plot(all[,1], all[,2])
+
+
+
+for(i in seq_along(list2[1:5])){
+  tmp <- list2[i]
+  ss2 <- subset(ss, orig.ident == tmp)
+  for(j in seq_along(1:10)){
+    sample1 <- sample(ss2$barcode, 100)
+    ss2.ss <- subset(ss2, barcode %in% sample1)
+    agg.ss2.ss <- AggregateExpression(ss2.ss)
+    agg.ss2.ss <- as.matrix(agg.ss2.ss[["RNA"]])
+    if(i == 1 & j == 1){
+      all <- agg.ss2.ss
+      next()
+    }
+    all <- cbind(all, agg.ss2.ss)
+  }
+}
+```
+
+
+
+
+```{r}
+# Convert labels to factor for classification
+labels <- factor(pseudobulk_data$labels)
+  
+# Prepare the training data
+pseudobulk_matrix <- as.data.frame(t(pseudobulk_data$pseudobulk_matrix))
+  
+# Split the data into training and test sets
+set.seed(123)
+train_idx <- sample(seq_len(nrow(pseudobulk_matrix)), size = 0.8 * nrow(pseudobulk_matrix))
+train_data <- pseudobulk_matrix[train_idx, ]
+test_data <- pseudobulk_matrix[-train_idx, ]
+train_labels <- labels[train_idx]
+test_labels <- labels[-train_idx]
+  
+# Train a random forest model
+rf_model <- randomForest(x = train_data, y = train_labels, ntree = 100)
+  
+# Evaluate the model
+predictions <- predict(rf_model, test_data)
+accuracy <- sum(predictions == test_labels) / length(test_labels)
+  
+cat("Model Accuracy:", accuracy, "\n")
+  
+return(rf_model)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
