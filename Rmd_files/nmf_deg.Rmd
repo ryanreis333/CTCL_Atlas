@@ -1,0 +1,340 @@
+---
+title: "NMF_DEG"
+output: html_document
+date: "2025-03-10"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+t.cells <- subset(merge, celltype == "T_Cells")
+
+t.umap <- readRDS(file = "~/hpchome/ctcl4.4/int_results/t.umap.rds")
+clusters.t <- readRDS(file = "~/hpchome/ctcl4.4/int_results/clusters.t.rds")
+
+t.cells@reductions$umap.t.cells <- t.umap
+t.cells$clusters.t.cells <- clusters.t
+
+DimPlot(t.cells, reduction = "umap.t.cells", split.by = "final.clones", group.by = "orig.ident", label = T)+NoLegend()
+DimPlot(t.cells, reduction = "umap.t.cells", split.by = "final.clones", group.by = "clusters.t.cells")
+DimPlot(t.cells, reduction = "umap.t.cells", group.by = "clusters.t.cells", label = T)
+table(t.cells$clusters.t.cells)
+```
+
+
+```{r}
+df.prop.cancer.clusters <- t.cells@meta.data[t.cells$final.clones == "malig",]
+
+df.prop.cancer.clusters <- df.prop.cancer.clusters %>%
+  group_by(orig.ident, clusters.t.cells) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(orig.ident) %>%
+  mutate(proportion = n / sum(n))
+
+df.prop.cancer.clusters <- df.prop.cancer.clusters[,c(1,2,4)] %>%
+  tidyr::pivot_wider(
+    names_from = orig.ident,
+    values_from = proportion,
+    values_fill = 0
+  )
+df.prop.cancer.clusters <- as.data.frame(df.prop.cancer.clusters)
+#rownames(df.prop.cancer.clusters) <- paste0("Cluster_", df.prop.cancer.clusters$clusters.t.cells)
+df.prop.cancer.clusters <- df.prop.cancer.clusters[,-1]
+
+pheatmap(df.prop.cancer.clusters, show_colnames = F)
+
+df.prop.cancer.clusters.ss <- df.prop.cancer.clusters[-9,]
+
+pheatmap(df.prop.cancer.clusters, show_colnames = F)
+pheatmap(df.prop.cancer.clusters.ss, show_colnames = F)
+```
+
+
+
+
+```{r}
+t.cells$final.clones.norm.clusters <- t.cells$final.clones
+t.cells$final.clones.norm.clusters[t.cells$final.clones == "non_malig"] <- t.cells$clusters.t.cells[t.cells$final.clones == "non_malig"]
+table(t.cells$final.clones.norm.clusters)
+```
+
+
+```{r}
+#t.ss <- subset(t.cells, clusters.t.cells %in% c("6","2","4","5","8"))
+df <- as.data.frame.matrix(table(t.cells$orig.ident, t.cells$final.clones))
+df.query <- subset(df, malig > 20 & non_malig > 20)
+
+t.ss <- subset(t.cells, orig.ident %in% rownames(df.query) & clusters.t.cells != "9")
+
+split.t <- SplitObject(object = t.ss, split.by = "orig.ident")
+
+markers.split.t <- lapply(names(split.t), FUN = function(sample_name) {
+  # Get the current sample
+  x <- split.t[[sample_name]]
+  
+  # Set identities to "final.clones"
+  Idents(x) <- x$final.clones.norm.clusters
+  
+  # Extract only the "S1" column (assuming proportions are numeric)
+  hc.clusters <- df.prop.cancer.clusters.ss[df.prop.cancer.clusters.ss[[sample_name]] > 0.1, , drop = FALSE]
+  hc.clusters <- rownames(hc.clusters)
+  
+  # Filter hc.clusters to only those with ≥3 cells in this sample
+  cluster_counts <- table(Idents(x))
+  hc.clusters <- hc.clusters[hc.clusters %in% names(cluster_counts[cluster_counts >= 3])]
+
+  # Skip if no valid clusters
+  if (length(hc.clusters) == 0) {
+    message("Skipping ", sample_name, ": no valid clusters with ≥3 cells")
+    return(NULL)
+  }
+  
+  print(sample_name)
+  # Find markers for "malig" vs. other clones
+  markers.x <- FindMarkers(
+    x,
+    ident.1 = "malig",
+    ident.2 = hc.clusters) # Cluster of interest
+  
+  # Filter for significant markers (adjusted p-value < 0.05)
+  #markers.x <- subset(markers.x, p_val_adj < 0.05)
+  
+  # Add the sample name to the results
+  markers.x$sample <- sample_name
+  
+  markers.x$gene <- rownames(markers.x)
+  
+  # Return the significant markers with the sample name
+  return(markers.x)
+})
+
+names(markers.split.t) <- names(split.t)
+
+markers.split.t <- markers.split.t[-which(names(markers.split.t) == "S104")]
+
+markers.split.t2 <- lapply(markers.split.t, FUN = function(x) {
+  # Extract avg_log2FC and gene names
+  res <- data.frame(
+    gene = rownames(x),
+    avg_log2FC = x$avg_log2FC,
+    sample = x$sample
+  )
+  return(res)
+})
+
+# Combine all results into one data frame
+combined_results <- do.call(rbind, markers.split.t2)
+
+markers.matrix <- combined_results %>%
+  pivot_wider(names_from = sample, values_from = avg_log2FC, values_fill = list(avg_log2FC = 0))
+
+markers.matrix <- as.data.frame(markers.matrix)
+rownames(markers.matrix) <- markers.matrix$gene
+markers.matrix$gene <- NULL
+
+totals <- as.data.frame(rowSums(markers.matrix))
+
+pheatmap(markers.matrix, cluster_cols = T, cluster_rows = T)
+
+zero_counts <- rowSums(markers.matrix == 0)
+hist(zero_counts, breaks = 100)
+markers.matrix.ss <- as.matrix(markers.matrix[zero_counts <= 60, ])
+pheatmap(markers.matrix.ss)
+
+column_sds <- apply(markers.matrix.ss, 2, sd)
+samples_with_zero_sd <- names(column_sds[column_sds == 0])
+markers.matrix.ss <- markers.matrix.ss[,!is.na(column_sds) & column_sds != 0]
+
+markers.matrix.ss.scaled <- scale(markers.matrix.ss)
+markers.matrix.ss.scaled[markers.matrix.ss.scaled > 3] <- 3
+markers.matrix.ss.scaled[markers.matrix.ss.scaled < -3] <- -3
+pheatmap(markers.matrix.ss.scaled)
+
+df.sum <- data.frame(rowSums(markers.matrix.ss.scaled))
+```
+
+```{r}
+cor.markers.matrix.ss <- cor(t(markers.matrix.ss.scaled))
+cor.cells.matrix.ss <- cor(markers.matrix.ss.scaled)
+
+metadata <- t.cells@meta.data[, c("Path.Stage.bin", "Dx.final", "orig.ident", "Tissue")]  # Replace with your columns
+collapsed_metadata <- metadata %>%
+  group_by(orig.ident) %>%
+  summarize(
+    Path.Stage.bin = dplyr::first(Path.Stage.bin),  # Use dplyr::first explicitly
+    Dx.final = dplyr::first(Dx.final),                           # Use dplyr::first explicitly
+    Tissue = dplyr::first(Tissue) 
+    )
+rownames(collapsed_metadata) <- collapsed_metadata$orig.ident
+
+annotation_df <- data.frame(Path.Stage.bin = collapsed_metadata$Path.Stage.bin, Dx.final = collapsed_metadata$Dx.final, Tissue = collapsed_metadata$Tissue)
+
+rownames(annotation_df) <- rownames(collapsed_metadata)
+
+pheatmap(cor.cells.matrix.ss, annotation_col = annotation_df, annotation_legend = T)
+
+pheatmap(cor.markers.matrix.ss[1:1000,1:1000])
+```
+
+
+
+```{r}
+library(DESeq2)
+# 1. Create pseudobulk counts
+pseudobulk <- AggregateExpression(
+  t.ss,
+  assays = "SCT",
+  slot = "counts",
+  group.by = c("orig.ident", "final.clones"),
+  return.seurat = FALSE
+)
+
+nm <- grep("non-malig", colnames(pseudobulk$SCT))
+mal <- setdiff(grep("malig", colnames(pseudobulk$SCT)), nm)
+# 2. Extract counts for "malig" and "other" clones
+malig_counts <- pseudobulk$SCT[, mal]
+other_counts <- pseudobulk$SCT[, nm]
+
+countdata <- as.matrix(cbind(malig_counts, other_counts))
+which(is.infinite(countdata))
+# 3. Create a DESeq2 object
+dds <- DESeqDataSetFromMatrix(
+  countData = countdata,
+  colData = data.frame(
+    condition = c(rep("malig", ncol(malig_counts)), rep("nonmalig", ncol(malig_counts))),
+    sample = rep(colnames(malig_counts), 2)
+  ),
+  design = ~ condition
+)
+
+# 4. Run DESeq2
+dds <- DESeq(dds)
+res <- results(dds)
+
+res.df <- as.data.frame(res@listData)
+rownames(res.df) <- res@rownames
+
+
+res <- results(object = dds, contrast = c("condition", "malig", "nonmalig"))
+res.table <- as.data.frame(res@listData)
+rownames(res.table) <- res@rownames
+res.table$gene <- rownames(res.table)
+
+res.table <- res.table[order(-res.table$stat),]
+
+vsdata <- vst(dds, blind = FALSE)
+res.vst.table <- vsdata@assays@data@listData[[1]]
+
+pca.out <- plotPCA(object = vsdata, ntop = 500, returnData = T)
+plotPCA(object = vsdata, ntop = 500)
+
+```
+
+
+```{r}
+vst.Counts <- res.vst.table
+sigs <- subset(res.table, padj < 0.05)
+
+sigs <- sigs[order(sigs$stat, decreasing = TRUE),]
+
+tcr_genes <- grep("^TR[ABDG][VDJC]", rownames(merge), value = TRUE)
+ig_genes <- grep("^IG[JHKL][VDJCMG]", rownames(merge), value = TRUE)
+
+
+sigs.ss <- subset(sigs, gene %!in% c(tcr_genes, ig_genes))
+
+keep <- c(head(rownames(sigs.ss), 50), tail(rownames(sigs.ss), 50))
+
+mat <- vst.Counts[keep,]
+
+pheatmap(mat, cluster_cols = F, scale = "row", cluster_rows = F)
+```
+
+
+
+```{r}
+objects_to_keep <- c("merge","t.cells","markers","markers.ss","markers.matrix", "%!in%")
+#Remove all objects except the ones to keep
+rm(list = setdiff(ls(), objects_to_keep))
+gc()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

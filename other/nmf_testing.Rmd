@@ -1,0 +1,565 @@
+---
+title: "testing.Rmd"
+output: html_document
+date: "2025-02-07"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+
+
+
+```{r}
+install.packages("tidyverse")
+install.packages("Seurat")
+install.packages("dplyr")
+install.packages("patchwork")
+install.packages("pheatmap")
+```
+
+
+```{r}
+library(Seurat)
+library(dplyr)
+library(patchwork)
+library(ggplot2)
+library(pheatmap)
+```
+
+
+```{r}
+library(future.apply)
+plan(multicore, workers = 4)
+```
+
+
+
+```{r}
+closs_nmf <- function(v, param, k_s, k_d, init = "random", flag = 0, 
+                      max_iter = 2000, tol = 0.001) {
+  # Dimensions and parameters
+  m <- nrow(v)
+  n <- ncol(v)
+  lambda <- param$lammda / 2    # Half of the L2 regularization parameter
+  alpha  <- param$alpha         # Laplacian regularization weight for rows
+  beta   <- param$beta / 2      # Half of the Laplacian regularization weight for columns
+  k      <- param$k            # Latent dimensionality (number of factors)
+  sita   <- param$sita         # Scale parameter controlling dropout weighting
+  
+  # Optional sparsity (L1) regularization parameters for w and h
+  lambda_L1_w <- ifelse(is.null(param$lambda_L1_w), 0, param$lambda_L1_w)
+  lambda_L1_h <- ifelse(is.null(param$lambda_L1_h), 0, param$lambda_L1_h)
+  
+  epsilon <- 1e-16  # Small constant to avoid division by zero
+  
+  # Binary indicator matrices: 
+  # 'ct' marks observed (nonzero) entries,
+  # 'un' marks dropouts (zeros).
+  un <- matrix(as.integer(v == 0), m, n)
+  ct <- matrix(as.integer(v > 0), m, n)
+  
+  # Initialization: use random initialization (or NNDSVD if defined)
+  if (init == "random") {
+    w <- matrix(runif(m * k, min = 0, max = 1) * 0.1, nrow = m, ncol = k)
+    h <- matrix(runif(k * n, min = 0, max = 1) * 0.1, nrow = k, ncol = n)
+  } else if (init == "nndsvd") {
+    # Assumes that nndsvd_init_parameter is defined elsewhere
+    init_res <- nndsvd_init_parameter(v, k, flag)
+    w <- init_res$w
+    h <- init_res$h
+  } else {
+    stop("Unsupported initialization method")
+  }
+  
+  # Helper function: reconstruct v from w and h
+  reconstruct_v <- function(w, h) {
+    w %*% h
+  }
+  
+  # Update m: compute a weighting matrix that adapts to dropout sensitivity.
+  # For observed entries (v > 0), weight is set to 1.
+  # For zeros, weight decays exponentially with the magnitude of the predicted value.
+  update_m <- function(w, h) {
+    pre <- reconstruct_v(w, h)
+    m_matrix <- matrix(1, m, n)
+    # For dropout entries: lower weight if the predicted expression is high
+    m_matrix[v == 0] <- exp(-abs(pre[v == 0]) / sita)
+    m_matrix
+  }
+  
+  # Update w using multiplicative update rules:
+  # - Includes dynamic weighting from m_matrix.
+  # - Adds Laplacian regularization via k_d.
+  # - Adds an L1 penalty (lambda_L1_w) for sparsity.
+  update_w <- function(m_matrix, w, h) {
+    term_wh <- w %*% h
+    num <- (m_matrix * v) %*% t(h) + alpha * (k_d %*% w)
+    den <- (m_matrix * term_wh + lambda * un * term_wh) %*% t(h) +
+      alpha * ((w %*% t(w)) %*% w) + epsilon + lambda_L1_w
+    w * (num / den)
+  }
+  
+  # Update h using multiplicative update rules:
+  # - Incorporates dynamic weighting, Laplacian regularization via k_s,
+  #   and an L1 penalty (lambda_L1_h) for sparsity.
+  update_h <- function(m_matrix, w, h) {
+    term_wh <- w %*% h
+    num <- t(w) %*% (m_matrix * v) + beta * (h %*% k_s)
+    den <- t(w) %*% (m_matrix * term_wh + lambda * un * term_wh) +
+      beta * ((h %*% t(h)) %*% h) + epsilon + lambda_L1_h
+    h * (num / den)
+  }
+  
+  # Check for convergence based on relative changes in w and h
+  break_iteration <- function(w_old, h_old, w_new, h_new) {
+    dw <- max(abs(w_old - w_new)) / (sqrt(.Machine$double.eps) + max(abs(w_old)))
+    dh <- max(abs(h_old - h_new)) / (sqrt(.Machine$double.eps) + max(abs(h_old)))
+    max(dw, dh) <= tol
+  }
+  
+  # Main training loop: iteratively update m_matrix, w, and h until convergence
+  for (i in 1:max_iter) {
+    w_old <- w
+    h_old <- h
+    m_matrix <- update_m(w, h)
+    w <- update_w(m_matrix, w, h)
+    h <- update_h(m_matrix, w, h)
+    if (break_iteration(w_old, h_old, w, h))
+      break
+  }
+  
+  list(m = m_matrix, w = w, h = h)
+}
+
+```
+
+```{r}
+# Example input matrix v and parameters
+v <- matrix(sample(0:10, 50000, replace = TRUE), nrow = 100, ncol = 500)
+v <- read.csv("mat.csv", header = T) 
+rownames(v) <- v$X
+v <- v[, -1]
+v <- as.matrix(v)
+param <- list(lammda = 0.1, alpha = 0.2, beta = 0.1, k = 20, sita = 1)
+
+# For v with dimensions m x n:
+k_d <- diag(nrow(v))  # m x m
+k_s <- diag(ncol(v))  # n x n
+
+# Run the Closs_NMF algorithm
+result <- closs_nmf(v, param, k_s, k_d, max_iter = 100, tol = 0.001)
+
+# Extract the weighting and factor matrices
+final_m <- result$m
+final_w <- result$w
+final_h <- result$h
+
+approx <- final_w %*% final_h
+mse <- sum((v - approx)^2) / (nrow(v) * ncol(v))
+
+plot(approx[1:100,1:100], v[1:100,1:100], main = paste("MSE:", mse))
+
+
+cell_types <- sapply(strsplit(colnames(v), "\\."), function(x) x[1])
+
+# Create the annotation data frame
+annotation_col <- data.frame(CellType = factor(cell_types))
+rownames(annotation_col) <- colnames(v)
+
+pheatmap::pheatmap(v, cluster_cols = T, cluster_rows = T, annotation_col = annotation_col)
+pheatmap::pheatmap(approx, cluster_cols = T, cluster_rows = T, annotation_col = annotation_col)
+```
+
+
+```{r}
+pbmc.data <- Read10X(data.dir = "~/learningR4.3/filtered_gene_bc_matrices/hg19/")
+
+pbmc <- CreateSeuratObject(counts = pbmc.data, project = "pbmc3k", min.cells = 3, min.features = 200)
+asdf <- pbmc
+
+asdf <- FindVariableFeatures(asdf)
+asdf <- NormalizeData(asdf)
+asdf <- ScaleData(asdf)
+asdf <- RunPCA(asdf, npcs = 30, verbose = FALSE)
+asdf <- RunUMAP(asdf, reduction = "pca", dims = 1:30)
+asdf <- FindNeighbors(asdf)
+asdf <- FindClusters(asdf, resolution = 0.5) 
+
+DimPlot(asdf, label = TRUE) + NoLegend()
+
+mat <- asdf@assays$RNA@layers$data
+rownames(mat) <- rownames(asdf@assays$RNA)
+colnames(mat) <- colnames(asdf@assays$RNA)
+mat <- as.matrix(mat)
+
+param <- list(lammda = 0.1, alpha = 0.2, beta = 0.1, k = 20, sita = 1)
+v <- mat
+# For v with dimensions m x n:
+k_d <- diag(nrow(v))  # m x m
+k_s <- diag(ncol(v))  # n x n
+
+# Run the Closs_NMF algorithm
+result <- closs_nmf(v, param, k_s, k_d, max_iter = 100, tol = 0.001)
+
+# Extract the weighting and factor matrices
+final_m <- result$m
+final_w <- result$w
+final_h <- result$h
+
+approx <- final_w %*% final_h
+mse <- sum((v - approx)^2) / (nrow(v) * ncol(v))
+
+cor_pearson <- cor(as.vector(v), as.vector(approx), method = "pearson")
+cor_spearman <- cor(as.vector(v), as.vector(approx), method = "spearman")
+
+dropout_rate_before <- sum(v == 0) / length(v)
+dropout_rate_after <- sum(approx == 0) / length(approx)
+
+plot(approx[1:100,1:100], v[1:100,1:100], main = paste("MSE:", mse))
+
+annotation_col <- data.frame(CellType = asdf$seurat_clusters)
+rownames(annotation_col) <- colnames(v)
+
+pheatmap::pheatmap(v, cluster_cols = T, cluster_rows = T, annotation_col = annotation_col)
+pheatmap::pheatmap(approx, cluster_cols = T, cluster_rows = T, annotation_col = annotation_col)
+
+
+```
+
+
+
+```{r}
+imputed_seurat <- asdf
+imputed_seurat@assays$RNA@data <- as.matrix(approx)
+
+imputed_seurat <- FindVariableFeatures(imputed_seurat)
+imputed_seurat <- ScaleData(imputed_seurat)
+imputed_seurat <- RunPCA(imputed_seurat, npcs = 30, verbose = FALSE)
+imputed_seurat <- RunUMAP(imputed_seurat, reduction = "pca", dims = 1:30)
+imputed_seurat <- FindNeighbors(imputed_seurat)
+imputed_seurat <- FindClusters(imputed_seurat, resolution = 0.5) 
+
+DimPlot(asdf, label = TRUE)
+DimPlot(imputed_seurat, label = TRUE)
+```
+
+
+```{r}
+library(FNN)  # For kNN graph
+
+# Extract PCA embeddings from Seurat
+pca_embeddings <- asdf@reductions$pca@cell.embeddings
+
+# Compute kNN similarity graph (e.g., k=10)
+knn_graph <- get.knn(pca_embeddings, k = 10)
+similarity_matrix <- matrix(0, nrow = nrow(pca_embeddings), ncol = nrow(pca_embeddings))
+
+for (i in 1:nrow(knn_graph$nn.index)) {
+  similarity_matrix[i, knn_graph$nn.index[i, ]] <- 1
+}
+
+# Convert to adjacency matrix
+k_d <- similarity_matrix
+diag(k_d) <- 1
+
+#########################################
+
+gene_cor <- cor(t(v), method = "pearson")
+
+# Convert to similarity matrix
+k_s <- abs(gene_cor)  # Absolute value to ensure non-negative values
+diag(k_s) <- 1  # Ensure self-similarity
+
+##########################################
+
+param <- list(lammda = 0.1, alpha = 0.2, beta = 0.1, k = 20, sita = 1)
+
+# Run Closs_NMF
+result2 <- closs_nmf(mat, param, k_s, k_d, max_iter = 100, tol = 0.001)
+
+# Extract results
+final_w2 <- result2$w
+final_h2 <- result2$h
+approx2 <- final_w2 %*% final_h2
+
+mse <- sum((v - approx2)^2) / (nrow(v) * ncol(v))
+
+cor_pearson <- cor(as.vector(v), as.vector(approx2), method = "pearson")
+cor_spearman <- cor(as.vector(v), as.vector(approx2), method = "spearman")
+
+dropout_rate_before <- sum(v == 0) / length(v)
+dropout_rate_after <- sum(approx2 == 0) / length(approx2)
+
+plot(approx[1:1000,1:1000], approx2[1:1000,1:1000], main = paste("MSE:", mse))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+######################### NEW 2.12.25 #######################################
+
+
+```{r}
+closs_nmf2 <- function(v, k_s, k_d, init = "random", flag = 0,
+                       max_iter = 2000, tol = 0.001, lambda = 0.5, 
+                       alpha = 0.1, beta = 0.1, k = 20, sita = 1, 
+                       tau = 0.1, lambda_L1_w = 0, lambda_L1_h = 0) {
+  # Dimensions of the input matrix
+  m <- nrow(v)  # number of genes
+  n <- ncol(v)  # number of cells
+
+  # Compute gene-specific dropout thresholds if not provided:
+  tau.s <- rep(0, m)  # Initialize tau.s
+  if (tau != 0) {
+    for (i in 1:m) {
+      nonzero_vals <- v[i, v[i, ] > 0]
+      if (length(nonzero_vals) > 0) {
+        tau.s[i] <- tau * mean(nonzero_vals)
+      } else {
+        tau.s[i] <- tau  # fallback value if no nonzero entries
+      }
+    }
+  }
+
+  epsilon <- 1e-16  # Small constant to avoid division by zero
+
+  # Create binary indicator matrix for dropouts (zeros)
+  un <- matrix(as.integer(v == 0), m, n)
+
+  # Initialization: use random initialization (or NNDSVD if specified)
+  if (init == "random") {
+    w <- matrix(runif(m * k, min = 0, max = 1) * 0.1, nrow = m, ncol = k)
+    h <- matrix(runif(k * n, min = 0, max = 1) * 0.1, nrow = k, ncol = n)
+  } else if (init == "nndsvd") {
+    # Assumes that nndsvd_init_parameter is defined elsewhere
+    init_res <- nndsvd_init_parameter(v, k, flag)
+    w <- init_res$w
+    h <- init_res$h
+  } else {
+    stop("Unsupported initialization method")
+  }
+
+  # Helper function: reconstruct v from w and h.
+  reconstruct_v <- function(w, h) {
+    w %*% h
+  }
+
+  # Update m: compute an adaptive weighting matrix based on dropout sensitivity.
+  update_m <- function(w, h) {
+    pre <- reconstruct_v(w, h)
+    m_matrix <- matrix(1, m, n)
+    dropout_idx <- (v == 0)
+    for (i in 1:m) {
+      idx <- which(dropout_idx[i, ])
+      if (length(idx) > 0) {
+        m_matrix[i, idx] <- ifelse(abs(pre[i, idx]) < tau.s[i],
+                                   epsilon,
+                                   exp(-abs(pre[i, idx]) / sita))
+      }
+    }
+    m_matrix
+  }
+
+  # Update w using multiplicative update rules, including Laplacian (via k_d) and L1 regularization.
+  update_w <- function(m_matrix, w, h) {
+    term_wh <- w %*% h
+    num <- (m_matrix * v) %*% t(h) + alpha * (k_d %*% w)
+    den <- (m_matrix * term_wh + lambda * un * term_wh) %*% t(h) +
+      alpha * ((w %*% t(w)) %*% w) + epsilon + lambda_L1_w
+    w * (num / den)
+  }
+
+  # Update h using multiplicative update rules, including Laplacian (via k_s) and L1 regularization.
+  update_h <- function(m_matrix, w, h) {
+    term_wh <- w %*% h
+    num <- t(w) %*% (m_matrix * v) + beta * (h %*% k_s)
+    den <- t(w) %*% (m_matrix * term_wh + lambda * un * term_wh) +
+      beta * ((h %*% t(h)) %*% h) + epsilon + lambda_L1_h
+    h * (num / den)
+  }
+
+  # Initialize a vector to store convergence history.
+  conv_history <- numeric(max_iter)
+
+  # Main iterative loop.
+  for (i in 1:max_iter) {
+    w_old <- w
+    h_old <- h
+    m_matrix <- update_m(w, h)
+    w <- update_w(m_matrix, w, h)
+    h <- update_h(m_matrix, w, h)
+
+    # Compute maximum relative change in w and h.
+    dw <- max(abs(w_old - w)) / (sqrt(.Machine$double.eps) + max(abs(w_old), epsilon))
+    dh <- max(abs(h_old - h)) / (sqrt(.Machine$double.eps) + max(abs(h_old), epsilon))
+    conv_history[i] <- max(dw, dh)
+
+    if (conv_history[i] <= tol) {
+      conv_history <- conv_history[1:i]  # Trim convergence history
+      break
+    }
+  }
+
+  # Return the final adaptive weight matrix, factor matrices, and convergence history.
+  list(m = m_matrix, w = w, h = h, conv_history = conv_history)
+}
+
+```
+
+
+
+
+
+
+
+
+```{r}
+asdf <- FindVariableFeatures(asdf, assay = "RNA", nfeatures = 2000)
+mat.ss <- mat[VariableFeatures(asdf), ]
+
+pca_embeddings <- asdf@reductions$pca@cell.embeddings
+k_s <- cor(t(pca_embeddings))
+
+#diag(k_s) <- 1
+#k_s <- diag(nrow(mat.ss))  # m x m
+
+k_d <- diag(nrow(mat.ss))  # n x n
+
+
+
+param <- list(
+  lammda = 0.01,       # Reduced L2 regularization
+  alpha = 0.1,         # Laplacian regularization for rows
+  beta = 0.1,          # Laplacian regularization for columns
+  k = 20,              # Increased number of factors
+  sita = .01,          # Increased dropout sensitivity parameter
+  lambda_L1_w = 2,  # Reduced L1 for W
+  lambda_L1_h = 2   # Reduced L1 for H
+)
+
+# Run the Closs_NMF algorithm
+result <- closs_nmf2(mat.ss,
+                     k_d = k_d, 
+                     k_s = k_s, 
+                     max_iter = 100, 
+                     tol = 0.0001,      
+                     lambda = 0.01,
+                     alpha = 0.01,         # Laplacian regularization for rows
+                     beta = 0.01,          # Laplacian regularization for columns
+                     k = 50,              # Increased number of factors
+                     sita = 1,          # Increased dropout sensitivity parameter
+                     lambda_L1_w = 1,  # Reduced L1 for W
+                     lambda_L1_h = 1,  # Reduced L1 for H
+                     tau = .1,
+                     init = "random") 
+
+# Extract the weighting and factor matrices
+final_m <- result$m
+final_w <- result$w
+final_h <- result$h
+
+approx <- final_w %*% final_h
+
+sum(mat.ss)
+sum(approx)
+
+approx <- approx * (sum(mat.ss) / sum(approx))
+sum(approx)
+mse <- sum((mat.ss - approx)^2) / (nrow(mat.ss) * ncol(mat.ss))
+
+cor_pearson <- cor(as.vector(mat.ss), as.vector(approx), method = "pearson")
+cor_spearman <- cor(as.vector(mat.ss), as.vector(approx), method = "spearman")
+
+dropout_rate_before <- sum(mat.ss == 0) / length(mat.ss)
+dropout_rate_after <- sum(approx == 0) / length(approx)
+dropout_rate_after2 <- sum(approx < 0.1) / length(approx)
+
+plot(approx[1:1000,1:100], mat.ss[1:1000,1:100], main = paste("MSE:", mse))
+
+df <- data.frame("approx" = rowSums(approx[1:1000,1:100]), "original" = rowSums(mat.ss[1:1000,1:100]))
+df$dif <- (df$approx - df$original)/(df$original+1)
+
+annotation_col <- data.frame(CellType = asdf$seurat_clusters)
+rownames(annotation_col) <- colnames(mat.ss)
+
+imputed_seurat <- asdf
+impute <- CreateAssayObject(data = approx, key = "impute_")
+imputed_seurat@assays$impute <- impute
+imputed_seurat@assays$impute@counts <- imputed_seurat@assays$impute@data
+
+DefaultAssay(imputed_seurat) <- "RNA"
+FeaturePlot(imputed_seurat, features = "MS4A1")
+DefaultAssay(imputed_seurat) <- "impute"
+FeaturePlot(imputed_seurat, features = "MS4A1")
+
+VlnPlot(imputed_seurat, features = "MS4A1", group.by = "seurat_clusters", assay = "RNA")
+VlnPlot(imputed_seurat, features = "MS4A1", group.by = "seurat_clusters", assay = "impute")
+
+imputed_seurat <- ScaleData(imputed_seurat, assay = "RNA", features = markers.ss$gene)
+imputed_seurat <- ScaleData(imputed_seurat, assay = "impute", features = markers.ss$gene)
+
+DoHeatmap(imputed_seurat, markers.ss$gene, assay = "RNA", group.by = "seurat_clusters")
+DoHeatmap(imputed_seurat, markers.ss$gene, assay = "impute", group.by = "seurat_clusters")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

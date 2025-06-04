@@ -1,0 +1,244 @@
+---
+title: "ctcl.final_processing"
+output: html_document
+date: "2025-03-03"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r}
+suppressPackageStartupMessages(library(Seurat))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(Matrix))
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(gridExtra))
+suppressPackageStartupMessages(library(tidyr))
+suppressPackageStartupMessages(library(stringr))
+suppressPackageStartupMessages(library(viridis))
+suppressPackageStartupMessages(library(reticulate))
+suppressPackageStartupMessages(library(xgboost))
+suppressPackageStartupMessages(library(igraph))
+suppressPackageStartupMessages(library(plotly))
+suppressPackageStartupMessages(library(clusterProfiler))
+suppressPackageStartupMessages(library(SeuratWrappers))
+suppressPackageStartupMessages(library(scCustomize))
+suppressPackageStartupMessages(library(lisi))
+suppressPackageStartupMessages(library(plotly))
+suppressPackageStartupMessages(library(scRepertoire))
+suppressPackageStartupMessages(library(Trex))
+suppressPackageStartupMessages(library(readxl))
+suppressPackageStartupMessages(library(presto))
+suppressPackageStartupMessages(library(harmony))
+suppressPackageStartupMessages(library(infercnv))
+suppressPackageStartupMessages(library(GeneNMF))
+suppressPackageStartupMessages(library(R2easygene))
+suppressPackageStartupMessages(library(R2easyviz))
+suppressPackageStartupMessages(library(fgsea))
+suppressPackageStartupMessages(library(msigdbr))
+suppressPackageStartupMessages(library(UCell))
+suppressPackageStartupMessages(library(ggalluvial))
+suppressPackageStartupMessages(library(scDblFinder))
+suppressPackageStartupMessages(library(BPCells))
+suppressPackageStartupMessages(library(scGate))
+suppressPackageStartupMessages(library(SingleR))
+suppressPackageStartupMessages(library(celldex))
+suppressPackageStartupMessages(library(miloR))
+suppressPackageStartupMessages(library(NMF))
+suppressPackageStartupMessages(library(NNLM))
+suppressPackageStartupMessages(library(umap))
+suppressPackageStartupMessages(library(pheatmap))
+suppressPackageStartupMessages(library(ProjecTILs))
+suppressPackageStartupMessages(library(glmGamPoi))
+options(future.globals.maxSize = 10 * 1024^3)  # 10 GB
+```
+
+# Read in new samples
+
+```{r}
+final.all <- readRDS("~/hpchome/ctcl4.4/SO_ctcl.new.final.filtered.rds")
+CTCL_seurat.merged <- readRDS("~/hpchome/ctcl4.4/updated_seurat_obj.rds")
+```
+
+
+```{r}
+#Read in new data
+final.all <- readRDS("~/hpchome/ctcl4.4/ctcl.new.final.rds")
+
+final.all$barcodes.match <- paste0(final.all$donor_and_number, "_", final.all$barcode_simple, "_", final.all$donor_and_number)
+
+CTCL_seurat.merged <- readRDS("~/hpchome/ctcl4.4/updated_seurat_obj.rds")
+
+Idents(final.all) <- final.all$orig.ident
+asdf <- merge(final.all, CTCL_seurat.merged)
+
+asdf$orig.ident <- as.character(asdf$orig.ident)
+# Update the orig.ident column directly
+asdf$orig.ident[asdf$orig.ident == "CTCL1"] <- "S153"
+asdf$orig.ident[asdf$orig.ident == "CTCL2"] <- "S154"
+asdf$orig.ident[asdf$orig.ident == "CTCL3"] <- "S155"
+asdf$orig.ident[asdf$orig.ident == "CTCL4"] <- "S156"
+asdf$orig.ident[asdf$orig.ident == "CTCL5"] <- "S157"
+asdf$orig.ident[asdf$orig.ident == "CTCL6"] <- "S158"
+asdf$orig.ident[asdf$orig.ident == "CTCL7"] <- "S159"
+asdf$orig.ident[asdf$orig.ident == "CTCL8"] <- "S160"
+asdf$orig.ident[asdf$orig.ident == "CTCL9"] <- "S161"
+asdf$orig.ident[asdf$orig.ident == "CTCL10"] <- "S162"
+asdf$orig.ident[asdf$orig.ident == "CTCL11"] <- "S163"
+asdf$orig.ident[asdf$orig.ident == "CTCL12"] <- "S164"
+asdf$orig.ident[asdf$orig.ident == "CTCL13"] <- "S165"
+asdf$orig.ident[asdf$orig.ident == "CTCL14"] <- "S166"
+asdf$orig.ident[asdf$orig.ident == "CTCL15"] <- "S167"
+asdf$orig.ident[asdf$orig.ident == "CTCL16"] <- "S168"
+asdf$orig.ident[asdf$orig.ident == "CTCL17"] <- "S169"
+asdf$orig.ident[asdf$orig.ident == "CTCL18"] <- "S170"
+
+table(asdf$orig.ident)
+```
+
+
+# Read in and process data
+```{r}
+inventory <- readxl::read_xlsx("FileInventoryUpdatesRyan.xlsx")
+
+meta <- asdf[[]]
+meta$barcode <- colnames(asdf)
+df.samples <- as.data.frame(table(asdf$orig.ident))
+
+adt.assay <- GetAssayData(asdf, assay = "ADT")
+saveRDS(adt.assay, "~/hpchome/ctcl4.4/adt.assay.rds")
+
+asdf@assays$ADT <- NULL
+Idents(asdf) <- asdf$orig.ident
+
+#saveRDS(asdf, "~/hpchome/ctcl4.4/asdf.all.rds")
+asdf <- R2easygene::update_genes(Seurat_obj = asdf, select_assay = "RNA", return_seurat = T, min.cells = 3, min.features = 100)
+
+colnames(asdf@assays$RNA@layers$counts) <- colnames(asdf)
+rownames(asdf@assays$RNA@layers$counts) <- rownames(asdf)
+
+meta <- merge(meta, inventory[,1:14], by.x = "orig.ident", by.y = "Sample")
+
+barcodes <- meta$barcode
+rownames(meta) <- barcodes
+
+asdf[[]] <- meta
+
+asdf.new <- UpdateSeuratObject(asdf)
+asdf <- asdf.new
+
+VlnPlot(asdf, features = "percent.mt", pt.size = 0, y.max = 20)
+VlnPlot(asdf, features = "percent.rb", pt.size = 0)
+VlnPlot(asdf, features = "nCount_RNA", pt.size = 0, y.max = 30000)
+VlnPlot(asdf, features = "nFeature_RNA", pt.size = 0)
+VlnPlot(asdf, features = "HBB", pt.size = 0, y.max = 500)
+table(asdf$db.class)
+
+###############################################################################
+saveRDS(asdf, "~/hpchome/ctcl4.4/asdf.all.unfiltered.rds")
+asdf <- readRDS("~/hpchome/ctcl4.4/asdf.all.unfiltered.rds")
+```
+
+
+```{r}
+asdf <- readRDS("~/hpchome/ctcl4.4/asdf.all.unfiltered.rds")    
+final.all <- readRDS("~/hpchome/ctcl4.4/ctcl.new.final.rds")
+
+final.all$barcodes.match <- colnames(final.all)
+
+intersect(final.all$barcodes.match, asdf$barcode)
+
+intersect(colnames(final.all), colnames(asdf))
+
+asdf$celltype.new.study <- final.all$cell_type
+
+table(asdf$celltype.new.study)
+
+asdf <- subset(asdf, db.class == "singlet")
+
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+asdf <- NormalizeData(asdf)
+asdf <- CellCycleScoring(asdf, s.features = s.genes, g2m.features = g2m.genes, set.ident = F)
+asdf$cc.dif <- asdf$S.Score - asdf$G2M.Score
+
+
+rna <- as.data.frame(rownames(asdf))
+colnames(rna) <- "genes"
+genes <- rna$genes
+tcr_genes <- grep("^TR[ABDG][VDJC]", rownames(asdf), value = TRUE)
+ig_genes <- grep("^IG[JHKL][VDJC]", rownames(asdf), value = TRUE)
+cell_cycle <- c(s.genes, g2m.genes)
+mito <- grep("^MT-", rownames(asdf), value = TRUE)
+ribo <- grep("^RP[SL]", rownames(asdf), value = TRUE)
+hb_genes <- grep("^HB[AB]", rownames(asdf), value = TRUE, ignore.case = TRUE)
+sex_genes <- grep("^RPS4Y1|^KDM5D|^UTY|^DDX3Y|XIST", rownames(asdf), value = TRUE, ignore.case = TRUE)
+
+library(future)
+
+asdf <- FindVariableFeatures(asdf, nfeatures = 3000)
+VariableFeatures(asdf) <- setdiff(VariableFeatures(asdf), c(tcr_genes, ig_genes, cell_cycle, mito, ribo, hb_genes, sex_genes))
+asdf <- ScaleData(asdf, vars.to.regress = c("nFeature_RNA", "percent.rb", "percent.mt", "S.Score", "G2M.Score"))
+asdf <- RunPCA(asdf)
+asdf <- RunHarmony(asdf, group.by.vars = "orig.ident", 
+				reduction = "pca", assay.use = "RNA", reduction.save = "harmony", ncores = 30)
+asdf <- RunUMAP(asdf, dims = 1:30, reduction = "harmony")
+asdf <- FindNeighbors(asdf, dims = 1:30, reduction = "harmony", assay = "RNA", nn.method = "annoy", annoy.metric = "euclidean")
+asdf <- FindClusters(asdf, resolution = .1, n.start = 5, n.iter = 10)
+asdf <- FindNeighbors(asdf, dims = 1:2, reduction = "umap", assay = "RNA", nn.method = "annoy", annoy.metric = "euclidean", graph.name = c("umap_nn", "umap_snn"))
+asdf <- FindClusters(asdf, resolution = .01, n.start = 5, n.iter = 10, graph.name = "umap_snn")
+
+DimPlot(asdf, group.by = "orig.ident", alpha = .1, pt.size = .1, raster = F, shuffle = T)+NoLegend()
+DimPlot(asdf, group.by = "RNA_snn_res.0.1", alpha = .1, pt.size = .1, raster = F, shuffle = T, label = T)+NoLegend()
+DimPlot(asdf, group.by = "umap_snn_res.0.1", alpha = .1, pt.size = .1, raster = F, shuffle = T, label = T)+NoLegend()
+DimPlot(asdf, group.by = "umap_snn_res.0.01", alpha = .1, pt.size = .1, raster = F, shuffle = T, label = T)+NoLegend()
+```
+
+
+```{r}
+Idents(asdf) <- asdf$umap_snn_res.0.01
+markers <- FindAllMarkers(asdf, max.cells.per.ident = 5000, min.pct = .1, logfc.threshold = .5, only.pos = T)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

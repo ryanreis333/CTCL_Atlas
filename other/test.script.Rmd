@@ -1,0 +1,163 @@
+---
+title: "test.script.Rmd"
+output: html_document
+date: "2025-02-10"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+
+
+
+
+
+```{r}
+# Load necessary library
+library(Seurat)
+
+# Load your Seurat object (adjust the path as needed)
+asdf <- readRDS("~/hpchome/SAVE/asdf.save.rds")
+
+# Extract barcodes for malignant and normal T cells
+# Adjust the strings ("malignant_T" / "normal_T") to match your cell type annotations
+malignant_barcodes <- rownames(asdf@meta.data)[asdf@meta.data$new.clones == "Malignant"]
+normal_barcodes <- rownames(asdf@meta.data)[asdf@meta.data$new.clones == "Non_malignant"]
+
+# Save barcode lists to text files (one barcode per line)
+write.table(malignant_barcodes, file = "malignant_barcodes.txt", row.names = FALSE,
+            col.names = FALSE, quote = FALSE)
+write.table(normal_barcodes, file = "normal_barcodes.txt", row.names = FALSE,
+            col.names = FALSE, quote = FALSE)
+
+cat("Extracted", length(malignant_barcodes), "malignant barcodes and",
+    length(normal_barcodes), "normal barcodes.\n")
+
+```
+
+
+
+
+
+
+
+```{bash}
+# For malignant cells:
+python3 filter_fastq_by_barcode.py --r1 R1.fastq.gz --r2 R2.fastq.gz \
+    --barcodes malignant_barcodes.txt --out_r1 malignant_R1.fastq --out_r2 malignant_R2.fastq
+
+# For normal cells:
+python3 filter_fastq_by_barcode.py --r1 R1.fastq.gz --r2 R2.fastq.gz \
+    --barcodes normal_barcodes.txt --out_r1 normal_R1.fastq --out_r2 normal_R2.fastq
+
+```
+
+
+
+
+
+
+```{bash}
+# For malignant cells:
+STAR --runThreadN 8 \
+     --genomeDir /path/to/STAR_genome/ \
+     --readFilesIn malignant_R1.fastq malignant_R2.fastq \
+     --outFileNamePrefix malignant_ \
+     --outSAMtype SAM
+
+# For normal cells:
+STAR --runThreadN 8 \
+     --genomeDir /path/to/STAR_genome/ \
+     --readFilesIn normal_R1.fastq normal_R2.fastq \
+     --outFileNamePrefix normal_ \
+     --outSAMtype SAM
+
+```
+
+
+
+
+```{bash}
+# For malignant cells:
+samtools sort -@ 8 -o malignant_sorted.bam malignant_Aligned.out.sam
+samtools index malignant_sorted.bam
+
+# For normal cells:
+samtools sort -@ 8 -o normal_sorted.bam normal_Aligned.out.sam
+samtools index normal_sorted.bam
+
+```
+
+
+
+
+
+```{bash}
+# For malignant cells:
+bcftools mpileup -Ou -f /path/to/reference.fa malignant_sorted.bam | \
+    bcftools call -mv -Ob -o malignant.bcf
+bcftools view malignant.bcf > malignant_variants.vcf
+
+# For normal cells:
+bcftools mpileup -Ou -f /path/to/reference.fa normal_sorted.bam | \
+    bcftools call -mv -Ob -o normal.bcf
+bcftools view normal.bcf > normal_variants.vcf
+
+```
+
+
+
+
+
+
+
+
+```{bash}
+# For malignant cells:
+stringtie malignant_sorted.bam -G /path/to/annotation.gtf -o malignant_isoforms.gtf -p 8
+
+# For normal cells:
+stringtie normal_sorted.bam -G /path/to/annotation.gtf -o normal_isoforms.gtf -p 8
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
