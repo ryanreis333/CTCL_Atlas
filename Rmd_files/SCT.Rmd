@@ -355,6 +355,14 @@ gc()
 
 
 
+```{r}
+library(googledrive)
+drive_auth(
+  scopes = "https://www.googleapis.com/auth/drive.file"
+)
+drive_upload("~/hpchome/ctcl4.4/merge3.rds")
+```
+
 
 
 
