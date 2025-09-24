@@ -1,0 +1,492 @@
+---
+title: "combine.all.datasets"
+output: html_document
+date: "2025-09-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+
+
+```{r}
+th2.list <- readRDS("~/hpchome/th2.list2.rds")
+sca.list <- readRDS("~/hpchome/sca.list.rds")
+canc_disc.list <- readRDS("~/hpchome/canc_disc.list.rds")
+orig.list <- readRDS("~/hpchome/seurat.merged.list.rds")
+```
+
+
+```{r}
+BiocManager::install("decontX")
+library(decontX)
+library(BiocParallel)
+
+th2.list.ss <- th2.list
+th2.list.ss <- lapply(th2.list.ss, function(x){
+  meta <- x@meta.data
+  meta <- meta[,1:3]
+  x@meta.data <- meta
+  return(x)
+})
+
+samples <- names(th2.list.ss)
+th2.list.pp <- list()
+
+for(i in seq_along(samples)){
+  tmp <- samples[i]
+  seurat_obj <- th2.list.ss[[tmp]]
+  mat <- GetAssayData(seurat_obj, assay = "RNA", layer = "counts")
+  decont <- decontX(mat)
+  
+  seurat_obj <- CreateSeuratObject(counts = decont[["decontXcounts"]], min.cells = 3, min.features = 300, project = tmp)
+  seurat_obj <- subset(seurat_obj, nCount_RNA > 500)
+  
+  sce <- as.SingleCellExperiment(seurat_obj)
+  sce <- scDblFinder(sce, BPPARAM=MulticoreParam(16))
+  doublets <- data.frame(db.class = sce$scDblFinder.class, db.score = sce$scDblFinder.score)
+  rownames(doublets) <- rownames(sce@colData)
+  seurat_obj <- AddMetaData(seurat_obj, doublets)
+  
+  seurat_obj <- subset(seurat_obj, db.class == "singlet")
+  seurat_obj@meta.data <- seurat_obj@meta.data[,1:3]
+  th2.list.pp[[i]] <- seurat_obj
+}
+
+names(th2.list.pp) <- samples
+
+th2.list.pp.merge <- merge(th2.list.pp[[1]], th2.list.pp[-1])
+th2.list.pp.merge <- JoinLayers(th2.list.pp.merge)
+saveRDS(th2.list.pp.merge, "~/hpchome/th2.list.pp.merge.rds")
+```
+
+
+
+```{r}
+sca.list.ss <- sca.list2
+
+samples <- names(sca.list.ss)
+sca.list.pp <- list()
+
+for(i in seq_along(samples)){
+  tmp <- samples[i]
+  seurat_obj <- sca.list.ss[[tmp]]
+  mat <- GetAssayData(seurat_obj, assay = "RNA", layer = "counts")
+  decont <- decontX(mat)
+  
+  seurat_obj <- CreateSeuratObject(counts = decont[["decontXcounts"]], min.cells = 3, min.features = 300, project = tmp)
+  Idents(seurat_obj) <- tmp
+  seurat_obj$orig.ident <- tmp
+  seurat_obj <- subset(seurat_obj, nCount_RNA > 500)
+  
+  sce <- as.SingleCellExperiment(seurat_obj)
+  sce <- scDblFinder(sce, BPPARAM=MulticoreParam(16))
+  doublets <- data.frame(db.class = sce$scDblFinder.class, db.score = sce$scDblFinder.score)
+  rownames(doublets) <- rownames(sce@colData)
+  seurat_obj <- AddMetaData(seurat_obj, doublets)
+  
+  seurat_obj <- subset(seurat_obj, db.class == "singlet")
+  seurat_obj@meta.data <- seurat_obj@meta.data[,1:3]
+  sca.list.pp[[i]] <- seurat_obj
+}
+
+names(sca.list.pp) <- samples
+
+sca.list.pp.merge <- merge(sca.list.pp[[1]], sca.list.pp[-1])
+sca.list.pp.merge <- JoinLayers(sca.list.pp.merge)
+saveRDS(sca.list.pp.merge, "~/hpchome/sca.list.pp.merge.rds")
+```
+
+
+
+```{r}
+canc_disc.list.ss <- canc_disc.list
+canc_disc.list.ss <- lapply(canc_disc.list.ss, function(x){
+  meta <- x@meta.data
+  meta <- meta[,1:3]
+  x@meta.data <- meta
+  return(x)
+})
+
+samples <- names(canc_disc.list.ss)
+canc_disc.list.pp <- list()
+
+for(i in seq_along(samples)){
+  tmp <- samples[i]
+  seurat_obj <- canc_disc.list.ss[[tmp]]
+  mat <- GetAssayData(seurat_obj, assay = "RNA", layer = "counts")
+  decont <- decontX(mat)
+  
+  seurat_obj <- CreateSeuratObject(counts = decont[["decontXcounts"]], min.cells = 3, min.features = 300, project = tmp)
+  Idents(seurat_obj) <- tmp
+  seurat_obj$orig.ident <- tmp
+  seurat_obj <- subset(seurat_obj, nCount_RNA > 500)
+  
+  sce <- as.SingleCellExperiment(seurat_obj)
+  sce <- scDblFinder(sce, BPPARAM=MulticoreParam(16))
+  doublets <- data.frame(db.class = sce$scDblFinder.class, db.score = sce$scDblFinder.score)
+  rownames(doublets) <- rownames(sce@colData)
+  seurat_obj <- AddMetaData(seurat_obj, doublets)
+  
+  seurat_obj <- subset(seurat_obj, db.class == "singlet")
+  seurat_obj@meta.data <- seurat_obj@meta.data[,1:3]
+  canc_disc.list.pp[[i]] <- seurat_obj
+}
+
+names(canc_disc.list.pp) <- samples
+
+canc_disc.list.pp.merge <- merge(canc_disc.list.pp[[1]], canc_disc.list.pp[-1])
+canc_disc.list.pp.merge <- JoinLayers(canc_disc.list.pp.merge)
+saveRDS(canc_disc.list.pp.merge, "~/hpchome/canc_disc.list.pp.merge.rds")
+```
+
+
+
+```{r}
+keep <- data.frame(table(canc_disc.list.pp.merge$orig.ident))
+keep$Var1 <- as.character(keep$Var1)
+
+keep$gsm <- sapply(strsplit(keep$Var1, "_"), `[`, 1)
+
+gsm.keep <- c("GSM8677458",
+              "GSM8677461",
+              "GSM8677474",
+              "GSM8677477",
+              "GSM8677478",
+              "GSM8677481",
+              "GSM8677484",
+              "GSM8677487",
+              "GSM8677488",
+              "GSM8677489",
+              "GSM8677490",
+              "GSM8677491",
+              "GSM8677510",
+              "GSM8677512",
+              "GSM8677518",
+              "GSM8677520",
+              "GSM8677566",
+              "GSM8677568",
+              "GSM8677570",
+              "GSM8677580",
+              "GSM8677622",
+              "GSM8677628",
+              "GSM8677630",
+              "GSM8677632",
+              "GSM8677634",
+              "GSM8677636",
+              "GSM8677638",
+              "GSM8677640",
+              "GSM8677642",
+              "GSM8677643",
+              "GSM8677645",
+              "GSM8677647",
+              "GSM8677649",
+              "GSM8677651",
+              "GSM8677653",
+              "GSM8677655",
+              "GSM8677657",
+              "GSM8677659",
+              "GSM8677661",
+              "GSM8677663"
+              )
+
+keep.ss <- subset(keep, gsm %in% gsm.keep)
+canc_disc.list.pp.merge.ss <- subset(canc_disc.list.pp.merge, orig.ident %in% keep.ss$Var1)
+saveRDS(canc_disc.list.pp.merge.ss, "~/hpchome/canc_disc.list.pp.merge.ss.rds")
+```
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+orig.list.ss <- orig.list
+orig.list.ss <- lapply(orig.list.ss, function(x){
+  meta <- x@meta.data
+  meta <- meta[,1:3]
+  x@meta.data <- meta
+  return(x)
+})
+
+samples <- names(orig.list.ss)
+orig.list.pp <- list()
+samples[134]
+samples.fix <- samples[135:148]
+for(i in seq_along(samples.fix)){
+  tmp <- samples[i+134]
+  seurat_obj <- orig.list.ss[[tmp]]
+  mat <- GetAssayData(seurat_obj, assay = "RNA", layer = "counts")
+  decont <- decontX(mat)
+  
+  seurat_obj <- CreateSeuratObject(counts = decont[["decontXcounts"]], min.cells = 3, min.features = 300, project = tmp)
+  Idents(seurat_obj) <- tmp
+  seurat_obj$orig.ident <- tmp
+  seurat_obj <- subset(seurat_obj, nCount_RNA > 500)
+  
+  sce <- as.SingleCellExperiment(seurat_obj)
+  sce <- scDblFinder(sce, BPPARAM=MulticoreParam(16))
+  doublets <- data.frame(db.class = sce$scDblFinder.class, db.score = sce$scDblFinder.score)
+  rownames(doublets) <- rownames(sce@colData)
+  seurat_obj <- AddMetaData(seurat_obj, doublets)
+  
+  seurat_obj <- subset(seurat_obj, db.class == "singlet")
+  seurat_obj@meta.data <- seurat_obj@meta.data[,1:3]
+  orig.list.pp[[i+133]] <- seurat_obj
+}
+
+samples.remove <- samples[-134]
+names(orig.list.pp) <- samples.remove
+
+saveRDS(orig.list.pp, "~/hpchome/orig.list.pp.save.rds")
+orig.list.pp.merge <- merge(orig.list.pp[[1]], orig.list.pp[-1])
+orig.list.pp.merge <- JoinLayers(orig.list.pp.merge)
+saveRDS(orig.list.pp.merge, "~/hpchome/orig.list.pp.merge.rds")
+```
+
+
+
+```{r}
+mat <- th2.list.pp.merge@assays$RNA@layers$counts
+rownames(mat) <- rownames(th2.list.pp.merge@assays$RNA)
+colnames(mat) <- colnames(th2.list.pp.merge@assays$RNA)
+write_matrix_dir(mat = mat, dir = "~/hpchome/ctcl4.4/th2.list.pp.merge")
+
+mat <- sca.list.pp.merge@assays$RNA@layers$counts
+rownames(mat) <- rownames(sca.list.pp.merge@assays$RNA)
+colnames(mat) <- colnames(sca.list.pp.merge@assays$RNA)
+write_matrix_dir(mat = mat, dir = "~/hpchome/ctcl4.4/sca.list.pp.merge")
+
+canc_disc.list.pp.merge.ss <- readRDS("~/hpchome/canc_disc.list.pp.merge.ss.rds")
+mat <- canc_disc.list.pp.merge.ss@assays$RNA@layers$counts
+rownames(mat) <- rownames(canc_disc.list.pp.merge.ss@assays$RNA)
+colnames(mat) <- colnames(canc_disc.list.pp.merge.ss@assays$RNA)
+write_matrix_dir(mat = mat, dir = "~/hpchome/ctcl4.4/canc_disc.list.pp.merge.ss")
+
+mat <- orig.list.pp.merge@assays$RNA@layers$counts
+rownames(mat) <- rownames(orig.list.pp.merge@assays$RNA)
+colnames(mat) <- colnames(orig.list.pp.merge@assays$RNA)
+write_matrix_dir(mat = mat, dir = "~/hpchome/ctcl4.4/orig.list.pp.merge")
+
+
+saveRDS(th2.list.pp.merge@meta.data, "~/hpchome/ctcl4.4/meta.th2.list.pp.merge.rds")
+saveRDS(sca.list.pp.merge@meta.data, "~/hpchome/ctcl4.4/meta.sca.list.pp.merge.rds")
+saveRDS(canc_disc.list.pp.merge.ss@meta.data, "~/hpchome/ctcl4.4/meta.canc_disc.list.pp.merge.ss.rds")
+saveRDS(orig.list.pp.merge@meta.data, "~/hpchome/ctcl4.4/meta.orig.list.pp.merge.rds")
+```
+
+
+```{r}
+th2.list.pp.merge.disk <- open_matrix_dir(dir = "~/hpchome/ctcl4.4/th2.list.pp.merge")
+meta.th2.list.pp.merge <- readRDS("~/hpchome/ctcl4.4/meta.th2.list.pp.merge.rds")
+th2.disk <- CreateSeuratObject(counts = th2.list.pp.merge.disk, meta.data = meta.th2.list.pp.merge)
+
+sca.list.pp.merge.disk <- open_matrix_dir(dir = "~/hpchome/ctcl4.4/sca.list.pp.merge")
+meta.sca.list.pp.merge <- readRDS("~/hpchome/ctcl4.4/meta.sca.list.pp.merge.rds")
+sca.disk <- CreateSeuratObject(counts = sca.list.pp.merge.disk, meta.data = meta.sca.list.pp.merge)
+
+canc_disc.list.pp.merge.disk <- open_matrix_dir(dir = "~/hpchome/ctcl4.4/canc_disc.list.pp.merge.ss")
+meta.canc_disc.list.pp.merge <- readRDS("~/hpchome/ctcl4.4/meta.canc_disc.list.pp.merge.ss.rds")
+canc_disc.disk <- CreateSeuratObject(counts = canc_disc.list.pp.merge.disk, meta.data = meta.canc_disc.list.pp.merge)
+
+orig.list.pp.merge.disk <- open_matrix_dir(dir = "~/hpchome/ctcl4.4/orig.list.pp.merge")
+meta.orig.list.pp.merge <- readRDS("~/hpchome/ctcl4.4/meta.orig.list.pp.merge.rds")
+orig.disk <- CreateSeuratObject(counts = orig.list.pp.merge.disk, meta.data = meta.orig.list.pp.merge)
+
+merge.all.list.disk <- list(th2.disk, sca.disk, canc_disc.disk, orig.disk)
+merge.all.disk <- merge(merge.all.list.disk[[1]], merge.all.list.disk[-1])
+merge.all.disk <- JoinLayers(merge.all.disk)
+
+mat <- merge.all.disk@assays$RNA@layers$counts
+rownames(mat) <- rownames(merge.all.disk@assays$RNA)
+colnames(mat) <- colnames(merge.all.disk@assays$RNA)
+write_matrix_dir(mat = mat, dir = "~/hpchome/ctcl4.4/merge.all.disk")
+saveRDS(merge.all.disk@meta.data, "~/hpchome/ctcl4.4/meta.merge.all.disk.rds")
+```
+
+
+
+```{r}
+merge.all.disk.save <- merge.all.disk
+
+```
+
+
+
+
+```{r}
+# Other meta data
+
+th2.list <- readRDS("~/hpchome/th2.list2.rds")
+
+canc_disc.list <- readRDS("~/hpchome/canc_disc.list.rds")
+orig.list <- readRDS("~/hpchome/seurat.merged.list.rds")
+
+meta.list.th2 <- lapply(th2.list, function(x) {
+  df <- x@meta.data
+  return(df)
+})
+meta.df.th2 <- bind_rows(meta.list.th2)
+
+
+keep <- data.frame(table(names(canc_disc.list)))
+keep$Var1 <- as.character(keep$Var1)
+
+keep$gsm <- sapply(strsplit(keep$Var1, "_"), `[`, 1)
+
+gsm.keep <- c("GSM8677458",
+              "GSM8677461",
+              "GSM8677474",
+              "GSM8677477",
+              "GSM8677478",
+              "GSM8677481",
+              "GSM8677484",
+              "GSM8677487",
+              "GSM8677488",
+              "GSM8677489",
+              "GSM8677490",
+              "GSM8677491",
+              "GSM8677510",
+              "GSM8677512",
+              "GSM8677518",
+              "GSM8677520",
+              "GSM8677566",
+              "GSM8677568",
+              "GSM8677570",
+              "GSM8677580",
+              "GSM8677622",
+              "GSM8677628",
+              "GSM8677630",
+              "GSM8677632",
+              "GSM8677634",
+              "GSM8677636",
+              "GSM8677638",
+              "GSM8677640",
+              "GSM8677642",
+              "GSM8677643",
+              "GSM8677645",
+              "GSM8677647",
+              "GSM8677649",
+              "GSM8677651",
+              "GSM8677653",
+              "GSM8677655",
+              "GSM8677657",
+              "GSM8677659",
+              "GSM8677661",
+              "GSM8677663"
+              )
+
+keep.ss <- subset(keep, gsm %in% gsm.keep)
+canc_disc.list.ss <- canc_disc.list[keep.ss]
+
+meta.list.canc_disc <- lapply(canc_disc.list.ss, function(x) {
+  df <- x@meta.data
+  return(df)
+})
+meta.df.canc_disc <- bind_rows(meta.list.canc_disc)
+
+
+meta.df.orig <- seurat.merged@meta.data
+meta.df.orig <- meta.df.orig[,-c(4:20)]
+
+colnames(meta.df.orig)
+colnames(meta.df.orig) <- c("orig.ident", "nCount_RNA", "nFeature_RNA", "barcode", "CTgene", "CTnt", "CTaa", "CTstrict", "clonalProportion", "cloneSize")
+
+colnames(meta.df.canc_disc)
+meta.df.canc_disc <- meta.df.canc_disc[,-9]
+colnames(meta.df.th2)
+meta.df.th2 <- meta.df.th2[,-10]
+
+meta.vdj.all <- rbind(meta.df.orig, meta.df.canc_disc, meta.df.th2)
+table(meta.vdj.all$orig.ident)
+
+saveRDS(meta.vdj.all, "~/hpchome/meta.vdj.all.rds")
+```
+
+
+
+
+```{r}
+meta <- merge.all.disk@meta.data
+meta$barcode.simple <- str_extract(rownames(meta), "[ACGT]+")
+meta$barcode <- paste0(meta$barcode.simple, "_", meta$orig.ident)
+rownames(meta) <- make.unique(meta$barcode)
+
+colnames(merge.all.disk) <- rownames(meta)
+
+meta.vdj.all$barcode.simple <- str_extract(rownames(meta.vdj.all), "[ACGT]+")
+meta.vdj.all$barcode <- paste0(meta.vdj.all$barcode.simple, "_", meta.vdj.all$orig.ident)
+rownames(meta.vdj.all) <- make.unique(meta.vdj.all$barcode)
+```
+
+
+
+```{r}
+meta$barcode <- rownames(meta)
+meta.vdj.all$barcode <- rownames(meta.vdj.all)
+
+# Merge by barcode (like a SQL left join)
+meta.merged <- merge(
+  meta,
+  meta.vdj.all[,4:11],
+  by = "barcode",
+  all.x = TRUE  # keep all cells from meta, fill NAs if no match in vdj
+)
+
+# Set rownames back to barcode
+rownames(meta.merged) <- make.unique(meta.merged$barcode)
+
+meta.merged <- meta.merged[colnames(merge.all.disk), ]
+colnames(meta.merged)
+meta.merged <- meta.merged[,-12]
+# Assign back to Seurat
+merge.all.disk@meta.data <- meta.merged
+```
+
+
+```{r}
+meta.final <- merge.all.disk@meta.data
+
+saveRDS(meta.final, "~/hpchome/meta.final.rds")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

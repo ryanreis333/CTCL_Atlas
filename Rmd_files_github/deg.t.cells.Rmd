@@ -1,0 +1,477 @@
+---
+title: "deg.t.cells"
+output: html_document
+date: "2025-09-12"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+
+```{r}
+immune.counts <- open_matrix_dir(dir = "~/hpchome/immune.mat.matrix.dir")
+immune.meta <- readRDS("~/hpchome/immune.meta.rds")
+
+immune <- CreateSeuratObject(counts = immune.counts, meta = immune.meta)
+
+immune@reductions$harmony.full <- readRDS("~/hpchome/immune.harmony.full.rds")
+immune@reductions$full.umap.1 <- readRDS("~/hpchome/immune.full.umap.rds")
+immune@assays$sketch <- readRDS("~/hpchome/immune.sketch.assay.rds")
+
+Idents(immune) <- immune$orig.ident
+
+DefaultAssay(immune) <- "RNA"
+immune <- NormalizeData(immune)
+
+DimPlot(immune, group.by = "orig.ident")+NoLegend()
+DimPlot(immune, group.by = "celltype", label = T)+NoLegend()
+DimPlot(immune, group.by = "celltype.specific", label = T)+NoLegend()
+```
+
+
+```{r}
+table(asdf$celltype.malig)
+malig <- subset(asdf, celltype.malig == "malig")
+```
+
+```{r}
+t.cells <- merge(malig, immune)
+
+table(t.cells$celltype.specific)
+
+meta.t.cells <- t.cells@meta.data
+
+meta.t.cells$celltype.specific[meta.t.cells$celltype.malig == "malig"] <- "malig"
+
+t.cells@meta.data <- meta.t.cells
+
+table(t.cells$celltype.specific)
+
+t.cells <- subset(t.cells, celltype.specific %in% c("CD4_T", "CD8_T", "ILC", "CD4_T_Act", "Treg", "T_HSP", "malig"))
+```
+
+
+```{r}
+meta.t <- t.cells@meta.data
+
+meta.t$celltype.specific.simple <- ifelse(meta.t$celltype.malig == "malig", "CTCL", "Benign_T")
+
+meta.t$orig.merge <- ifelse(meta.t$orig.ident %in% c("S72", "S73"), "S72",
+                      ifelse(meta.t$orig.ident %in% c("S74", "S75"), "S74",
+                      ifelse(meta.t$orig.ident %in% paste0("S", 153:156), "S153",
+                      ifelse(meta.t$orig.ident %in% paste0("S", 157:161), "S157",
+                      ifelse(meta.t$orig.ident %in% paste0("S", 162:165), "S162",
+                      ifelse(meta.t$orig.ident %in% paste0("S", 166:169), "S166",
+                      ifelse(meta.t$orig.ident %in% paste0("S", 170:175), "S170",
+                      ifelse(meta.t$orig.ident %in% paste0("S", 176:181), "S176",
+                      ifelse(meta.t$orig.ident %in% paste0("S", 182:187), "S182",
+                      ifelse(meta.t$orig.ident %in% paste0("S", 188:192), "S188",
+                      ifelse(meta.t$orig.ident %in% paste0("S", 216:223), "S216",
+                      ifelse(meta.t$orig.ident %in% paste0("S", 225:232), "S225",
+                      meta.t$orig.ident))))))))))))
+
+meta.t$orig.merge.malig <- paste0(meta.t$orig.merge, "_", meta.t$celltype.specific.simple)
+
+t.cells@meta.data <- meta.t
+
+table(t.cells$celltype.specific.simple)
+table(t.cells$orig.merge.malig)
+
+ctcl.pts <- sort(unique(meta.t$orig.merge[meta.t$Dx.simple == "CTCL"]))
+```
+
+
+```{r}
+df.ctcl.deg <- as.data.frame.matrix(table(t.cells$orig.merge, t.cells$celltype.specific.simple))
+
+df.ctcl.deg.ss <- subset(df.ctcl.deg, CTCL > 50 & Benign_T > 50)
+
+query <- rownames(df.ctcl.deg.ss)
+```
+
+
+
+
+```{r}
+t.query <- subset(t.cells, orig.merge %in% query)
+
+t.query.ss <- t.query
+DefaultAssay(t.query.ss) <- "RNA"
+t.query.ss@assays$sketch <- NULL
+t.query.ss <- JoinLayers(t.query.ss)
+
+t.query.ss <- r2sample_seurat(t.query.ss, group_var = "orig.merge.malig", n = 1000, barcode_column = "barcode.unique")
+
+split.t <- SplitObject(object = t.query.ss, split.by = "orig.merge")
+
+markers.split.t <- list()
+
+markers.split.t <- lapply(names(split.t), FUN = function(sample_name) {
+  # Get the current sample
+  x <- split.t[[sample_name]]
+  
+  # Set identities to "final.clones"
+  Idents(x) <- x$celltype.specific.simple
+  
+  markers.x <- FindMarkers(
+    x,
+    ident.1 = "CTCL",
+    ident.2 = "Benign_T") # Cluster of interest
+
+  # Add the sample name to the results
+  markers.x$sample <- sample_name
+  markers.x$gene <- rownames(markers.x)
+  markers.x$dif <- markers.x$pct.1 - markers.x$pct.2
+  markers.x$log_padj <- -log10(markers.x$p_val_adj + 1e-300)
+  
+  # Return the significant markers with the sample name
+  return(markers.x)
+})
+
+names(markers.split.t) <- names(split.t)
+saveRDS(markers.split.t, "~/hpchome/ctcl.deg.split.t.rds")
+
+```
+
+
+```{r}
+#optional
+`%!in%` <- Negate(`%in%`)
+tcr_genes <- grep("^TR[ABDG][VDJ]", rownames(t.cells), value = TRUE)
+ig_genes <- grep("^IG[JHKL][VDJCMG]", rownames(t.cells), value = TRUE)
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+hemoglobin <- grep("^HB[AB]", rownames(t.cells), value = TRUE)
+
+markers.split.t <- readRDS("~/hpchome/ctcl.deg.split.t.rds")
+```
+
+
+```{r}
+markers.matrix <- bind_rows(markers.split.t) %>%
+  select(sample, avg_log2FC, gene) %>%
+  pivot_wider(
+    names_from = sample,
+    values_from = avg_log2FC,
+    values_fill = NA
+  ) %>%
+  column_to_rownames("gene") %>%
+  as.matrix()
+
+saveRDS(markers.matrix, "~/hpchome/ctcl.deg.markers.matrix.rds")
+
+
+padj.matrix <- bind_rows(markers.split.t) %>%
+  select(sample, p_val_adj, gene) %>%
+  pivot_wider(
+    names_from = sample,
+    values_from = p_val_adj,
+    values_fill = NA
+  ) %>%
+  column_to_rownames("gene") %>%
+  as.matrix()
+
+saveRDS(padj.matrix, "~/hpchome/ctcl.deg.padj.matrix.rds")
+
+```
+
+
+#all
+```{r}
+keep.genes <- setdiff(rownames(markers.matrix), c(tcr_genes, ig_genes))
+markers.matrix.ss <- markers.matrix[keep.genes,]
+markers.matrix.ss <- markers.matrix.ss[rowSums(is.na(markers.matrix.ss))< 50,]
+hist(rowSums(abs(markers.matrix.ss),na.rm = T), breaks = 500)
+
+markers.matrix.ss <- markers.matrix.ss[rowSums(abs(markers.matrix.ss), na.rm = T)> 150,]
+markers.matrix.ss.scale <- scale(markers.matrix.ss)
+
+pheatmap(markers.matrix.ss, scale = "none")
+pheatmap(markers.matrix.ss.scale, scale = "none")
+
+plot(markers.matrix.ss, markers.matrix.ss.scale)
+cor(as.numeric(markers.matrix.ss), as.numeric(markers.matrix.ss.scale), use = "pairwise.complete.obs")
+```
+
+```{r}
+df.markers.matrix.all <- data.frame("Sum" = rowSums(markers.matrix.ss.scale, na.rm = T), 
+                                    "Count" = rowSums(!is.na(markers.matrix.ss.scale)),
+                                    "Abs" = rowSums(abs(markers.matrix.ss.scale), na.rm = T),
+                                    "Var" = rowVars(markers.matrix.ss.scale, na.rm = T))
+df.markers.matrix.all$Norm <- df.markers.matrix.all$Sum / df.markers.matrix.all$Count
+
+df.markers.matrix.all <- arrange(df.markers.matrix.all, desc(Sum))
+
+plot(df.markers.matrix.all$Sum, df.markers.matrix.all$Abs)
+```
+
+```{r}
+sample.cor <- cor(markers.matrix.ss.scale, use = "pairwise.complete.obs")
+gene.cor <- cor(t(markers.matrix.ss.scale), use = "pairwise.complete.obs")
+
+pheatmap(sample.cor)
+
+pheatmap(gene.cor, show_colnames = F)
+
+df.markers.matrix.all <- arrange(df.markers.matrix.all, desc(Sum))
+top <- c(head(rownames(df.markers.matrix.all), 25), tail(rownames(df.markers.matrix.all), 25))
+
+df.markers.matrix.all <- arrange(df.markers.matrix.all, desc(Var))
+top <- head(rownames(df.markers.matrix.all), 100)
+
+markers.top <- markers.matrix.ss.scale[top,]
+
+pheatmap(markers.top, cluster_cols = T, cluster_rows = T)
+```
+
+```{r}
+meta <- t.query.ss@meta.data
+table(meta$Path.Stage)
+meta$Path.Stage.bin <- ifelse(meta$Path.Stage %in% c("IA", "IB", "IIA", "Control"), "Early_Stage",
+                            ifelse(meta$Path.Stage %in% c("IIB", "IIIA", "IIIB", "IVA", "IVB", "IV"),
+                              "Late_Stage", NA))
+
+anno_df <- meta %>%
+  as.data.frame() %>%
+  group_by(orig.merge) %>%                 # group by sample
+  summarise(
+    Tissue = names(sort(table(Tissue), decreasing = TRUE))[1],
+    Dx = names(sort(table(Dx), decreasing = TRUE))[1],
+    Path.Stage.bin = names(sort(table(Path.Stage.bin), decreasing = TRUE))[1],
+  ) %>%
+  column_to_rownames("orig.merge")
+
+pheatmap(markers.top, show_colnames = FALSE, show_rownames = T, annotation_col = anno_df)
+```
+
+
+
+
+
+
+```{r}
+markers.matrix.sig <- markers.matrix
+markers.matrix.sig[padj.matrix >= 0.05] <- NA
+
+hist(rowSums(is.na(markers.matrix.sig)))
+
+df.markers.summary <- data.frame("Sum" = rowSums(markers.matrix.sig, na.rm = T), "Count" = rowSums(!is.na(markers.matrix.sig)))
+df.markers.summary$Norm <- df.markers.summary$Sum / df.markers.summary$Count
+```
+
+
+
+```{r}
+markers.matrix.sig.ss <- markers.matrix.sig[rowSums(is.na(markers.matrix.sig)) < 100,]
+
+pheatmap(markers.matrix.sig.ss, cluster_cols = F, cluster_rows = F)
+
+keep <- setdiff(rownames(markers.matrix.sig.ss), c(tcr_genes, ig_genes))
+markers.matrix.sig.ss <- markers.matrix.sig.ss[keep,]
+
+pheatmap(markers.matrix.sig.ss, cluster_cols = F, cluster_rows = F)
+
+markers.matrix.sig.ss <- MinMax(markers.matrix.sig.ss, min = -10, max = 10)
+markers.matrix.sig.ss <- scale(markers.matrix.sig.ss)
+
+pheatmap(markers.matrix.sig.ss, cluster_cols = F, cluster_rows = F)
+
+keep <- which(rowMeans(abs(markers.matrix.sig.ss), na.rm = T) > 1.5)
+markers.matrix.sig.ss <- markers.matrix.sig.ss[keep,]
+
+pheatmap(markers.matrix.sig.ss, cluster_cols = F, cluster_rows = F)
+
+markers.matrix.sig.ss <- MinMax(markers.matrix.sig.ss, min = -5, max = 5)
+pheatmap(markers.matrix.sig.ss, cluster_cols = F, cluster_rows = F)
+
+markers.matrix.sig.ss2 <- markers.matrix.sig.ss[rowSums(is.na(markers.matrix.sig.ss)) < 100, colSums(is.na(markers.matrix.sig.ss)) < 350]
+pheatmap(markers.matrix.sig.ss2, cluster_cols = F, cluster_rows = F)
+
+markers.matrix.sig.ss2[is.na(markers.matrix.sig.ss2)] <- 0
+
+png("test.png", height = 2000, width = 1000)
+pheatmap(markers.matrix.sig.ss2)
+dev.off()
+```
+
+
+```{r}
+sample.cor <- cor(markers.matrix.sig.ss, use = "pairwise.complete.obs")
+gene.cor <- cor(t(markers.matrix.sig.ss), use = "pairwise.complete.obs")
+
+pheatmap(sample.cor)
+
+pheatmap(gene.cor, show_colnames = F)
+
+png("test.png", height = 1500, width = 1500)
+pheatmap(gene.cor, show_colnames = F)
+dev.off()
+```
+
+
+```{r}
+meta <- t.query.ss@meta.data
+
+meta$Path.Stage.bin <- ifelse(meta$Path.Stage %in% c("IA", "IB", "IIA"), "Early_Stage",
+                            ifelse(meta$Path.Stage %in% c("IIB", "IIIA", "IIIB", "IVA", "IVB", "IV"),
+                              "Late_Stage", "Control"))
+
+anno_df <- meta %>%
+  as.data.frame() %>%
+  group_by(orig.merge) %>%                 # group by sample
+  summarise(
+    Tissue = names(sort(table(Tissue), decreasing = TRUE))[1],
+    Dx = names(sort(table(Dx), decreasing = TRUE))[1],
+    Path.Stage.bin = names(sort(table(Path.Stage.bin), decreasing = TRUE))[1],
+  ) %>%
+  column_to_rownames("orig.merge")
+
+pheatmap(sample.cor, show_colnames = FALSE, show_rownames = FALSE, annotation_col = anno_df, annotation_colors = ann_colors)
+```
+
+
+```{r}
+df.markers.summary <- arrange(df.markers.summary, desc(Sum))
+top_genes <- c(head(rownames(df.markers.summary), 25), tail(rownames(df.markers.summary), 25))
+
+idx <- which(rownames(markers.matrix.sig) %in% top_genes)
+markers.matrix.top25 <- markers.matrix.sig[idx,]
+
+pheatmap(markers.matrix.top25, show_colnames = T, show_rownames = T)
+```
+
+
+
+
+
+```{r}
+# Compare to just CD4
+table(t.cells$celltype.specific)
+cd4 <- subset(t.cells, celltype.specific %in% c("malig", "CD4_T", "T_Activated", "Tregs"))
+
+table(cd4$orig.merge, cd4$celltype.specific)
+
+df.ctcl.deg.cd4 <- as.data.frame.matrix(table(cd4$orig.merge, cd4$celltype.specific.simple))
+
+df.ctcl.deg.cd4.ss <- subset(df.ctcl.deg, CTCL > 50 & Benign_T > 50)
+
+query <- rownames(df.ctcl.deg.cd4.ss)
+```
+
+
+```{r}
+cd4.query <- subset(cd4, orig.merge %in% query)
+
+cd4.query.ss <- cd4.query
+DefaultAssay(cd4.query.ss) <- "RNA"
+cd4.query.ss@assays$sketch <- NULL
+cd4.query.ss <- JoinLayers(cd4.query.ss)
+
+cd4.query.ss$orig.merge.malig <- paste0(cd4.query.ss$orig.merge, "_", cd4.query.ss$celltype.specific.simple)
+table(cd4.query.ss$orig.merge.malig)
+
+cd4.query.ss <- r2sample_seurat(cd4.query.ss, group_var = "orig.merge.malig", n = 1000, barcode_column = "barcode.unique")
+
+split.cd4 <- SplitObject(object = cd4.query.ss, split.by = "orig.merge")
+
+markers.split.cd4 <- list()
+
+markers.split.cd4 <- lapply(names(split.cd4), FUN = function(sample_name) {
+  # Get the current sample
+  x <- split.cd4[[sample_name]]
+  
+  # Set identities to "final.clones"
+  Idents(x) <- x$celltype.specific.simple
+  
+  markers.x <- FindMarkers(
+    x,
+    ident.1 = "CTCL",
+    ident.2 = "Benign_T") # Cluster of interest
+
+  # Add the sample name to the results
+  markers.x$sample <- sample_name
+  markers.x$gene <- rownames(markers.x)
+  markers.x$dif <- markers.x$pct.1 - markers.x$pct.2
+  markers.x$log_padj <- -log10(markers.x$p_val_adj + 1e-300)
+  
+  # Return the significant markers with the sample name
+  return(markers.x)
+})
+
+names(markers.split.cd4) <- names(split.cd4)
+saveRDS(markers.split.cd4, "~/hpchome/ctcl.deg.split.cd4.rds")
+
+```
+
+
+
+```{r}
+markers.matrix.cd4 <- bind_rows(markers.split.cd4) %>%
+  select(sample, avg_log2FC, gene) %>%
+  pivot_wider(
+    names_from = sample,
+    values_from = avg_log2FC,
+    values_fill = NA
+  ) %>%
+  column_to_rownames("gene") %>%
+  as.matrix()
+
+saveRDS(markers.matrix.cd4, "~/hpchome/ctcl.deg.markers.matrix.cd4.rds")
+
+
+padj.matrix.cd4 <- bind_rows(markers.split.cd4) %>%
+  select(sample, p_val_adj, gene) %>%
+  pivot_wider(
+    names_from = sample,
+    values_from = p_val_adj,
+    values_fill = NA
+  ) %>%
+  column_to_rownames("gene") %>%
+  as.matrix()
+
+saveRDS(padj.matrix.cd4, "~/hpchome/ctcl.deg.padj.matrix.cd4.rds")
+
+```
+
+
+
+```{r}
+markers.matrix.sig.cd4 <- markers.matrix.cd4
+markers.matrix.sig.cd4[padj.matrix.cd4 >= 0.05] <- NA
+
+hist(rowSums(is.na(markers.matrix.sig.cd4)))
+
+df.markers.summary.cd4 <- data.frame("Sum" = rowSums(markers.matrix.sig.cd4, na.rm = T), "Count" = rowSums(!is.na(markers.matrix.sig.cd4)))
+df.markers.summary.cd4$Norm <- df.markers.summary.cd4$Sum / df.markers.summary.cd4$Count
+
+df.markers.summary.cd4 <- arrange(df.markers.summary.cd4, desc(Sum))
+top.cd4 <- c(head(rownames(df.markers.summary.cd4), 25), tail(rownames(df.markers.summary.cd4), 50))
+
+top.cd4 <- setdiff(top.cd4, c(tcr_genes,ig_genes))
+```
+
+
+
+```{r}
+markers.matrix.cd4.ss <- markers.matrix.cd4[top.cd4,]
+pheatmap(markers.matrix.cd4.ss)
+```
+
+
+
+
+
+
+
+
+
+
+
+

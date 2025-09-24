@@ -1,0 +1,72 @@
+---
+title: "sca.processing"
+output: html_document
+date: "2025-09-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+
+
+```{r}
+#Didn't work, use python to read in h5ad and extract info
+library(SeuratDisk)
+
+Convert("~/hpchome/submission.h5ad", dest = "h5seurat", overwrite = TRUE, assay = "RNA", main.layer = "X")
+sca <- LoadH5Seurat("~/hpchome/submission.h5seurat")
+
+sca
+```
+
+
+```{r}
+counts <- ReadMtx(
+   mtx = t("~/hpchome/counts.mtx"),
+   features = "~/hpchome/genes.tsv",
+   cells = "~/hpchome/barcodes.tsv", feature.column = 1, cell.column = 1, mtx.transpose = T)
+
+meta <- read.csv("~/hpchome/cell_metadata.csv")
+rownames(meta) <- meta$index
+#gene.meta <- read.csv("~/hpchome/gene_metadata.csv")
+
+sca <- CreateSeuratObject(counts = counts, meta.data = meta, min.cells = 3, min.features = 300, project = "sca")
+
+table(sca$donor_id)
+
+
+sca$orig.ident <- sca$donor_id
+
+sca@meta.data <- sca@meta.data[,1:3]
+Idents(sca) <- sca$orig.ident
+
+split.sca <- SplitObject(sca, split.by = "orig.ident")
+
+list <- unique(sca$orig.ident)
+sca.list2 <- list()
+for(i in seq_along(list)){
+  tmp <- list[i]
+  mat <- GetAssayData(object = split.sca[[tmp]], layer = "counts", assay = "RNA")
+  mat <- update_gene_names_sparse(mat)
+  
+  so <- CreateSeuratObject(mat, min.cells = 3, min.features = 300, project = tmp)
+  so$barcode <- colnames(so)
+  sca.list2[[tmp]] <- so 
+}
+
+saveRDS(sca.list2, file = "~/hpchome/sca.list.rds")
+```
+
+
+
+
+
+
+

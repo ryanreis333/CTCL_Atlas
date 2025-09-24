@@ -1,0 +1,333 @@
+---
+title: "tme.stromal"
+output: html_document
+date: "2025-08-15"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r}
+test <- open_matrix_dir(dir = "~/hpchome/final.counts.disk")
+meta<- readRDS("~/hpchome/meta.rds")
+
+asdf <- CreateSeuratObject(counts = test, meta = meta)
+
+asdf@reductions$harmony.full <- readRDS("~/hpchome/harmony.full.rds")
+asdf@reductions$full.umap <- readRDS("~/hpchome/full.umap.rds")
+asdf@assays$sketch <- readRDS("~/hpchome/sketch.assay.rds")
+
+Idents(asdf) <- asdf$orig.ident
+
+DefaultAssay(asdf) <- "RNA"
+asdf <- NormalizeData(asdf)
+
+DimPlot(asdf, group.by = "orig.ident")+NoLegend()
+DimPlot(asdf, group.by = "celltype", label = T)+NoLegend()
+```
+
+
+```{r}
+`%!in%` <- Negate(`%in%`)
+tcr_genes <- grep("^TR[ABGD][VDJ]", rownames(asdf), value = TRUE)
+ig_genes  <- grep("^IG[HKL][VDJ]", rownames(asdf), value = TRUE)
+ribo  <- grep("^RP[SL]", rownames(asdf), value = TRUE)
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+cell.cycle <- c(s.genes, g2m.genes)
+hemoglobin <- grep("^HB[AB]", rownames(asdf), value = TRUE)
+```
+
+
+```{r}
+table(asdf$celltype)
+```
+
+
+```{r}
+stromal <- subset(asdf, celltype %in% c("Fibroblasts", "Glandular_Epi", "Keratinocytes", "Lymph_Endo", "Melanocytes", "Pericytes", "Vasc_Endo", "Neurons") & Tissue != "blood")
+table(stromal$Tissue)
+
+DefaultAssay(stromal) <- "RNA"
+stromal@assays$sketch <- NULL
+
+table(stromal$GEO.Cohort)
+table(stromal$orig.ident)
+
+stromal <- Split_Layers(stromal, assay = "RNA", split.by = "GEO.Cohort")
+stromal <- FindVariableFeatures(stromal, nfeatures = 2000)
+vf <- VariableFeatures(stromal)
+
+vf.ss <- setdiff(vf, c(tcr_genes, ig_genes, hemoglobin, cell.cycle, ribo))
+
+VariableFeatures(stromal) <- vf.ss
+
+table(stromal$GEO.Cohort)
+stromal <- subset(stromal, GEO.Cohort != "Iowa")
+
+stromal <- SketchData(object = stromal, ncells = 5000, method = "LeverageScore", sketched.assay = "sketch", over.write = T)
+DefaultAssay(stromal) <- "sketch"
+
+stromal <- JoinLayers(stromal, assay = "sketch")
+stromal <- FindVariableFeatures(stromal, nfeatures = 2000)
+
+vf <- VariableFeatures(stromal)
+vf.ss <- setdiff(vf, c(tcr_genes, ig_genes, hemoglobin, cell.cycle, ribo))
+VariableFeatures(stromal) <- vf.ss
+
+stromal <- ScaleData(stromal)
+stromal <- RunPCA(stromal)
+stromal <- RunHarmony(stromal, group.by.vars = "orig.ident", 
+				reduction = "pca", assay.use = "sketch", reduction.save = "harmony", dims = 1:30, ncores = 30)
+stromal <- RunUMAP(stromal, dims = 1:30, return.model = T, reduction = "harmony", umap.method = "umap-learn")
+
+DimPlot(stromal, group.by = "orig.ident")+NoLegend()
+DimPlot(stromal, group.by = "GEO.Cohort")
+DimPlot(stromal, group.by = "celltype", label = T)+NoLegend()
+
+```
+
+```{r}
+stromal <- FindNeighbors(stromal, reduction = "umap", dims = 1:2)
+stromal <- FindClusters(stromal, resolution = c(0.01,0.05,0.2))
+
+stromal <- FindNeighbors(stromal, reduction = "harmony", dims = 1:30)
+stromal <- FindClusters(stromal, resolution = c(0.1,0.3,0.5,0.8,1))
+```
+
+```{r}
+DimPlot(stromal, group.by = "orig.ident")+NoLegend()
+DimPlot(stromal, group.by = "GEO.Cohort")+NoLegend()
+DimPlot(stromal, group.by = "celltype", label = T)+NoLegend()
+
+DimPlot(stromal, group.by = "sketch_snn_res.0.01", label = T)+NoLegend()
+DimPlot(stromal, group.by = "sketch_snn_res.0.05", label = T)+NoLegend()
+DimPlot(stromal, group.by = "sketch_snn_res.0.2", label = T)+NoLegend()
+
+DimPlot(stromal, group.by = "sketch_snn_res.0.1", label = T)+NoLegend()
+DimPlot(stromal, group.by = "sketch_snn_res.0.3", label = T)+NoLegend()
+DimPlot(stromal, group.by = "sketch_snn_res.0.5", label = T)+NoLegend()
+DimPlot(stromal, group.by = "sketch_snn_res.0.8", label = T)+NoLegend()
+DimPlot(stromal, group.by = "sketch_snn_res.1", label = T)+NoLegend()
+```
+
+
+
+
+```{r}
+stromal <- JoinLayers(stromal, assay = "RNA")
+stromal <- ProjectIntegration(object = stromal, sketched.assay = "sketch", assay = "RNA", reduction = "harmony")
+
+stromal <- ProjectData(object = stromal, 
+                    sketched.assay = "sketch", 
+                    assay = "RNA", 
+                    sketched.reduction = "harmony", 
+                    full.reduction = "harmony.full",
+                    recompute.neighbors = T,
+                    dims = 1:30, 
+                    refdata = list(sketch_snn_res.0.01 = "sketch_snn_res.0.01",
+                                   sketch_snn_res.0.05 = "sketch_snn_res.0.05",
+                                   sketch_snn_res.0.2 = "sketch_snn_res.0.2",
+                                   sketch_snn_res.0.1 = "sketch_snn_res.0.1",
+                                   sketch_snn_res.0.3 = "sketch_snn_res.0.3",
+                                   sketch_snn_res.0.5 = "sketch_snn_res.0.5",
+                                   sketch_snn_res.0.8 = "sketch_snn_res.0.8",
+                                   sketch_snn_res.1 = "sketch_snn_res.1"), 
+                    k.weight = 100, 
+                    umap.model = "umap")
+
+
+DimPlot(stromal, reduction = "umap", group.by = "orig.ident", alpha = .1, pt.size = .1, raster = F)+NoLegend()
+DimPlot(stromal, reduction = "full.umap.1", group.by = "orig.ident", alpha = .1, pt.size = .1, raster = F)+NoLegend()
+
+DimPlot(stromal, reduction = "umap", group.by = "celltype", alpha = .1, pt.size = .1, raster = F)
+DimPlot(stromal, reduction = "full.umap.1", group.by = "celltype", alpha = .1, pt.size = .1, raster = F)
+
+DimPlot(stromal, reduction = "umap", group.by = "Dx.simple", alpha = .1, pt.size = .1, raster = F)
+DimPlot(stromal, reduction = "full.umap.1", group.by = "Dx.simple", alpha = .1, pt.size = .1, raster = F)
+```
+
+
+```{r}
+DimPlot(stromal, reduction = "umap", group.by = "sketch_snn_res.0.01", label = T)+NoLegend()
+DimPlot(stromal, reduction = "umap", group.by = "sketch_snn_res.0.05", label = T)+NoLegend()
+DimPlot(stromal, reduction = "umap", group.by = "sketch_snn_res.0.1", label = T)+NoLegend()
+DimPlot(stromal, reduction = "umap", group.by = "sketch_snn_res.0.3", label = T)+NoLegend()
+DimPlot(stromal, reduction = "umap", group.by = "sketch_snn_res.0.5", label = T)+NoLegend()
+DimPlot(stromal, reduction = "umap", group.by = "sketch_snn_res.0.8", label = T)+NoLegend()
+DimPlot(stromal, reduction = "umap", group.by = "sketch_snn_res.1", label = T)+NoLegend()
+```
+
+```{r}
+DimPlot(stromal, reduction = "full.umap.1", group.by = "sketch_snn_res.0.01", label = T, alpha = .1, pt.size = .1, raster = F)+NoLegend()
+DimPlot(stromal, reduction = "full.umap.1", group.by = "sketch_snn_res.0.05", label = T, alpha = .1, pt.size = .1, raster = F)+NoLegend()
+DimPlot(stromal, reduction = "full.umap.1", group.by = "sketch_snn_res.0.2", label = T, alpha = .1, pt.size = .1, raster = F)+NoLegend()
+DimPlot(stromal, reduction = "full.umap.1", group.by = "sketch_snn_res.0.1", label = T, alpha = .1, pt.size = .1, raster = F)+NoLegend()
+DimPlot(stromal, reduction = "full.umap.1", group.by = "sketch_snn_res.0.3", label = T, alpha = .1, pt.size = .1, raster = F)+NoLegend()
+DimPlot(stromal, reduction = "full.umap.1", group.by = "sketch_snn_res.0.5", label = T, alpha = .1, pt.size = .1, raster = F)+NoLegend()
+DimPlot(stromal, reduction = "full.umap.1", group.by = "sketch_snn_res.0.8", label = T, alpha = .1, pt.size = .1, raster = F)+NoLegend()
+DimPlot(stromal, reduction = "full.umap.1", group.by = "sketch_snn_res.1", label = T, alpha = .1, pt.size = .1, raster = F)+NoLegend()
+
+```
+
+
+
+
+
+```{r}
+markers.stromal <- FindAllMarkers(stromal, min.pct = .1, only.pos = T, group.by = "sketch_snn_res.0.1")
+
+markers.stromal$dif <- markers.stromal$pct.1 - markers.stromal$pct.2
+markers.stromal.ss <- markers.stromal %>% group_by(cluster) %>% arrange(desc(dif)) %>% slice_head(n = 20)
+```
+
+
+
+
+```{r}
+stromal <- subset(stromal, sketch_snn_res.0.5 != "5")
+remove <- CellSelector(DimPlot(stromal, reduction = "full.umap.1"))
+stromal <- subset(stromal, barcode.unique %!in% remove)
+
+DimPlot(stromal, reduction = "full.umap.1", group.by = "sketch_snn_res.0.5", label = T, raster = F, pt.size = .01, alpha = .1)+NoLegend()
+```
+
+```{r}
+Idents(stromal) <- stromal$sketch_snn_res.0.5
+
+markers.stromal <- FindAllMarkers(stromal, only.pos = T, min.pct = .1, max.cells.per.ident = 5000)
+markers.stromal$dif <- markers.stromal$pct.1 - markers.stromal$pct.2
+markers.stromal.ss <- markers.stromal %>% group_by(cluster) %>% arrange(desc(dif)) %>% slice_head(n = 10)
+
+markers.stromal.ss$cluster <- as.numeric(as.character(markers.stromal.ss$cluster))
+markers.stromal.ss <- arrange(markers.stromal.ss, cluster)
+```
+
+
+```{r}
+DimPlot(stromal, reduction = "full.umap.1", group.by = "orig.ident", alpha = .1, pt.size = .1, raster = F)+NoLegend()
+
+DimPlot(stromal, reduction = "full.umap.1", group.by = "GEO.Cohort", alpha = .1, pt.size = .1, raster = F)+NoLegend()
+
+DimPlot(stromal, reduction = "full.umap.1", group.by = "celltype", alpha = .1, pt.size = .1, raster = F)
+
+DimPlot(stromal, reduction = "full.umap.1", group.by = "Tissue", alpha = .1, pt.size = .1, raster = F)
+```
+
+
+```{r}
+DimPlot(stromal, reduction = "full.umap.1", group.by = "sketch_snn_res.0.5", label = T, raster = F, pt.size = .01, alpha = .1)+NoLegend()
+```
+
+
+```{r}
+Idents(stromal) <- stromal$sketch_snn_res.0.5
+stromal <- RenameIdents(stromal, "0" = "Fibro_Col",
+                          "1" = "Kerat_Suprabasal",
+                          "2" = "Vasc_Endo",
+                          "3" = "Pericytes",
+                          "4" = "Kerat_Basal",
+                          "6" = "Fibro_ECM",
+                          "7" = "Kerat_Int",
+                          "8" = "Melanocyte",
+                          "9" = "Lymph_Endo",
+                          "10" = "Vasc_Endo_Junc",
+                          "11" = "Fibro_Perivascular",
+                          "12" = "Kerat_Glandular",
+                          "13" = "Vasc_Endo_Reg"
+                       )
+
+stromal$celltype.specific <- Idents(stromal)
+
+DimPlot(stromal, group.by = "celltype", label = T, reduction = "full.umap.1")+NoLegend()
+DimPlot(stromal, group.by = "celltype.specific", label = T, reduction = "full.umap.1")+NoLegend()
+```
+
+```{r}
+mat.stromal <- stromal@assays$RNA@layers$counts
+rownames(mat.stromal) <- rownames(stromal)
+colnames(mat.stromal) <- colnames(stromal)
+
+write_matrix_dir(mat = mat.stromal, dir = "~/hpchome/stromal.mat.matrix.dir")
+
+saveRDS(stromal@assays$sketch, "~/hpchome/stromal.sketch.assay.rds")
+saveRDS(stromal@reductions$harmony.full, "~/hpchome/stromal.harmony.full.rds")
+saveRDS(stromal@reductions$full.umap.1, "~/hpchome/stromal.full.umap.rds")
+
+meta <- stromal@meta.data
+meta <- meta[,c(1:35,53)]
+saveRDS(meta, "~/hpchome/stromal.meta.rds")
+```
+
+
+
+```{r}
+test <- open_matrix_dir(dir = "~/hpchome/stromal.mat.matrix.dir")
+meta<- readRDS("~/hpchome/stromal.meta.rds")
+
+stromal.test <- CreateSeuratObject(counts = test, meta = meta)
+
+stromal.test@reductions$harmony.full <- readRDS("~/hpchome/stromal.harmony.full.rds")
+stromal.test@reductions$full.umap.1 <- readRDS("~/hpchome/stromal.full.umap.rds")
+stromal.test@assays$sketch <- readRDS("~/hpchome/stromal.sketch.assay.rds")
+
+Idents(stromal.test) <- stromal.test$orig.ident
+
+DefaultAssay(stromal.test) <- "RNA"
+stromal.test <- NormalizeData(stromal.test)
+
+DimPlot(stromal.test, group.by = "orig.ident")+NoLegend()
+DimPlot(stromal.test, group.by = "celltype", label = T)+NoLegend()
+DimPlot(stromal.test, group.by = "celltype.specific", label = T)+NoLegend()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

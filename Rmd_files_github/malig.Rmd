@@ -1,0 +1,229 @@
+---
+title: "malig"
+output: html_document
+date: "2025-09-17"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+
+
+```{r}
+t.cells <- subset(asdf, celltype == "T_Cells")
+
+list <- sort(unique(meta$Patient.ID[meta$Dx.simple == "CTCL"]))
+
+tmp <- list[103]
+
+ss <- subset(t.cells, Patient.ID == tmp)
+length(unique(ss$orig.ident))
+
+ss <- FindVariableFeatures(ss, nfeatures = 1000)
+ss <- ScaleData(ss)
+ss <- RunPCA(ss, npcs = 30)
+#ss <- RunHarmony(ss, group.by.vars = "orig.ident", reduction = "pca", assay.use = "RNA", reduction.save = "harmony", ncores = 30)
+ss <- RunUMAP(ss, dims = 1:30, reduction = "pca")
+
+DimPlot(ss, group.by = "cloneSize", reduction = "umap")
+DimPlot(ss, group.by = "hyper", reduction = "umap")
+DimPlot(ss, group.by = "orig.ident", reduction = "umap")
+FeaturePlot(ss, features = "PTPRC", reduction = "umap")
+FeaturePlot(ss, features = "CD3E", reduction = "umap")
+FeaturePlot(ss, features = "CD4", reduction = "umap")
+FeaturePlot(ss, features = "CD7", reduction = "umap")
+FeaturePlot(ss, features = "CD8A", reduction = "umap")
+FeaturePlot(ss, features = "TRDC", reduction = "umap")
+FeaturePlot(ss, features = "FOXP3", reduction = "umap")
+FeaturePlot(ss, features = "NKG7", reduction = "umap")
+FeaturePlot(ss, features = "KIR3DL2", reduction = "umap")
+
+FeaturePlot(ss, features = "HDAC9", reduction = "umap")
+FeaturePlot(ss, features = "KRT7", reduction = "umap")
+FeaturePlot(ss, features = "ARHGAP21", reduction = "umap")
+FeaturePlot(ss, features = "PLS3", reduction = "umap")
+FeaturePlot(ss, features = "PAGE5", reduction = "umap")
+FeaturePlot(ss, features = "TRAV13-1", reduction = "umap")
+FeaturePlot(ss, features = "TRBV28", reduction = "umap")
+```
+
+
+```{r}
+malig <- CellSelector(DimPlot(ss, group.by = "cloneSize", reduction = "umap"))
+malig <- ss$barcode.unique[ss$RNA_snn_res.0.1 %in% c("0","2","3","4","6","8","11")]
+malig <- ss$barcode.unique[ss$pred.cluster.malig == "malig"]
+
+malig.add <- CellSelector(DimPlot(ss, group.by = "cloneSize", reduction = "umap"))
+malig.remove <- CellSelector(DimPlot(ss, group.by = "cloneSize", reduction = "umap"))
+
+malig.final <- c(malig, malig.add)
+malig.final <- intersect(malig, malig.add)
+malig.final <- setdiff(malig, malig.remove)
+DimPlot(ss, reduction = "umap", cells.highlight = malig.final, sizes.highlight = 1)
+
+malig <- malig.final
+
+malig.all <- append(malig.all, malig)
+
+saveRDS(malig.all, "~/hpchome/malig.all.final.rds")
+#sample 82
+```
+
+```{r}
+DimPlot(ss, group.by = "cloneSize", reduction = "umap")
+DimPlot(ss, group.by = "RNA_snn_res.0.1", reduction = "umap", label = T)
+```
+
+
+```{r}
+sort(table(ss$CTaa), decreasing = TRUE)
+
+DimPlot(ss, reduction = "umap", cells.highlight = ss$barcode.unique[ss$CTaa == "CAASDSWGKLQF_CASSPSTQSNEKLFF"], sizes.highlight = 1)
+```
+
+
+```{r}
+table(ss$cloneSize)
+markers.malig <- FindMarkers(ss, ident.1 = "Hyperexpanded (0.1 < X <= 1)", group.by = "cloneSize")
+#table(ss$mal)
+markers.malig <- FindMarkers(ss, ident.1 = "hyper", ident.2 = "non_hyper", group.by = "hyper")
+markers.malig$dif <- markers.malig$pct.1 - markers.malig$pct.2
+markers.malig$gene <- rownames(markers.malig)
+
+markers.malig.pos <- subset(markers.malig, avg_log2FC > 0)
+markers.malig.neg <- subset(markers.malig, avg_log2FC < 0)
+
+up <- head(rownames(markers.malig.pos), 50)
+down <- head(rownames(markers.malig.neg), 50)
+
+ss <- AddModuleScore(object = ss, features = list(up, down))
+ss$pred.label <- ifelse(ss$Cluster1 > ss$Cluster2, "malig", "non_malig")
+
+cl <- kmeans(ss@meta.data[, c("Cluster1", "Cluster2")], centers = 2)
+ss$pred.cluster <- paste0("Cluster", cl$cluster)
+
+cluster_means <- tapply(ss$Cluster1, ss$pred.cluster, mean)
+malig_cluster <- names(which.max(cluster_means))
+
+ss$pred.cluster.malig <- ifelse(ss$pred.cluster == malig_cluster, "malig", "non_malig")
+
+DimPlot(ss, group.by = "cloneSize", reduction = "umap")
+DimPlot(ss, group.by = "malig", reduction = "umap")
+DimPlot(ss, group.by = "pred.label", reduction = "umap")
+DimPlot(ss, group.by = "pred.cluster", reduction = "umap")
+DimPlot(ss, group.by = "pred.cluster.malig", reduction = "umap")
+FeaturePlot(ss, reduction = "umap", features = "Cluster1")
+FeaturePlot(ss, reduction = "umap", features = "Cluster2")
+
+up
+```
+
+
+
+```{r}
+go <- enrichGO(gene = up, OrgDb = "org.Hs.eg.db", keyType = "SYMBOL", ont = "ALL", universe = markers.malig$gene)
+
+
+ss <- FindNeighbors(ss, reduction = "umap", dims = 1:2)
+ss <- FindClusters(ss, resolution = 0.1)
+DimPlot(ss, reduction = "umap", group.by = "RNA_snn_res.0.1", label = T)
+
+markers.tmp <- FindMarkers(ss, group.by = "RNA_snn_res.0.1", ident.1 = c("5","12","9"), ident.2 = c("0","2","4"))
+markers.tmp$dif <- markers.tmp$pct.1 - markers.tmp$pct.2
+markers.tmp$gene <- rownames(markers.tmp)
+
+markers.tmp <- FindAllMarkers(ss, group.by = "RNA_snn_res.0.1")
+markers.tmp$dif <- markers.tmp$pct.1 - markers.tmp$pct.2
+
+markers.tmp2 <- arrange(markers.tmp, desc(dif))
+up <- head(markers.tmp2$gene, 100)
+down <- tail(markers.tmp2$gene, 100)
+go <- enrichGO(gene = down, OrgDb = "org.Hs.eg.db", keyType = "SYMBOL", ont = "ALL", universe = markers.tmp2$gene)
+
+FeaturePlot(ss, reduction = "umap", features = "percent.mt")
+FeaturePlot(ss, reduction = "umap", features = "percent.rb")
+FeaturePlot(ss, reduction = "umap", features = "nCount_RNA")
+FeaturePlot(ss, reduction = "umap", features = "nFeature_RNA")
+FeaturePlot(ss, reduction = "umap", features = "S.Score")
+FeaturePlot(ss, reduction = "umap", features = "G2M.Score")
+
+FeaturePlot(ss, reduction = "umap", features = "TRAV4")
+FeaturePlot(ss, reduction = "umap", features = "TRBV11-1")
+FeaturePlot(ss, reduction = "umap", features = "CHGB")
+FeaturePlot(ss, reduction = "umap", features = "IKZF2")
+FeaturePlot(ss, reduction = "umap", features = "CCR7")
+
+FeaturePlot(ss, reduction = "umap", features = "CTSL")
+FeaturePlot(ss, reduction = "umap", features = "TRBC2")
+FeaturePlot(ss, reduction = "umap", features = "GSTP1")
+FeaturePlot(ss, reduction = "umap", features = "KLRK1")
+FeaturePlot(ss, reduction = "umap", features = "NOSIP")
+
+
+FeaturePlot(ss, reduction = "umap", features = "TRAV25")
+FeaturePlot(ss, reduction = "umap", features = "PLS3")
+FeaturePlot(ss, reduction = "umap", features = "S100A4")
+FeaturePlot(ss, reduction = "umap", features = "GAPDH")
+FeaturePlot(ss, reduction = "umap", features = "DNM3")
+```
+
+
+
+
+```{r}
+VlnPlot(ss, group.by = "orig.ident", features = "percent.rb", split.by = "mal")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

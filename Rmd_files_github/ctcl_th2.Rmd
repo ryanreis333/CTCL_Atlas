@@ -1,0 +1,234 @@
+---
+title: "ctcl_th2"
+output: html_document
+date: "2025-09-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+
+
+```{r}
+library(dplyr)
+library(stringr)
+sdrf <- read.delim("~/hpchome/ftp/ftp.ebi.ac.uk/biostudies/fire/E-MTAB-/303/E-MTAB-12303/Files/E-MTAB-12303.sdrf.txt", sep = "\t", check.names = FALSE)
+
+colnames(sdrf) <- make.unique(colnames(sdrf))
+
+# Build mapping: Source Name -> tar.gz files
+mapping <- sdrf %>%
+  select(`Source Name`, starts_with("Derived Array Data File")) %>%
+  tidyr::pivot_longer(
+    cols = -`Source Name`,
+    names_to = "file_col",
+    values_to = "tar_file"
+  ) %>%
+  filter(grepl("\\.tar\\.gz$", tar_file)) %>%
+  distinct(`Source Name`, tar_file)
+
+# Extract patient/sample prefix (everything before first "_")
+mapping <- mapping %>%
+  mutate(Patient = str_extract(`Source Name`, "^[^_]+")) %>%
+  group_by(Patient) %>%
+  summarise(tar_files = list(unique(tar_file)), .groups = "drop")
+
+# Show result
+mapping
+```
+
+
+```{r}
+name_map <- mapping %>%
+  unnest(tar_files) %>%
+  mutate(tar_files = gsub("\\.tar\\.gz$", "", tar_files))
+
+name_map <- as.data.frame(name_map)
+
+name_map <- subset(name_map, tar_files %in% names(so.list))
+
+name_map <- name_map %>%
+  group_by(Patient) %>%
+  mutate(
+    is_wsss = grepl("^WSSS", tar_files),
+    gex_index = ifelse(is_wsss, row_number(), NA_integer_)
+  ) %>%
+  ungroup()
+
+
+name_map <- name_map %>%
+  mutate(
+    final_name = case_when(
+      # WSSS samples -> CTCLx_GEX_#
+      is_wsss ~ paste0(Patient, "_GEX_", gex_index),
+      # Already has GEX in the name -> keep
+      str_detect(tar_files, "GEX_") ~ tar_files,
+      # Everything else: default to patient
+      TRUE ~ Patient
+    )
+  )
+```
+
+
+
+
+
+```{r}
+list <- list.dirs("~/hpchome/ftp/ftp.ebi.ac.uk/biostudies/fire/E-MTAB-/303/E-MTAB-12303/Files", recursive = F, full.names = F)
+so.list <- list()
+for (i in seq_along(list)) {
+  tmp <- list[i]
+  path <- paste0("~/hpchome/ftp/ftp.ebi.ac.uk/biostudies/fire/E-MTAB-/303/E-MTAB-12303/Files/", 
+                 tmp, "/output/Gene/filtered")
+  
+  if (dir.exists(path)) {
+    message("Processing: ", tmp)
+    data <- Read10X(data.dir = path)
+    data <- update_gene_names_sparse(data)
+    so <- CreateSeuratObject(data, min.cells = 3, min.features = 300, project = tmp)
+    so.list[[tmp]] <- so   # store by sample name
+  } else {
+    message("Skipping: ", tmp, " (directory not found)")
+  }
+}
+
+names(so.list)
+
+names(so.list) <- name_map$final_name[match(names(so.list), name_map$tar_files)]
+
+so.list <- lapply(so.list, function(x) {
+  # remove sample prefix up to the last underscore, then remove trailing -digits
+  x@meta.data$barcode <- colnames(x)
+  return(x)
+})
+```
+
+
+
+```{r}
+vdj.list <- list()
+for (i in seq_along(list)) {
+  tmp <- list[i]
+  path <- paste0("~/hpchome/ftp/ftp.ebi.ac.uk/biostudies/fire/E-MTAB-/303/E-MTAB-12303/Files/", 
+                 tmp, "/outs")
+  
+  if (dir.exists(path)) {
+    message("Processing: ", tmp)
+    vdj.list[[tmp]] <- read.csv(paste0(path, "/filtered_contig_annotations.csv"))   # store by sample name
+  } else {
+    message("Skipping: ", tmp, " (directory not found)")
+  }
+}
+
+```
+
+
+
+```{r}
+vdj_map <- mapping %>%
+  unnest(tar_files) %>%
+  mutate(tar_files = gsub("\\.tar\\.gz$", "", tar_files)) %>%
+  filter(grepl("VDJ|WSSS", tar_files))   # keep only VDJ or WSSS entries
+
+vdj_map <- as.data.frame(vdj_map)
+
+vdj_map <- subset(vdj_map, tar_files %in% names(vdj.list))
+
+vdj_map <- vdj_map %>%
+  group_by(Patient) %>%
+  mutate(
+    is_wsss = grepl("^WSSS", tar_files),
+    vdj_index = ifelse(is_wsss, row_number(), NA_integer_)
+  ) %>%
+  ungroup()
+
+vdj_map <- vdj_map %>%
+  mutate(
+    final_name = case_when(
+      # WSSS samples → CTCLx_VDJ_#
+      is_wsss ~ paste0(Patient, "_VDJ_", vdj_index),
+      # Already has VDJ in the name → keep
+      str_detect(tar_files, "VDJ_") ~ tar_files,
+      TRUE ~ Patient
+    )
+  )
+
+names(vdj.list) <- vdj_map$final_name[match(names(vdj.list), vdj_map$tar_files)]
+
+```
+
+
+
+```{r}
+# GEX barcodes
+gex_barcodes <- lapply(so.list, colnames)
+
+# VDJ barcodes (strip the "-1" suffix for matching)
+vdj_barcodes <- lapply(vdj.list, function(x) gsub("-1$", "", x$barcode))
+
+
+overlap_matrix <- sapply(vdj_barcodes, function(v_bcs) {
+  sapply(gex_barcodes, function(g_bcs) length(intersect(v_bcs, g_bcs)))
+})
+
+# For each VDJ, find the best-matching GEX
+best_match <- apply(overlap_matrix, 2, function(x) names(x)[which.max(x)])
+best_match
+
+vdj.list.save <- vdj.list
+#vdj.list <- vdj.list.save
+names(vdj.list) <- best_match[colnames(overlap_matrix)]
+
+combined.TCR <- combineTCR(
+  vdj.list,
+  samples = names(vdj.list),
+  removeNA = FALSE,
+  removeMulti = FALSE,
+  filterMulti = TRUE
+)
+
+
+combined.TCR <- lapply(combined.TCR, function(df) {
+  # remove sample prefix up to the last underscore, then remove trailing -digits
+  df$barcode <- sub("-\\d+$", "", sub("^.*_", "", df$barcode))
+  df
+})
+
+
+valid_samples <- names(vdj.list)
+screp.list <- list()
+for(i in seq_along(valid_samples)){
+  tmp <- valid_samples[i]
+  screp.list[[tmp]] <- combineExpression(combined.TCR[tmp], so.list[[tmp]], chain = "both", cloneCall = "gene", proportion = TRUE)
+}
+
+missing.tcr <- setdiff(names(so.list), names(screp.list))
+missingtcr.list <- so.list[missing.tcr]
+
+th2.list <- c(screp.list, missingtcr.list)
+saveRDS(th2.list, file = "~/hpchome/th2.list2.rds")
+```
+
+
+```{r}
+tmp <- readRDS("~/hpchome/th2.list2.rds")
+```
+
+
+
+
+
+
+
+
+
+
+
+

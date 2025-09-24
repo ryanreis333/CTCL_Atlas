@@ -1,0 +1,301 @@
+---
+title: "tme.immune"
+output: html_document
+date: "2025-08-15"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r}
+test <- open_matrix_dir(dir = "~/hpchome/final.counts.disk")
+meta<- readRDS("~/hpchome/meta.rds")
+
+asdf <- CreateSeuratObject(counts = test, meta = meta)
+
+asdf@reductions$harmony.full <- readRDS("~/hpchome/harmony.full.rds")
+asdf@reductions$full.umap <- readRDS("~/hpchome/full.umap.rds")
+asdf@assays$sketch <- readRDS("~/hpchome/sketch.assay.rds")
+
+Idents(asdf) <- asdf$orig.ident
+
+DefaultAssay(asdf) <- "RNA"
+asdf <- NormalizeData(asdf)
+
+DimPlot(asdf, group.by = "orig.ident")+NoLegend()
+DimPlot(asdf, group.by = "celltype", label = T)+NoLegend()
+```
+
+
+```{r}
+`%!in%` <- Negate(`%in%`)
+tcr_genes <- grep("^TR[ABGD][VDJ]", rownames(asdf), value = TRUE)
+ig_genes  <- grep("^IG[HKL][VDJ]", rownames(asdf), value = TRUE)
+ribo  <- grep("^RP[SL]", rownames(asdf), value = TRUE)
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+cell.cycle <- c(s.genes, g2m.genes)
+hemoglobin <- grep("^HB[AB]", rownames(asdf), value = TRUE)
+```
+
+
+```{r}
+meta <- asdf@meta.data
+
+malig.all <- readRDS("~/hpchome/malig.all.final.rds")
+meta$celltype.malig <- ifelse(meta$barcode.unique %in% malig.all, "malig", meta$celltype)
+
+table(meta$celltype, meta$celltype.malig)
+
+asdf@meta.data <- meta
+```
+
+
+```{r}
+immune <- subset(asdf, celltype.malig %in% c("B_Cells", "Mast_Cells", "Myeloid", "T_Cells"))
+
+DefaultAssay(immune) <- "RNA"
+immune@assays$sketch <- NULL
+
+table(immune$GEO.Cohort)
+immune <- subset(immune, GEO.Cohort != "Iowa")
+
+immune <- Split_Layers(immune, assay = "RNA", split.by = "GEO.Cohort")
+
+immune <- FindVariableFeatures(immune, nfeatures = 2000)
+
+immune <- SketchData(object = immune, ncells = 5000, method = "LeverageScore", sketched.assay = "sketch", over.write = T)
+DefaultAssay(immune) <- "sketch"
+immune <- JoinLayers(immune, assay = "sketch")
+
+immune <- FindVariableFeatures(immune, nfeatures = 2000)
+vf <- VariableFeatures(immune)
+vf.ss <- setdiff(vf, c(tcr_genes, ig_genes, hemoglobin, cell.cycle, ribo))
+VariableFeatures(immune) <- vf.ss
+
+immune <- ScaleData(immune, vars.to.regress = "nFeature_RNA")
+immune <- RunPCA(immune)
+immune <- RunHarmony(immune, group.by.vars = "orig.ident", 
+				reduction = "pca", assay.use = "sketch", reduction.save = "harmony", dims = 1:30, ncores = 30)
+immune <- RunUMAP(immune, dims = 1:30, return.model = T, reduction = "harmony", umap.method = "umap-learn")
+
+DimPlot(immune, group.by = "orig.ident", reduction = "umap")+NoLegend()
+DimPlot(immune, group.by = "GEO.Cohort", reduction = "umap")+NoLegend()
+DimPlot(immune, group.by = "celltype", reduction = "umap", label = T)+NoLegend()
+
+immune <- FindNeighbors(immune, reduction = "umap", dims = 1:2)
+immune <- FindClusters(immune, resolution = c(0.01,0.05,0.2))
+
+DimPlot(immune, group.by = "orig.ident")+NoLegend()
+DimPlot(immune, group.by = "GEO.Cohort")+NoLegend()
+DimPlot(immune, group.by = "celltype", label = T)+NoLegend()
+DimPlot(immune, reduction = "umap", group.by = "sketch_snn_res.0.01", label = T)+NoLegend()
+DimPlot(immune, reduction = "umap", group.by = "sketch_snn_res.0.05", label = T)+NoLegend()
+DimPlot(immune, reduction = "umap", group.by = "sketch_snn_res.0.2", label = T)+NoLegend()
+
+```
+
+```{r}
+Idents(immune) <- immune$sketch_snn_res.0.01
+
+markers.immune <- FindAllMarkers(immune, only.pos = T, min.pct = .1)
+markers.immune$dif <- markers.immune$pct.1 - markers.immune$pct.2
+markers.immune.ss <- markers.immune %>% group_by(cluster) %>% arrange(desc(dif)) %>% slice_head(n = 10)
+```
+
+
+```{r}
+immune <- FindNeighbors(immune, reduction = "harmony", dims = 1:30)
+immune <- FindClusters(immune, resolution = c(0.1,0.3,0.5,0.8,1))
+
+immune <- JoinLayers(immune, assay = "RNA")
+immune <- ProjectIntegration(object = immune, sketched.assay = "sketch", assay = "RNA", reduction = "harmony")
+
+immune <- ProjectData(object = immune, 
+                    sketched.assay = "sketch", 
+                    assay = "RNA", 
+                    sketched.reduction = "harmony", 
+                    full.reduction = "harmony.full",
+                    recompute.neighbors = T,
+                    dims = 1:30, 
+                    refdata = list(sketch_snn_res.0.01 = "sketch_snn_res.0.01",
+                                   sketch_snn_res.0.05 = "sketch_snn_res.0.05",
+                                   sketch_snn_res.0.2 = "sketch_snn_res.0.2",
+                                   sketch_snn_res.0.1 = "sketch_snn_res.0.1",
+                                   sketch_snn_res.0.3 = "sketch_snn_res.0.3",
+                                   sketch_snn_res.0.5 = "sketch_snn_res.0.5",
+                                   sketch_snn_res.0.8 = "sketch_snn_res.0.8",
+                                   sketch_snn_res.1 = "sketch_snn_res.1"), 
+                    k.weight = 100, 
+                    umap.model = "umap")
+
+
+DimPlot(immune, reduction = "umap", group.by = "orig.ident", alpha = .1, pt.size = .1, raster = F)+NoLegend()
+DimPlot(immune, reduction = "full.umap.1", group.by = "orig.ident", alpha = .1, pt.size = .1, raster = F)+NoLegend()
+
+DimPlot(immune, reduction = "umap", group.by = "celltype", alpha = .1, pt.size = .1, raster = F)
+DimPlot(immune, reduction = "full.umap.1", group.by = "celltype", alpha = .1, pt.size = .1, raster = F)
+
+```
+
+
+```{r}
+DefaultAssay(immune) <- "RNA"
+DimPlot(immune, reduction = "full.umap.1", group.by = "sketch_snn_res.0.01", label = T)+NoLegend()
+DimPlot(immune, reduction = "full.umap.1", group.by = "sketch_snn_res.0.05", label = T)+NoLegend()
+DimPlot(immune, reduction = "full.umap.1", group.by = "sketch_snn_res.0.2", label = T)+NoLegend()
+DimPlot(immune, reduction = "full.umap.1", group.by = "sketch_snn_res.0.1", label = T)+NoLegend()
+DimPlot(immune, reduction = "full.umap.1", group.by = "sketch_snn_res.0.3", label = T)+NoLegend()
+DimPlot(immune, reduction = "full.umap.1", group.by = "sketch_snn_res.0.5", label = T)+NoLegend()
+DimPlot(immune, reduction = "full.umap.1", group.by = "sketch_snn_res.0.8", label = T)+NoLegend()
+DimPlot(immune, reduction = "full.umap.1", group.by = "sketch_snn_res.1", label = T)+NoLegend()
+```
+
+```{r}
+immune <- subset(immune, sketch_snn_res.0.01 != "10")
+remove <- CellSelector(DimPlot(immune, reduction = "full.umap.1"))
+immune <- subset(immune, barcode.unique %!in% remove)
+
+DimPlot(immune, reduction = "full.umap.1", group.by = "sketch_snn_res.0.01", label = T, raster = F, pt.size = .01, alpha = .1)+NoLegend()
+```
+
+
+```{r}
+DefaultAssay(immune) <- "sketch"
+Idents(immune) <- immune$sketch_snn_res.0.3
+
+markers.immune <- FindAllMarkers(immune, only.pos = T, min.pct = .1, max.cells.per.ident = 5000)
+markers.immune$dif <- markers.immune$pct.1 - markers.immune$pct.2
+
+markers.immune$cluster <- as.numeric(as.character(markers.immune$cluster))
+
+markers.immune.ss <- markers.immune %>% group_by(cluster) %>% arrange(desc(dif)) %>% slice_head(n = 10)
+```
+
+
+```{r}
+immune <- subset(immune, sketch_snn_res.0.3 != "16")
+DimPlot(immune, reduction = "full.umap.1", group.by = "sketch_snn_res.0.3", label = T, raster = F, pt.size = .01, alpha = .1)+NoLegend()
+```
+
+```{r}
+FeaturePlot(immune, features = "CD4")
+FeaturePlot(immune, features = "CD8A")
+FeaturePlot(immune, features = "NKG7")
+FeaturePlot(immune, features = "TRDC")
+```
+
+```{r}
+Idents(immune) <- immune$sketch_snn_res.0.3
+immune <- RenameIdents(immune, "0" = "CD4_T",
+                          "1" = "CD14_Mono",
+                          "2" = "CD8_T",
+                          "3" = "Macrophage",
+                          "4" = "cDC2",
+                          "5" = "ILC",
+                          "6" = "B_Cells",
+                          "7" = "Treg",
+                          "8" = "mreg_DC",
+                          "9" = "T_HSP",
+                          "10" = "Plasma_Cells",
+                          "11" = "CD16_Mono",
+                          "12" = "CD4_T_Act",
+                          "13" = "cDC1",
+                          "14" = "pDCs",
+                          "15" = "Mast_Cells")
+immune$celltype.specific <- Idents(immune)
+
+DimPlot(immune, group.by = "celltype", label = T, reduction = "full.umap.1")+NoLegend()
+DimPlot(immune, group.by = "celltype.specific", label = T, reduction = "full.umap.1")+NoLegend()
+```
+
+```{r}
+mat.immune <- immune@assays$RNA@layers$counts
+rownames(mat.immune) <- rownames(immune)
+colnames(mat.immune) <- colnames(immune)
+
+write_matrix_dir(mat = mat.immune, dir = "~/hpchome/immune.mat.matrix.dir")
+
+saveRDS(immune@assays$sketch, "~/hpchome/immune.sketch.assay.rds")
+saveRDS(immune@reductions$harmony.full, "~/hpchome/immune.harmony.full.rds")
+saveRDS(immune@reductions$full.umap.1, "~/hpchome/immune.full.umap.rds")
+
+meta <- immune@meta.data
+meta <- meta[,c(1:35,53)]
+saveRDS(meta, "~/hpchome/immune.meta.rds")
+```
+
+
+
+
+
+```{r}
+test <- open_matrix_dir(dir = "~/hpchome/immune.mat.matrix.dir")
+meta<- readRDS("~/hpchome/immune.meta.rds")
+
+immune.test <- CreateSeuratObject(counts = test, meta = meta)
+
+immune.test@reductions$harmony.full <- readRDS("~/hpchome/immune.harmony.full.rds")
+immune.test@reductions$full.umap.1 <- readRDS("~/hpchome/immune.full.umap.rds")
+immune.test@assays$sketch <- readRDS("~/hpchome/immune.sketch.assay.rds")
+
+Idents(immune.test) <- immune.test$orig.ident
+
+DefaultAssay(immune.test) <- "RNA"
+immune.test <- NormalizeData(immune.test)
+
+DimPlot(immune.test, group.by = "orig.ident")+NoLegend()
+DimPlot(immune.test, group.by = "celltype", label = T)+NoLegend()
+DimPlot(immune.test, group.by = "celltype.specific", label = T)+NoLegend()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

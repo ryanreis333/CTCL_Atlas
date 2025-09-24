@@ -1,0 +1,106 @@
+---
+title: "ctcl_canc_disc"
+output: html_document
+date: "2025-09-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r}
+# Set data directory
+data_dir <- "~/hpchome/ctcl4.4/GSE284075"
+
+# List files
+gex_files <- list.files(data_dir, pattern = "filtered_feature_bc_matrix\\.h5$", full.names = TRUE)
+contig_files <- list.files(data_dir, pattern = "filtered_contig_annotations\\.csv\\.gz$", full.names = TRUE)
+
+# Helper to extract sample ID
+get_sample_id <- function(x) {
+  str_extract(basename(x), "^GSM\\d+_PT\\d+_[^_]+")
+}
+
+# Create mapping
+file_map <- tibble(
+  gex = gex_files,
+  contig = contig_files,
+  sample = sapply(gex_files, get_sample_id)
+)
+
+canc_disc.list <- list()
+for (i in seq_len(nrow(file_map))) {
+  sample_id <- file_map$sample[i]
+  gex_file <- file_map$gex[i]
+  contig_file <- file_map$contig[i]
+
+  message("Processing: ", sample_id)
+
+  tmp <- Read10X_h5(gex_file)
+  tmp2 <- tmp$`Gene Expression`
+  ## 1. Read GEX into Seurat
+  tmp2 <- update_gene_names_sparse(tmp2)
+  so <- CreateSeuratObject(counts = tmp2, project = sample_id, min.cells = 3, min.features = 300)
+
+  ## 2. Read and filter contigs
+  contigs <- fread(contig_file)
+
+  ## 3. Wrap in list for scRepertoire
+  contig_list <- list(contigs)
+
+  ## 4. Combine TCR
+  combined.TCR <- combineTCR(
+    contig_list,
+    samples = c(""),
+    removeNA = FALSE,
+    removeMulti = FALSE,
+    filterMulti = TRUE
+  )
+  
+  ## 5. Clean barcodes
+  combined.TCR[[1]][["barcode"]] <- sub("^_", "", combined.TCR[[1]][["barcode"]])  # just remove leading underscore
+
+  colnames(so) <- sub("^_", "", colnames(so))  # just remove leading underscore
+
+  ## 6. Combine TCR with expression
+  so <- combineExpression(
+    combined.TCR,
+    so,
+    cloneCall = "gene",
+    group.by = "sample",
+    proportion = TRUE
+  )
+  
+  ## 7. Store result
+  canc_disc.list[[sample_id]] <- so
+}
+
+canc_disc.list <- lapply(canc_disc.list, function(x) {
+  # remove sample prefix up to the last underscore, then remove trailing -digits
+  x@meta.data$barcode <- colnames(x)
+  return(x)
+})
+
+canc_disc.list <- lapply(canc_disc.list, function(x) {
+  # remove sample prefix up to the last underscore, then remove trailing -digits
+  x@meta.data$barcode <- sub("-.*", "", x@meta.data$barcode)
+  return(x)
+})
+
+saveRDS(canc_disc.list, file = "~/hpchome/canc_disc.list.rds")
+
+```
+
+
+
+
+
+
+
+

@@ -1,0 +1,312 @@
+---
+title: "final.merge.all"
+output: html_document
+date: "2025-09-09"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+
+```{r}
+merge.all.disk.counts <- open_matrix_dir(dir = "~/hpchome/ctcl4.4/merge.all.disk")
+meta <- readRDS("~/hpchome/meta.final.rds")
+colnames(meta)[5] <- "barcode.simple"
+
+metadata <- read_xlsx("CTCL_Metadata_Final_New.xlsx")
+metadata$sample.merge <- ifelse(metadata$Sample %in% c(paste0("S",1:152)), metadata$Sample, metadata$Study.ID)
+cell_meta <- meta %>%
+  left_join(
+    metadata %>% select(1:6, 9,11),
+    by = c("orig.ident" = "sample.merge")
+  )
+
+cell_meta$orig.ident2 <- cell_meta$orig.ident
+cell_meta$orig.ident <- cell_meta$Sample
+
+table(cell_meta$Sample)
+
+table(cell_meta$Patient.ID[cell_meta$orig.ident == "S240"])
+
+
+rownames(cell_meta) <- make.unique(cell_meta$barcode)
+cell_meta$barcode.sample <- paste0(cell_meta$barcode.simple.x, "_", cell_meta$Sample)
+merge.all.disk@meta.data <- cell_meta
+
+cell_meta$barcode <- paste0(cell_meta$barcode.simple, "_", cell_meta$orig.ident)
+cell_meta$barcode.unique <- make.unique(cell_meta$barcode)
+rownames(cell_meta) <- cell_meta$barcode.unique
+
+saveRDS(cell_meta, "~/hpchome/cell_meta.rds")
+
+colnames(merge.all.disk.counts) <- rownames(cell_meta)
+
+merge.all.disk.counts@dimnames[[2]]
+```
+
+
+```{r}
+merge.all.disk <- CreateSeuratObject(counts = merge.all.disk.counts, meta.data = cell_meta)
+
+`%!in%` <- Negate(`%in%`)
+tcr_genes <- grep("^TR[ABGD][VDJ]", rownames(merge.all.disk), value = TRUE)
+ig_genes  <- grep("^IG[HKL][VDJCMAG]", rownames(merge.all.disk), value = TRUE)
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+hemoglobin <- grep("^HB[AB]", rownames(merge.all.disk), value = TRUE)
+
+merge.all.disk <- NormalizeData(merge.all.disk)
+merge.all.disk <- CellCycleScoring(merge.all.disk, s.features = s.genes, g2m.features = g2m.genes)
+merge.all.disk$cc.total <- merge.all.disk$S.Score + merge.all.disk$G2M.Score
+
+merge.all.disk$percent.mt <- PercentageFeatureSet(object = merge.all.disk, pattern = "^MT-")
+merge.all.disk$percent.rb <- PercentageFeatureSet(object = merge.all.disk, pattern = "^RP[SL]")
+merge.all.disk$percent.hb <- PercentageFeatureSet(object = merge.all.disk, pattern = "^HB[AB]")
+
+merge.all.disk <- subset(merge.all.disk, percent.mt < 20 & percent.rb < 60 & percent.hb <5)
+
+merge.all.disk <- FindVariableFeatures(merge.all.disk)
+vf <- VariableFeatures(merge.all.disk, nfeatures = 3000)
+vf.ss <- setdiff(vf, c(tcr_genes, ig_genes, hemoglobin))
+VariableFeatures(merge.all.disk) <- vf.ss
+
+merge.all.disk <- SketchData(object = merge.all.disk, ncells = 100000, method = "LeverageScore", sketched.assay = "sketch")
+
+DefaultAssay(merge.all.disk) <- "sketch"
+
+merge.all.disk <- FindVariableFeatures(merge.all.disk, nfeatures = 3000)
+vf <- VariableFeatures(merge.all.disk)
+vf.ss <- setdiff(vf, c(tcr_genes, ig_genes, hemoglobin, s.genes, g2m.genes))
+VariableFeatures(merge.all.disk) <- vf.ss
+
+merge.all.disk <- ScaleData(merge.all.disk, vars.to.regress = c("cc.total", "percent.mt", "percent.rb"))
+merge.all.disk <- RunPCA(merge.all.disk)
+merge.all.disk <- RunHarmony(merge.all.disk, group.by.vars = "orig.ident", 
+				reduction = "pca", assay.use = "sketch", reduction.save = "harmony", ncores = 30)
+merge.all.disk <- RunUMAP(merge.all.disk, dims = 1:30, return.model = T, reduction = "harmony", umap.method = "umap-learn")
+
+merge.all.disk <- FindNeighbors(merge.all.disk, reduction = "harmony", dims = 1:30)
+merge.all.disk <- FindClusters(merge.all.disk, resolution = c(0.1,0.3,0.5))
+
+merge.all.disk <- FindNeighbors(merge.all.disk, reduction = "umap", dims = 1:2)
+merge.all.disk <- FindClusters(merge.all.disk, resolution = c(0.01,0.03,0.05))
+
+DimPlot(merge.all.disk, group.by = "orig.ident")+NoLegend()
+DimPlot(merge.all.disk, group.by = "sketch_snn_res.0.1", label = T)+NoLegend()
+DimPlot(merge.all.disk, group.by = "sketch_snn_res.0.3", label = T)+NoLegend()
+DimPlot(merge.all.disk, group.by = "sketch_snn_res.0.5", label = T)+NoLegend()
+DimPlot(merge.all.disk, group.by = "sketch_snn_res.0.01", label = T)+NoLegend()
+DimPlot(merge.all.disk, group.by = "sketch_snn_res.0.03", label = T)+NoLegend()
+DimPlot(merge.all.disk, group.by = "sketch_snn_res.0.05", label = T)+NoLegend()
+```
+
+```{r}
+Idents(merge.all.disk) <- merge.all.disk$sketch_snn_res.0.1
+markers <- FindAllMarkers(merge.all.disk, only.pos = T, min.pct = .1, max.cells.per.ident = 5000)
+markers$dif <- markers$pct.1 - markers$pct.2
+
+markers.ss <- markers %>% group_by(cluster) %>% arrange(desc(dif)) %>% slice_head(n = 10)
+
+merge.all.disk <- RenameIdents(merge.all.disk, "0" = "T_Cells",
+                               "1" = "Fibroblasts",
+                               "2" = "Keratinocytes",
+                               "3" = "Myeloid",
+                               "4" = "Vasc_Endo",
+                               "5" = "T_Cells",
+                               "6" = "Pericytes",
+                               "7" = "B_Cells",
+                               "8" = "Melanocytes",
+                               "9" = "Lymph_Endo",
+                               "10" = "Glandular_Epi",
+                               "11" = "Mast_Cells",
+                               "12" = "Keratinocytes",
+                               "13" = "Neurons")
+
+merge.all.disk$celltype <- Idents(merge.all.disk)
+
+platelets <- CellSelector(DimPlot(merge.all.disk, group.by = "celltype", label = T)+NoLegend())
+
+meta <- merge.all.disk@meta.data
+meta$celltype <- as.character(meta$celltype)
+meta$celltype[meta$barcode.unique %in% platelets] <- "Platelets"
+merge.all.disk@meta.data <- meta
+Idents(merge.all.disk) <- merge.all.disk$celltype
+merge.all.disk$celltype <- Idents(merge.all.disk)
+
+DimPlot(merge.all.disk, group.by = "orig.ident")+NoLegend()
+DimPlot(merge.all.disk, group.by = "celltype", label = T)+NoLegend()
+```
+
+
+
+```{r}
+merge.all.disk <- ProjectIntegration(object = merge.all.disk, sketched.assay = "sketch", assay = "RNA", reduction = "harmony")
+
+merge.all.disk <- ProjectData(object = merge.all.disk, 
+                    sketched.assay = "sketch", 
+                    assay = "RNA", 
+                    sketched.reduction = "harmony", 
+                    full.reduction = "harmony.full",
+                    dims = 1:30, 
+                    refdata = list(celltype = "celltype"), 
+                    k.weight = 300, 
+                    umap.model = "umap")
+
+DimPlot(merge.all.disk, reduction = "umap", group.by = "orig.ident", alpha = .1, pt.size = .1, raster = F)+NoLegend()
+DimPlot(merge.all.disk, reduction = "full.umap", group.by = "orig.ident", alpha = .1, pt.size = .1, raster = F)+NoLegend()
+```
+
+
+```{r}
+meta <- merge.all.disk@meta.data
+meta <- meta[,-c(29:35)]
+meta$celltype <- gsub("-", "_", meta$celltype)
+
+meta$cloneSize <- droplevels(x = meta$cloneSize)
+meta$cloneSize <- factor(
+  meta$cloneSize,
+  levels = c("Hyperexpanded (0.1 < X <= 1)", "Large (0.01 < X <= 0.1)", "Medium (0.001 < X <= 0.01)",
+             "Small (1e-04 < X <= 0.001)", "Rare (0 < X <= 1e-04)"))
+table(meta$cloneSize)
+
+meta$hyper <- ifelse(meta$cloneSize == "Hyperexpanded (0.1 < X <= 1)", "hyper", "non_hyper")
+table(meta$hyper)
+meta$hyper <- ifelse(is.na(meta$hyper), "missing", no = meta$hyper)
+table(meta$hyper)
+
+meta$has.tcr <- ifelse(is.na(meta$cloneSize), "No_TCR", "TCR")
+meta$has.tcr.hyper <- ifelse(meta$has.tcr == "No_TCR", "No_TCR", meta$hyper)
+table(meta$has.tcr.hyper, meta$has.tcr)
+
+table(meta$Dx)
+meta$Dx.simple <- ifelse(meta$Dx %in% c("SS", "MF", "FMF", "PCALCL"), "CTCL",
+                         ifelse(meta$Dx == "HC", "HC", "BID"))
+table(meta$Dx, meta$Dx.simple)
+
+merge.all.disk@meta.data <- meta
+
+```
+
+
+
+
+```{r}
+hist(merge.all.disk$celltype.score, breaks = 500)
+merge.all.disk.ss <- subset(merge.all.disk, celltype.score > 0.8)
+
+DimPlot(merge.all.disk, reduction = "full.umap", group.by = "orig.ident", alpha = .1, pt.size = .1, raster = F)+NoLegend()
+DimPlot(merge.all.disk.ss, reduction = "full.umap", group.by = "orig.ident", alpha = .1, pt.size = .1, raster = F)+NoLegend()
+```
+
+
+```{r}
+merge.all.disk.ss
+
+meta <- merge.all.disk.ss@meta.data
+saveRDS(meta, "~/hpchome/meta.rds")
+
+saveRDS(merge.all.disk.ss@reductions$harmony.full, "~/hpchome/harmony.full.rds")
+saveRDS(merge.all.disk.ss@reductions$full.umap, "~/hpchome/full.umap.rds")
+saveRDS(merge.all.disk.ss@assays$sketch, "~/hpchome/sketch.assay.rds")
+
+mat <- GetAssayData(merge.all.disk.ss, assay = "RNA", layer = "counts")
+mat <- merge.all.disk.ss@assays$RNA@layers$counts
+rownames(mat) <- rownames(merge.all.disk.ss@assays$RNA)
+colnames(mat) <- colnames(merge.all.disk.ss@assays$RNA)
+write_matrix_dir(mat = mat, dir = "~/hpchome/ctcl4.4/merge.all.ss.disk")
+
+
+```
+
+
+```{r}
+test <- open_matrix_dir(dir = "~/hpchome/ctcl4.4/merge.all.ss.disk")
+meta.test <- readRDS("~/hpchome/meta.rds")
+
+test.so <- CreateSeuratObject(counts = test, meta = meta.test)
+
+test.so@reductions$harmony.full <- readRDS("~/hpchome/harmony.full.rds")
+test.so@reductions$full.umap <- readRDS("~/hpchome/full.umap.rds")
+test.so@assays$sketch <- readRDS("~/hpchome/sketch.assay.rds")
+
+DimPlot(test.so, group.by = "orig.ident")+NoLegend()
+DimPlot(test.so, group.by = "celltype", label = T)+NoLegend()
+
+ss <- subset(test.so, celltype == "T_Cells")
+```
+
+```{r}
+meta.test <- readRDS("~/hpchome/meta.rds")
+
+meta.test.ss <- meta.test[, -c(12:35)]
+
+metadata <- read_xlsx("CTCL_Metadata_Final_New.xlsx")
+
+table(meta.test.ss$orig.ident)
+table(metadata$Sample)
+
+table(metadata$GEO.Cohort)
+table(metadata$PMID)
+
+cell_meta <- meta.test.ss %>%
+  left_join(
+    metadata %>% select(1:7, 9),
+    by = c("orig.ident" = "Sample")
+  )
+
+cell_meta$barcode.unique <- make.unique(cell_meta$barcode)
+rownames(cell_meta) <- cell_meta$barcode.unique
+
+cell_meta <- cbind(cell_meta, meta.test[,21:35])
+
+###################
+
+meta <- test.so@meta.data
+table(meta$cloneSize)
+table(meta$hyper)
+meta$hyper <- ifelse(test.so$cloneSize == "Hyperexpanded (0.1 < X <= 1)", "hyper", "non_hyper")
+
+test.so@meta.data <- meta
+
+ncol(test.so)
+meta <- test.so@meta.data
+meta$celltype[is.na(meta$celltype)] <- "NA"
+test.so@meta.data <- meta
+table(test.so$celltype)
+test.so <- subset(test.so, celltype != "NA")
+ncol(test.so)
+```
+
+
+
+```{r}
+meta <- test.so@meta.data
+saveRDS(meta, "~/hpchome/meta.rds")
+
+saveRDS(test.so@reductions$harmony.full, "~/hpchome/harmony.full.rds")
+saveRDS(test.so@reductions$full.umap, "~/hpchome/full.umap.rds")
+saveRDS(test.so@assays$sketch, "~/hpchome/sketch.assay.rds")
+
+mat <- GetAssayData(test.so, assay = "RNA", layer = "counts")
+mat <- test.so@assays$RNA@layers$counts
+rownames(mat) <- rownames(test.so@assays$RNA)
+colnames(mat) <- colnames(test.so@assays$RNA)
+write_matrix_dir(mat = mat, dir = "~/hpchome/final.counts.disk")
+
+```
+
+
+
+
+
+
+
+
+

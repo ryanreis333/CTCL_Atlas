@@ -1,0 +1,307 @@
+---
+title: "nmf.ctcl"
+output: html_document
+date: "2025-09-23"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+
+```{r}
+library(GeneNMF)
+```
+
+
+```{r}
+malig.labels <- readRDS("~/hpchome/malig.all.final.rds")
+
+malig <- subset(asdf, barcode.unique %in% malig.labels)
+
+table(malig$orig.ident)
+
+df.malig <- as.data.frame(table(malig$orig.ident))
+
+meta.malig <- malig@meta.data
+meta.malig$orig.merge <- ifelse(meta.malig$orig.ident %in% c("S72", "S73"), "S72",
+                      ifelse(meta.malig$orig.ident %in% c("S74", "S75"), "S74",
+                      ifelse(meta.malig$orig.ident %in% paste0("S", 153:156), "S153",
+                      ifelse(meta.malig$orig.ident %in% paste0("S", 157:161), "S157",
+                      ifelse(meta.malig$orig.ident %in% paste0("S", 162:165), "S162",
+                      ifelse(meta.malig$orig.ident %in% paste0("S", 166:169), "S166",
+                      ifelse(meta.malig$orig.ident %in% paste0("S", 170:175), "S170",
+                      ifelse(meta.malig$orig.ident %in% paste0("S", 176:181), "S176",
+                      ifelse(meta.malig$orig.ident %in% paste0("S", 182:187), "S182",
+                      ifelse(meta.malig$orig.ident %in% paste0("S", 188:192), "S188",
+                      ifelse(meta.malig$orig.ident %in% paste0("S", 216:223), "S216",
+                      ifelse(meta.malig$orig.ident %in% paste0("S", 225:232), "S225",
+                      meta.malig$orig.ident))))))))))))
+
+malig@meta.data <- meta.malig
+
+df.malig <- as.data.frame(table(malig$orig.merge))
+
+setdiff(ctcl.pts, df.malig$Var1)
+
+df.malig.ss <- subset(df.malig, Freq > 99)
+
+malig.ss <- subset(malig, orig.merge %in% df.malig.ss$Var1)
+
+malig.ss <- r2sample_seurat(malig.ss, group_var = "orig.merge", n = 1000, barcode_column = "barcode.unique")
+```
+
+```{r}
+DefaultAssay(malig.ss) <- "RNA"
+malig.ss@assays$sketch <- NULL
+
+malig.ss <- FindVariableFeatures(malig.ss)
+vf <- VariableFeatures(malig.ss)
+vf.ss <- setdiff(vf, c(ig_genes, tcr_genes, ribo, hemoglobin))
+
+malig.ss <- ScaleData(malig.ss)
+malig.ss <- RunPCA(malig.ss, npcs = 30)
+malig.ss <- RunUMAP(malig.ss, dims = 1:30)
+
+DimPlot(malig.ss, group.by = "orig.ident", reduction = "umap")+NoLegend()
+DimPlot(malig.ss, group.by = "GEO.Cohort", reduction = "umap")
+```
+
+
+
+```{r}
+malig.ss <- RunHarmony(malig.ss, group.by.vars = "orig.ident", 
+				reduction = "pca", assay.use = "RNA", reduction.save = "harmony", dims = 1:30, ncores = 30)
+malig.ss <- RunUMAP(malig.ss, dims = 1:30, reduction = "harmony", reduction.name = "umap.harmony.orig.ident")
+
+malig.ss <- RunHarmony(malig.ss, group.by.vars = "GEO.Cohort", 
+				reduction = "pca", assay.use = "RNA", reduction.save = "harmony.geo", dims = 1:30, ncores = 30)
+malig.ss <- RunUMAP(malig.ss, dims = 1:30, reduction = "harmony.geo", reduction.name = "umap.harmony.geo")
+
+
+DimPlot(malig.ss, group.by = "orig.ident", reduction = "umap")+NoLegend()
+DimPlot(malig.ss, group.by = "GEO.Cohort", reduction = "umap")
+
+DimPlot(malig.ss, group.by = "orig.ident", reduction = "umap.harmony.orig.ident")+NoLegend()
+DimPlot(malig.ss, group.by = "GEO.Cohort", reduction = "umap.harmony.orig.ident")
+
+DimPlot(malig.ss, group.by = "orig.ident", reduction = "umap.harmony.geo")+NoLegend()
+DimPlot(malig.ss, group.by = "GEO.Cohort", reduction = "umap.harmony.geo")
+```
+
+
+```{r}
+FeaturePlot(malig.ss, features = "TRDC", reduction = "umap.harmony.geo")
+```
+
+
+
+```{r}
+seu <- malig.ss
+
+meta.seu <- seu@meta.data
+meta.seu <- meta.seu[, c(1:3,18:26,36)]
+
+seu@meta.data <- meta.seu
+seu.list <- SplitObject(seu, split.by = "orig.merge")
+seu.list.ss <- seu.list[1:5]
+
+geneNMF.programs <- multiNMF(seu.list, assay="RNA", k=4:6, min.exp = 0.05)
+
+geneNMF.metaprograms <- getMetaPrograms(geneNMF.programs,
+                                        metric = "cosine",
+                                        specificity.weight = 3,
+                                        weight.explained = 0.6,
+                                        nMP=10, max.genes = 100, min.confidence = 0.5, remove.empty = T)
+
+plotMetaPrograms(geneNMF.metaprograms,
+                       similarity.cutoff = c(0.1,1))
+
+mps <- geneNMF.metaprograms[["metaprograms.genes"]]
+
+lapply(geneNMF.metaprograms$metaprograms.genes, head)
+```
+
+
+```{r}
+VlnPlot(t.cells, features = "DDX55", group.by = "celltype.malig", pt.size = .01, alpha = .01)
+```
+
+
+
+```{r}
+top_p <- lapply(geneNMF.metaprograms$metaprograms.genes, function(program) {
+  runGSEA(program, universe=rownames(seu), category = "C5", subcategory = "GO:BP")
+})
+
+mp.genes <- geneNMF.metaprograms$metaprograms.genes
+seu <- AddModuleScore_UCell(seu, features = mp.genes, ncores=32, name = "")
+
+meta.malig.ss <- malig.ss@meta.data
+meta.seu <- seu@meta.data
+
+meta.cbind <- cbind(meta.seu, meta.malig.ss)
+meta.cbind$Path.Stage.bin <- ifelse(meta.cbind$Path.Stage %in% c("IA", "IB", "IIA"), "Early_Stage",
+                            ifelse(meta.cbind$Path.Stage %in% c("IIB", "IIIA", "IIIB", "IVA", "IVB", "IV"),
+                              "Late_Stage", "Control"))
+
+seu@meta.data <- meta.cbind
+
+VlnPlot(seu, features=names(mp.genes), group.by = "Dx", pt.size = .01, alpha = .01, raster = F)
+VlnPlot(seu, features=names(mp.genes), group.by = "Tissue", pt.size = .01, alpha = .01, raster = F)
+VlnPlot(seu, features=names(mp.genes), group.by = "Path.Stage.bin", pt.size = .01, alpha = .01, raster = F)
+
+matrix <- seu@meta.data[,names(mp.genes)]
+
+dimred <- as.matrix(matrix)
+
+colnames(dimred) <- paste0("MP_",seq(1, ncol(dimred)))
+seu@reductions[["MPsignatures"]] <- new("DimReduc",
+                                         cell.embeddings = dimred,
+                                         assay.used = "RNA",
+                                         key = "MP_",
+                                         global = FALSE)
+
+seu <- RunUMAP(seu, reduction="MPsignatures", dims=1:length(seu@reductions[["MPsignatures"]]),
+               metric = "euclidean", reduction.name = "umap_MP")
+
+DimPlot(seu, reduction = "umap_MP", group.by = "orig.ident")+NoLegend()
+DimPlot(seu, reduction = "umap_MP", group.by = "GEO.Cohort")
+
+FeaturePlot(seu, features = names(mp.genes), reduction = "umap_MP", ncol=4) &
+  scale_color_viridis(option="B") &
+   theme(aspect.ratio = 1, axis.text=element_blank(), axis.ticks=element_blank())
+```
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+seu.list.ss <- seu.list[1:10]
+
+seu.list.ss <- lapply(seu.list.ss, function(x){
+  x <- FindVariableFeatures(x)
+  return(x)
+})
+
+hvg_freq <- table(unlist(lapply(seu.list.ss, VariableFeatures)))
+hvg_combined <- names(sort(hvg_freq, decreasing = TRUE))[1:min(2000, length(hvg_freq))]
+
+
+geneNMF.programs.ss <- multiNMF(seu.list.ss, assay="RNA", k=4:6, min.exp = 0.05, center = F, scale = T, hvg = hvg_combined)
+
+
+geneNMF.metaprograms.ss <- getMetaPrograms(geneNMF.programs.ss,
+                                        metric = "cosine",
+                                        specificity.weight = 3,
+                                        weight.explained = 0.6,
+                                        nMP=10, 
+                                        max.genes = 100, 
+                                        min.confidence = 0.5, 
+                                        remove.empty = T)
+
+plotMetaPrograms(geneNMF.metaprograms.ss,
+                       similarity.cutoff = c(0.1,1))
+
+lapply(geneNMF.metaprograms.ss$metaprograms.genes, head)
+
+
+mps.ss<- geneNMF.metaprograms.ss[["metaprograms.genes"]]
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

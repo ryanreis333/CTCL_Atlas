@@ -1,0 +1,138 @@
+---
+title: "pseudobulk"
+output: html_document
+date: "2025-09-24"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+
+
+#pseudobulk
+```{r}
+library(DESeq2)
+
+table(t.query.ss$celltype.specific.simple)
+
+t.bulk <- AggregateExpression(object = t.query.ss, assays = "RNA", return.seurat = F, group.by = c("orig.merge", "celltype.specific.simple"))
+
+t.bulk <- t.bulk$RNA
+
+norm <- grep("Benign", colnames(t.bulk))
+mal <- setdiff(grep("CTCL", colnames(t.bulk)), norm)
+# 2. Extract counts for "malig" and "other" clones
+malig_counts <- t.bulk[, mal]
+other_counts <- t.bulk[, norm]
+
+countdata <- as.matrix(cbind(malig_counts, other_counts))
+which(is.infinite(countdata))
+
+col_data <- data.frame(
+  condition = factor(rep(c("CTCL", "Benign"), each = ncol(malig_counts))),
+  sample = rep(colnames(malig_counts), 2)
+)
+
+inventory <- readxl::read_xlsx("~/ctcl.meta.4.4/CTCL_Metadata_Final.xlsx")
+
+batch <- data.frame(sample = colnames(t.bulk))
+batch$orig.ident <- word(batch$sample, 1, sep = "_")
+inventory$orig.ident <- inventory$Sample
+batch <- batch %>%
+  left_join(inventory, by = "orig.ident")
+
+saveRDS(countdata, file = "~/hpchome/ctcl4.4/int_results/pseudobulk.countdata.rds")
+
+countdata <- readRDS("~/hpchome/ctcl4.4/int_results/pseudobulk.countdata.rds")
+countdata.no.tcr <- countdata[setdiff(rownames(countdata), c(tcr_genes,ig_genes)), ]
+# 3. Create a DESeq2 object
+dds <- DESeqDataSetFromMatrix(
+  countData = countdata.no.tcr,
+  colData = data.frame(
+    condition = factor(rep(c("malig", "nonmalig"), each = ncol(countdata.no.tcr)/2))
+  ),
+  design = ~ condition
+)
+
+###########################################################################
+# 4. Run DESeq2
+dds <- DESeq(dds)
+res <- results(dds)
+
+res.df <- as.data.frame(res@listData)
+rownames(res.df) <- res@rownames
+
+# Orig
+res <- results(object = dds, contrast = c("condition", "malig", "nonmalig"))
+res.table <- as.data.frame(res@listData)
+rownames(res.table) <- res@rownames
+res.table$gene <- rownames(res.table)
+
+res.table <- res.table[order(-res.table$stat),]
+res.table.ss <- subset(res.table, !is.na(stat))
+res.table.ss <- res.table.ss[order(-res.table.ss$stat),]
+vsdata <- vst(dds, blind = F)
+res.vst.table <- vsdata@assays@data@listData[[1]]
+
+pca.out <- plotPCA(object = vsdata, ntop = 1000, returnData = T)
+DESeq2::plotPCA(object = vsdata, ntop = 500, pcsToUse = c(1,2))
+
+res.table.ss <- res.table.ss[order(-res.table.ss$stat),]
+top_genes <- c(head(res.table.ss$gene, 25), tail(res.table.ss$gene, 25))
+mat <- res.vst.table[top_genes,]
+pheatmap(mat, cluster_cols = F, show_colnames = F, scale = "none", cluster_rows = F)
+pheatmap(mat, cluster_cols = F, show_colnames = F, scale = "row", cluster_rows = F)
+
+```
+
+
+
+
+```{r}
+VlnPlot(asdf, group.by = "final.clones", features = "PCSK5")
+```
+
+
+```{r}
+ctcl.up <- head(res.table.ss$gene, 100)
+ctcl.down <- tail(res.table.ss$gene, 100)
+
+table(cd4.t.cells.small$celltype.specific.malig)
+
+ctcl.up   <- intersect(ctcl.up, rownames(cd4.t.cells.small))
+ctcl.down <- intersect(ctcl.down, rownames(cd4.t.cells.small))
+
+DefaultAssay(cd4.t.cells.small) <- "RNA"
+cd4.t.cells.small <- AddModuleScore(
+  object = cd4.t.cells.small,
+  features = list(ctcl.up, ctcl.down),
+  name = c("CTCL_UP", "CTCL_DOWN")
+)
+
+VlnPlot(cd4.t.cells.small, features = c("CTCL_UP1", "CTCL_DOWN2"), group.by = "celltype.specific.malig", pt.size = .01, alpha = .01)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
