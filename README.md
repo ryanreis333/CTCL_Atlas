@@ -31,7 +31,7 @@ CTCL_Atlas/
 │       ├── figN.Rmd        #   analysis notebook
 │       ├── results/        #   intermediate results (.rds / .csv) used by the figures
 │       └── figs/           #   rendered figure panels (.pdf / .png)
-├── int/                    # small shared inputs (processed GSE168508 matrix + metadata, subtype lists)
+├── int/                    # small shared inputs (GSE168508 matrix + metadata, subtype lists)
 ├── docs/
 │   └── software_refs.bib   # citations for the software used
 ├── renv/ , renv.lock       # pinned R environment (R 4.5.3)
@@ -114,7 +114,7 @@ The atlas includes 18 cohorts:
 
 Libraries from the same specimen (e.g., sorted fractions) were merged into one biological sample (`orig.merge`). A few patients appear in more than one cohort.
 
-Independent validation cohort: bulk RNA-seq of advanced-stage MF skin biopsies, [GSE168508](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE168508). The processed matrix and metadata used for scoring (`int/surv.mat.rds`, `int/surv.meta*.rds`) are included. To rebuild them with `final/fig4/surv.Rmd`, download `GSE168508_gene_expression-MF_skin-biopsy_sample_.txt` from the GEO supplementary files and place it in `int/`.
+Independent validation cohort: bulk RNA-seq of advanced-stage MF skin biopsies, [GSE168508](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE168508). The expression file and processed metadata are in `int/`.
 
 MF, mycosis fungoides; FMF, folliculotropic MF; SS, Sézary syndrome; PCALCL, primary cutaneous anaplastic large cell lymphoma; BID, benign inflammatory dermatoses; HC, healthy control.
 
