@@ -1,0 +1,1791 @@
+---
+title: "fig6 - within-CTCL TME: lesion stage & molecular subtype"
+output: html_document
+date: "2026-06-17"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = TRUE)
+library(Seurat)
+library(BPCells)
+library(Matrix)
+library(GSVA)
+library(SummarizedExperiment)
+library(edgeR)
+library(variancePartition)
+library(BiocParallel)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(ggrepel)
+library(scales)
+library(patchwork)
+library(fgsea)
+library(msigdbr)
+library(lmerTest)
+library(conflicted)
+conflicts_prefer(
+  dplyr::filter, dplyr::select, dplyr::mutate, dplyr::arrange,
+  dplyr::count, dplyr::rename, dplyr::summarise, dplyr::summarize,
+  dplyr::group_by, dplyr::ungroup, dplyr::n, dplyr::first, dplyr::last,
+  dplyr::lag, dplyr::desc, dplyr::slice,
+  base::intersect, base::setdiff, base::union, base::unname,
+  base::as.data.frame, base::pmin, base::pmax, base::table, base::which,
+  variancePartition::eBayes, variancePartition::topTable,
+  lmerTest::lmer,
+  .quiet = TRUE
+)
+register(MulticoreParam(16))
+
+"%!in%" <- Negate("%in%")
+tcr_bcr_re <- "^TR[ABDG][VDJC]|^IG[HKL][VDJ]|^IGH[ADEGM]|^IGKC|^IGLC"
+
+# 16-core parallel backend (Mac M5 Max)
+bp <- MulticoreParam(workers = 16, progressbar = FALSE)
+
+# Shared visual order + palettes (match fig5: lesion progression early -> advanced)
+lesion_order   <- c("Patch_Plaque", "Tumor", "Erythroderma")
+lesion_colors  <- c(Patch_Plaque  = "#E69F00",
+                    Tumor         = "#9F86C0",
+                    Erythroderma  = "#E07A5F")
+subtype_colors <- c(Subtype_1 = "#B2182B", Subtype_2 = "#2166AC", ND = "#AAAAAA")
+
+theme_set(theme_classic(base_size = 11))
+```
+
+```{r load_data}
+unified <- readRDS("../fig5/unified.rds")
+
+# CTCL subtype labels from fig4 (sample id formatted "S157__CTCL")
+subtype_df      <- readRDS("../fig4/results/subtype_df.rds")
+orig_to_subtype <- setNames(subtype_df$subtype, sub("__CTCL$", "", subtype_df$sample))
+st <- base::unname(orig_to_subtype[as.character(unified$orig.merge)])
+st[is.na(st) | st %!in% c("Subtype_1", "Subtype_2")] <- "ND"   # not determined
+unified$subtype <- st
+
+# subset to CTCL samples of the 3 lesion types of interest
+ctcl <- subset(unified, Dx.simple == "CTCL" & Sample.Type.simple %in% lesion_order)
+ctcl$lesion_type <- factor(as.character(ctcl$Sample.Type.simple), levels = lesion_order)
+ctcl$subtype     <- factor(as.character(ctcl$subtype),
+                           levels = c("Subtype_1", "Subtype_2", "ND"))
+
+cat("cells:", ncol(ctcl), " samples:", length(unique(ctcl$orig.merge)), "\n")
+cat("\ncells by lesion_type:\n");      print(table(ctcl$lesion_type, useNA = "ifany"))
+cat("\ncells by subtype:\n");          print(table(ctcl$subtype,     useNA = "ifany"))
+cat("\ncells by celltype.unified:\n"); print(table(ctcl$celltype.unified, useNA = "ifany"))
+
+n_na <- ctcl@meta.data %>% distinct(orig.merge, subtype) %>%
+  summarise(n = sum(is.na(subtype))) %>% pull(n)
+cat("\nsamples with no fig4 subtype (NA):", n_na, "\n\n")
+
+ctcl@meta.data %>%
+  distinct(orig.merge, lesion_type, subtype) %>%
+  count(lesion_type, subtype) %>%
+  tidyr::pivot_wider(names_from = subtype, values_from = n, values_fill = 0) %>%
+  as_tibble() %>% print()
+```
+
+```{r umap_celltype}
+DimPlot(ctcl, group.by = "celltype.unified", label = TRUE, repel = TRUE,
+        label.size = 4) + NoLegend()
+ggsave("figs/umap.ctcl.celltype.pdf", height = 5, width = 5, dpi = 600)
+
+DimPlot(ctcl, group.by = "celltype.unified", label = F, pt.size = 1.8, alpha = .8, raster = T, raster.dpi = c(2048, 2048)) +
+  theme_void() +
+  theme(plot.title = element_blank(), plot.margin = margin(0, 0, 0, 0),
+        legend.position = "none", aspect.ratio = 1)
+ggsave("figs/umap_ctcl_celltypes.png", height = 5, width = 5, dpi = 600, bg = "transparent")
+```
+
+```{r umap_lesion_split}
+DimPlot(ctcl, group.by = "lesion_type", split.by = "lesion_type", label = FALSE,
+        shuffle = TRUE, raster = TRUE, raster.dpi = c(1024, 1024)) +
+  scale_color_manual(values = lesion_colors) + NoLegend() + ggtitle(NULL)
+ggsave("figs/umap.ctcl.lesion.split.pdf", height = 5, width = 15, dpi = 600)
+
+DimPlot(ctcl, group.by = "lesion_type", split.by = "lesion_type", pt.size = 2, alpha = .8, label = F, raster = T, raster.dpi = c(2048,2048)) + ggtitle(NULL) +
+  scale_color_manual(values = lesion_colors) +
+  theme_void() +
+  theme(plot.title = element_blank(), plot.margin = margin(0, 0, 0, 0),
+        legend.position = "none", aspect.ratio = 1)
+ggsave("figs/tme_ctcl_umap_by_lesion.pdf", height = 3, width = 9, dpi = 600)
+```
+
+```{r lesion_prop_by_celltype}
+md <- ctcl@meta.data %>% select(celltype.unified, lesion_type)
+
+# downsample each lesion type to equal cells so proportions aren't driven by
+# overall lesion-type abundance
+set.seed(42)
+n_min <- min(table(md$lesion_type))
+md_ds <- md %>% group_by(lesion_type) %>% slice_sample(n = n_min) %>% ungroup()
+
+prop_df <- md_ds %>% count(celltype.unified, lesion_type, name = "n")
+
+ggplot(prop_df, aes(x = celltype.unified, y = n, fill = lesion_type)) +
+  geom_col(position = "fill", width = 0.8) +
+  scale_fill_manual(values = lesion_colors, breaks = lesion_order) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(x = NULL, y = "proportion of cells", fill = NULL) +
+  theme_classic(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + NoLegend()
+ggsave("figs/ctcl.lesion.prop.by_celltype.pdf", height = 3, width = 7, dpi = 600)
+```
+
+```{r lesion_cohort_power}
+samp <- ctcl@meta.data %>% distinct(orig.merge, lesion_type, GEO.Cohort)
+
+cat("samples per lesion_type x cohort:\n")
+print(addmargins(table(samp$lesion_type, samp$GEO.Cohort, useNA = "ifany")))
+
+cat("\ntotal samples per lesion_type:\n")
+print(table(samp$lesion_type, useNA = "ifany"))
+
+cat("\ntotal samples per cohort:\n")
+print(table(samp$GEO.Cohort, useNA = "ifany"))
+```
+
+```{r lesion_da}
+MIN_SAMPLES <- 2
+
+# propeller: logit-transformed celltype proportions + limma, with GEO.Cohort as a
+# random effect via duplicateCorrelation. Patch_Plaque = reference -> coefficients
+# are Tumor_vs_PP and Erythroderma_vs_PP (matches fig5 unified_da_dx_propeller).
+samp_les <- ctcl@meta.data %>%
+  distinct(orig.merge, lesion_type, GEO.Cohort) %>%
+  mutate(lesion_type = factor(as.character(lesion_type), levels = lesion_order))
+
+props_les <- speckle::getTransformedProps(
+  clusters  = as.character(ctcl$celltype.unified),
+  sample    = as.character(ctcl$orig.merge),
+  transform = "logit")
+
+tp_les   <- props_les$TransformedProps                    # celltype x sample
+samp_les <- samp_les[match(colnames(tp_les), samp_les$orig.merge), ]
+stopifnot(identical(colnames(tp_les), samp_les$orig.merge))
+
+design_les <- model.matrix(~ lesion_type, data = samp_les)  # PP = reference
+dc_les  <- limma::duplicateCorrelation(tp_les, design_les, block = samp_les$GEO.Cohort)
+fit_les <- limma::eBayes(limma::lmFit(tp_les, design_les, block = samp_les$GEO.Cohort,
+                                      correlation = dc_les$consensus.correlation))
+
+da_les <- bind_rows(lapply(c("lesion_typeTumor", "lesion_typeErythroderma"), function(co)
+  limma::topTable(fit_les, coef = co, number = Inf, sort.by = "none") %>%
+    tibble::rownames_to_column("celltype") %>%
+    transmute(celltype,
+              contrast = paste0(sub("^lesion_type", "", co), "_vs_PP"),
+              estimate = logFC, t = t, p_value = P.Value, adj_p = adj.P.Val))) %>%
+  arrange(contrast, p_value)
+saveRDS(da_les, "results/da_les.rds")
+cat("consensus intra-cohort correlation:", round(dc_les$consensus.correlation, 3), "\n")
+print(as_tibble(da_les), n = Inf)
+
+da_les <- readRDS("results/da_les.rds")
+da_les %>%
+  mutate(star = ifelse(adj_p < 0.05, "*", ""),
+         hj   = ifelse(estimate > 0, -0.4, 1.4)) %>%
+  ggplot(aes(estimate, reorder(celltype, estimate), fill = estimate)) +
+  geom_col(width = 0.7) +
+  geom_vline(xintercept = 0, color = "grey70") +
+  geom_text(aes(label = star, hjust = hj), size = 5) +
+  scale_fill_gradient2(low = "#2166AC", mid = "grey90", high = "#B2182B",
+                       midpoint = 0, guide = "none") +
+  facet_wrap(~ contrast) +
+  labs(x = "logit-prop effect (vs Patch_Plaque)", y = NULL,
+       title = "Differential abundance across lesion types (propeller)") +
+  theme_classic(base_size = 11)
+```
+
+```{r lesion_da_scatter}
+da_wide <- da_les %>%
+  select(celltype, contrast, estimate) %>%
+  tidyr::pivot_wider(names_from = contrast, values_from = estimate) %>%
+  filter(!is.na(Tumor_vs_PP), !is.na(Erythroderma_vs_PP)) %>%
+  mutate(dif = Tumor_vs_PP - Erythroderma_vs_PP)   # + = larger in Tumor, - = larger in Ery
+
+# tight limits (data range + 8% pad) so the points fill the panel
+pad  <- 0.08
+xr   <- range(da_wide$Tumor_vs_PP);        xr <- xr + c(-1, 1) * diff(xr) * pad
+yr   <- range(da_wide$Erythroderma_vs_PP); yr <- yr + c(-1, 1) * diff(yr) * pad
+dlim <- max(abs(da_wide$dif), na.rm = TRUE)
+
+ggplot(da_wide, aes(Tumor_vs_PP, Erythroderma_vs_PP)) +
+  geom_hline(yintercept = 0, color = "grey85", linewidth = 0.3) +
+  geom_vline(xintercept = 0, color = "grey85", linewidth = 0.3) +
+  geom_abline(slope = 1, linetype = "dashed", color = "grey80", linewidth = 0.3) +
+  geom_point(aes(color = dif), size = 3.5) +
+  ggrepel::geom_text_repel(aes(label = celltype), color = "grey15", size = 3.5,
+    max.overlaps = Inf, min.segment.length = 0, segment.color = "grey80",
+    box.padding = 0.5) +
+  scale_color_gradient2(low = base::unname(lesion_colors["Erythroderma"]),
+                        mid = "grey85", high = base::unname(lesion_colors["Tumor"]),
+                        midpoint = 0, limits = c(-dlim, dlim),
+                        name = "Tumor − Ery\nlogit") +
+  coord_cartesian(xlim = xr, ylim = yr) +
+  labs(x = "Tumor vs PP", y = "Erythroderma vs PP",
+       title = "") +
+  theme_classic(base_size = 11)
+ggsave("figs/ctcl.lesion.da.propeller.scatter.pdf", height = 4, width = 4.75, dpi = 600)
+```
+
+```{r lesion_bulk_deg}
+# Whole-sample bulk of the CTCL-lesional TME (malignant already removed in `ctcl`).
+# One dream fit with lesion_type (PP reference) -> Tumor_vs_PP and Ery_vs_PP.
+f   <- factor(ctcl$orig.merge)
+ind <- Matrix::sparse.model.matrix(~ 0 + f); colnames(ind) <- levels(f)
+les_bulk_pb <- as.matrix(GetAssayData(ctcl, "counts", assay = "RNA") %*% ind)
+les_bulk_pb <- les_bulk_pb[!grepl(tcr_bcr_re, rownames(les_bulk_pb)), ]
+
+les_sm <- ctcl@meta.data %>%
+  distinct(orig.merge, lesion_type, GEO.Cohort) %>% as.data.frame()
+rownames(les_sm) <- les_sm$orig.merge
+les_sm <- les_sm[colnames(les_bulk_pb), ]
+les_sm$lesion_type <- factor(as.character(les_sm$lesion_type), levels = lesion_order)
+
+les_form <- if (n_distinct(les_sm$GEO.Cohort) >= 2) ~ lesion_type + (1 | GEO.Cohort) else ~ lesion_type
+les_dge <- DGEList(les_bulk_pb, samples = les_sm)
+les_dge <- calcNormFactors(les_dge[filterByExpr(les_dge, group = les_sm$lesion_type, min.count = 5, min.prop = .1), ])
+les_vo  <- voomWithDreamWeights(les_dge, les_form, les_sm, BPPARAM = bp)
+les_fit <- eBayes(dream(les_vo, les_form, les_sm, BPPARAM = bp))
+
+les_bulk_tum <- topTable(les_fit, coef = "lesion_typeTumor", number = Inf, sort.by = "P") %>%
+  rownames_to_column("gene") %>% mutate(contrast = "Tumor_vs_PP")
+les_bulk_ery <- topTable(les_fit, coef = "lesion_typeErythroderma", number = Inf, sort.by = "P") %>%
+  rownames_to_column("gene") %>% mutate(contrast = "Ery_vs_PP")
+
+les_bulk_deg <- bind_rows(les_bulk_tum, les_bulk_ery)
+cat("TME bulk Tumor vs PP DEGs (adj.P<0.05):", sum(les_bulk_tum$adj.P.Val < 0.05), "\n")
+cat("TME bulk Ery   vs PP DEGs (adj.P<0.05):", sum(les_bulk_ery$adj.P.Val < 0.05), "\n")
+
+cat("\n=== top Tumor vs PP ===\n")
+print(as_tibble(les_bulk_tum), n = 20)
+cat("\n=== top Ery vs PP ===\n")
+print(as_tibble(les_bulk_ery), n = 20)
+
+write.csv(les_bulk_deg, "results/les_bulk_deg.csv", row.names = FALSE)
+saveRDS(les_bulk_deg, "results/les_bulk_deg.rds")
+```
+
+```{r lesion_bulk_scatter}
+les_bulk_deg <- readRDS("results/les_bulk_deg.rds")
+les_bulk_wide <- les_bulk_deg %>%
+  select(gene, contrast, logFC, adj.P.Val) %>%
+  tidyr::pivot_wider(names_from = contrast,
+                     values_from = c(logFC, adj.P.Val), names_sep = "_") %>%
+  dplyr::filter(!is.na(logFC_Tumor_vs_PP) & !is.na(logFC_Ery_vs_PP)) %>%
+  mutate(sig = case_when(
+    adj.P.Val_Tumor_vs_PP < 0.05 & adj.P.Val_Ery_vs_PP < 0.05 ~ "both",
+    adj.P.Val_Tumor_vs_PP < 0.05                              ~ "Tumor only",
+    adj.P.Val_Ery_vs_PP   < 0.05                              ~ "Ery only",
+    TRUE                                                      ~ "ns"
+  ))
+
+lim <- quantile(abs(c(les_bulk_wide$logFC_Tumor_vs_PP, les_bulk_wide$logFC_Ery_vs_PP)),
+                0.999, na.rm = TRUE)
+
+# label representative genes at every extreme: Tumor axis (+/-), Ery axis (+/-),
+# the shared diagonal (up/down), and the divergent anti-diagonal corners
+w   <- les_bulk_wide %>%
+  mutate(x = logFC_Tumor_vs_PP, y = logFC_Ery_vs_PP, s = x + y, d = x - y)
+lab <- bind_rows(
+  slice_max(w, x, n = 6), slice_min(w, x, n = 6),   # Tumor up / down
+  slice_max(w, y, n = 6), slice_min(w, y, n = 6),   # Ery up / down
+  slice_max(w, s, n = 4), slice_min(w, s, n = 4),   # shared up / down
+  slice_max(w, d, n = 4), slice_min(w, d, n = 4)    # Tumor-up/Ery-down & reverse
+) %>% distinct(gene, .keep_all = TRUE) %>%
+  mutate(x = pmax(pmin(x, lim), -lim), y = pmax(pmin(y, lim), -lim))  # clamp to panel
+
+# squish all points to the panel so off-scale extremes (and their labels) sit on
+# the border instead of being clipped to empty space
+plt <- les_bulk_wide %>%
+  mutate(logFC_Tumor_vs_PP = pmax(pmin(logFC_Tumor_vs_PP, lim), -lim),
+         logFC_Ery_vs_PP   = pmax(pmin(logFC_Ery_vs_PP,   lim), -lim))
+
+ggplot(plt, aes(x = logFC_Tumor_vs_PP, y = logFC_Ery_vs_PP)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "grey80") +
+  geom_point(aes(color = sig), size = 1, alpha = 0.4) +
+  ggrepel::geom_text_repel(data = lab, aes(x = x, y = y, label = gene),
+    inherit.aes = FALSE, color = "black", size = 2.5, max.overlaps = 10,
+    min.segment.length = 0, segment.size = 0.2, segment.color = "grey70",
+    box.padding = 0.4) +
+  scale_color_manual(values = c("Tumor only" = base::unname(lesion_colors["Tumor"]),
+                                "Ery only"   = base::unname(lesion_colors["Erythroderma"]),
+                                "both"       = "black",
+                                "ns"         = "grey80")) +
+  coord_equal(xlim = c(-lim, lim), ylim = c(-lim, lim)) +
+  labs(x = "logFC Tumor vs PP", y = "logFC Ery vs PP", color = NULL,
+       title = NULL) +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "bottom")
+ggsave("figs/ctcl.lesion.bulk.scatter.pdf", height = 4.5, width = 4, dpi = 600)
+```
+
+```{r lesion_bulk_gsea}
+# GSEA on the TME-only whole-sample lesion bulk DEGs, ranked by t (Hallmark + Reactome).
+if (!exists("pathways")) {
+  msig_tbl <- bind_rows(
+    msigdbr(species = "Homo sapiens", collection = "H"),
+    msigdbr(species = "Homo sapiens", collection = "C2", subcollection = "CP:REACTOME")
+  ) %>% select(gs_name, gene_symbol) %>% distinct()
+  pathways <- split(msig_tbl$gene_symbol, msig_tbl$gs_name)
+}
+
+run_les_gsea <- function(res) {
+  rk <- res %>% arrange(desc(t)) %>% { setNames(.$t, .$gene) }
+  set.seed(42)
+  fgsea(pathways, rk, nproc = 16) %>% as_tibble()
+}
+
+gsea_les_tum <- run_les_gsea(les_bulk_tum)
+gsea_les_ery <- run_les_gsea(les_bulk_ery)
+
+cat("Tumor vs PP GSEA hits (padj<0.05):", sum(gsea_les_tum$padj < 0.05, na.rm = TRUE), "\n")
+cat("Ery   vs PP GSEA hits (padj<0.05):", sum(gsea_les_ery$padj < 0.05, na.rm = TRUE), "\n")
+
+saveRDS(gsea_les_tum, "results/gsea_les_tum.rds")
+saveRDS(gsea_les_ery, "results/gsea_les_ery.rds")
+# collapse the leadingEdge list-column to a string so write.csv can handle it
+write.csv(gsea_les_tum %>% mutate(leadingEdge = sapply(leadingEdge, paste, collapse = ";")),
+          "results/gsea_les_tum.csv", row.names = FALSE)
+write.csv(gsea_les_ery %>% mutate(leadingEdge = sapply(leadingEdge, paste, collapse = ";")),
+          "results/gsea_les_ery.csv", row.names = FALSE)
+
+# plot top 7 up + 3 down Tumor vs PP pathways by padj (most significant in each direction)
+top <- bind_rows(
+  gsea_les_tum %>% filter(NES > 0) %>% slice_min(padj, n = 7, with_ties = FALSE),
+  gsea_les_tum %>% filter(NES < 0) %>% slice_min(padj, n = 3, with_ties = FALSE)
+) %>% arrange(NES) %>% mutate(pathway = factor(pathway, levels = pathway))
+
+ggplot(top, aes(NES, pathway, fill = NES)) +
+  geom_col() + geom_vline(xintercept = 0, color = "grey70") +
+  scale_fill_gradient2(low = "#2166AC", mid = "grey85", high = "#B2182B",
+                       midpoint = 0, guide = "none") +
+  scale_y_discrete(labels = function(x)
+    scales::label_wrap(28)(gsub("_", " ", sub("^(HALLMARK|REACTOME)_", "", x)))) +
+  labs(x = "NES", y = NULL,
+       title = "TME bulk Tumor vs PP (Hallmark + Reactome)") +
+  theme_classic(base_size = 10)
+ggsave("figs/ctcl.lesion.bulk.gsea.tum_vs_pp.pdf", height = 5, width = 6, dpi = 600)
+```
+
+## Per-celltype pseudobulk DEG across lesion types
+
+Per-`celltype.unified` pseudobulk DEG on the `ctcl` object across lesion types,
+with `Patch_Plaque` as the shared reference (`Tumor_vs_PP`, `Ery_vs_PP`); cohort
+and patient random effects where supported. Saved to `results/`.
+
+```{r celltype_lesion_pseudobulk_deg}
+# Pseudobulk: orig.merge x celltype.unified counts.
+ctcl$pb_id <- paste(ctcl$orig.merge, ctcl$celltype.unified, sep = "__")
+agg_les <- AggregateExpression(ctcl, assays = "RNA", group.by = "pb_id",
+                               return.seurat = FALSE,
+                               normalization.method = "none", verbose = FALSE)
+cnt_les <- agg_les$RNA
+colnames(cnt_les) <- gsub("-", "_", colnames(cnt_les))
+
+samp_les <- ctcl@meta.data %>%
+  distinct(orig.merge, .keep_all = TRUE) %>%
+  select(orig.merge, lesion_type, GEO.Cohort, Patient.ID)
+
+pb_les <- tibble(pb_id = colnames(cnt_les)) %>%
+  tidyr::separate(pb_id, into = c("orig.merge", "celltype"),
+                  sep = "__", remove = FALSE) %>%
+  left_join(samp_les, by = "orig.merge") %>%
+  mutate(lesion_type = factor(lesion_type, levels = lesion_order),
+         celltype    = factor(celltype),
+         GEO.Cohort  = factor(GEO.Cohort),
+         Patient.ID  = factor(Patient.ID)) %>%
+  as.data.frame()
+rownames(pb_les) <- pb_les$pb_id
+
+n_pb <- table(ctcl$pb_id); names(n_pb) <- gsub("-", "_", names(n_pb))
+pb_les$n_cells <- as.integer(n_pb[pb_les$pb_id])
+pb_les <- pb_les[!is.na(pb_les$n_cells) & pb_les$n_cells >= 10, ]
+cnt_les <- cnt_les[, pb_les$pb_id, drop = FALSE]
+
+# keep celltypes with >=3 samples in each of the 3 lesion types
+keep_ct <- pb_les %>%
+  count(celltype, lesion_type) %>%
+  group_by(celltype) %>%
+  summarise(ok = n_distinct(lesion_type) == 3 && all(n >= 3), .groups = "drop") %>%
+  filter(ok) %>% pull(celltype) %>% as.character()
+pb_les   <- pb_les[pb_les$celltype %in% keep_ct, ]
+pb_les$celltype <- droplevels(pb_les$celltype)
+cnt_les  <- cnt_les[, pb_les$pb_id, drop = FALSE]
+
+cat("celltype x lesion_type pseudobulk counts (kept):\n")
+print(table(pb_les$celltype, pb_les$lesion_type))
+
+# per-celltype dream fit, PP reference -> Tumor_vs_PP and Ery_vs_PP
+fit_one_ct <- function(ct) {
+  m <- pb_les[pb_les$celltype == ct, ]
+  m$lesion_type <- factor(m$lesion_type, levels = lesion_order)
+  dge <- DGEList(cnt_les[, rownames(m), drop = FALSE])
+  dge <- dge[!grepl(tcr_bcr_re, rownames(dge)), , keep.lib.sizes = FALSE]
+  dge <- calcNormFactors(dge[filterByExpr(dge, group = m$lesion_type), ])
+  use_cohort  <- n_distinct(m$GEO.Cohort) >= 2
+  use_patient <- any(duplicated(m$Patient.ID))
+  form <- if (use_cohort && use_patient) ~ lesion_type + (1|GEO.Cohort) + (1|Patient.ID)
+          else if (use_cohort)           ~ lesion_type + (1|GEO.Cohort)
+          else if (use_patient)          ~ lesion_type + (1|Patient.ID)
+          else                           ~ lesion_type
+  fit <- tryCatch(
+    eBayes(dream(voomWithDreamWeights(dge, form, m, BPPARAM = bp), form, m, BPPARAM = bp)),
+    error = function(e)
+      eBayes(dream(voomWithDreamWeights(dge, ~ lesion_type, m, BPPARAM = bp),
+                   ~ lesion_type, m, BPPARAM = bp)))
+  one <- function(coef, label)
+    topTable(fit, coef = coef, number = Inf) %>%
+      rownames_to_column("gene") %>%
+      mutate(celltype = ct, contrast = label, sig = adj.P.Val < 0.05)
+  bind_rows(one("lesion_typeTumor", "Tumor_vs_PP"),
+            one("lesion_typeErythroderma", "Ery_vs_PP"))
+}
+
+cts <- levels(pb_les$celltype)
+res_lesion_tbl <- bind_rows(lapply(setNames(cts, cts), fit_one_ct))
+
+cat("\nDEGs per celltype x contrast (FDR<0.05):\n")
+res_lesion_tbl %>% filter(sig) %>% count(celltype, contrast, name = "n_sig") %>%
+  arrange(desc(n_sig)) %>% as_tibble() %>% print(n = Inf)
+
+write.csv(res_lesion_tbl, "results/res_lesion_tbl.csv", row.names = FALSE)
+saveRDS(res_lesion_tbl, "results/res_lesion_tbl.rds")
+```
+
+```{r celltype_lesion_ndeg_scatter}
+# Per-celltype sig-DEG counts: Tumor_vs_PP (x) vs Ery_vs_PP (y). Same style as
+# fig5 scatter_ndeg_ctcl_vs_bid.
+
+res_lesion_tbl <- readRDS("results/res_lesion_tbl.rds")
+n_sig <- res_lesion_tbl %>% filter(sig) %>%
+  count(contrast, celltype, name = "n_deg")
+
+cts <- unique(c(res_lesion_tbl$celltype))
+
+deg_wide <- tibble(celltype = cts) %>%
+  left_join(tidyr::pivot_wider(n_sig, names_from = contrast, values_from = n_deg),
+            by = "celltype") %>%
+  mutate(across(c(Tumor_vs_PP, Ery_vs_PP), ~ tidyr::replace_na(., 0)),
+         total = Tumor_vs_PP + Ery_vs_PP)
+
+ct_levels <- sort(unique(as.character(ctcl$celltype.unified)))
+ct_cols   <- setNames(scales::hue_pal()(length(ct_levels)), ct_levels)
+
+brks <- c(0, 1, 3, 10, 30, 100, 300, 1000)
+lim  <- c(0, max(deg_wide$Tumor_vs_PP, deg_wide$Ery_vs_PP))
+pl   <- scales::pseudo_log_trans(base = 10)
+
+ggplot(deg_wide, aes(Tumor_vs_PP, Ery_vs_PP)) +
+  geom_abline(slope = 1, linetype = "dashed", color = "grey80", linewidth = 0.4) +
+  geom_point(aes(color = celltype, size = total)) +
+  ggrepel::geom_text_repel(aes(label = celltype, color = celltype), size = 4.5,
+    max.overlaps = Inf, min.segment.length = 0, segment.color = "grey80",
+    box.padding = 0.6, show.legend = FALSE) +
+  scale_color_manual(values = ct_cols, guide = "none") +
+  scale_size_continuous(range = c(2, 6), name = "total sig DEGs") +
+  scale_x_continuous(trans = pl, breaks = brks, limits = lim) +
+  scale_y_continuous(trans = pl, breaks = brks, limits = lim) +
+  coord_equal() +
+  labs(x = "Tumor vs PP  (sig DEGs)", y = "Erythroderma vs PP  (sig DEGs)") +
+  theme_classic(base_size = 12) +
+  theme(axis.text = element_text(size = 12)) +
+  NoLegend()
+ggsave("figs/ctcl.lesion.ndeg.scatter.pdf", height = 4.5, width = 4.5, dpi = 600)
+```
+
+```{r fibroblast_lesion_volcano}
+# Volcano of the per-celltype Fibroblast Tumor vs PP pseudobulk DEGs.
+res_lesion_tbl <- readRDS("results/res_lesion_tbl.rds")
+
+v  <- res_lesion_tbl %>%
+  filter(celltype == "Fibroblast", contrast == "Tumor_vs_PP") %>%
+  mutate(neglog10p = -log10(adj.P.Val))
+xl <- quantile(abs(v$logFC), 0.9999, na.rm = TRUE)
+yl <- quantile(v$neglog10p, 0.9999, na.rm = TRUE)
+v  <- mutate(v, logFC = pmax(pmin(logFC, xl), -xl), neglog10p = pmin(neglog10p, yl))
+
+sig <- v %>% filter(adj.P.Val < 0.05)
+lab <- bind_rows(
+  slice_max(sig, logFC, n = 6), slice_min(sig, logFC, n = 6),
+  slice_min(filter(sig, logFC > 0), adj.P.Val, n = 6),
+  slice_min(filter(sig, logFC < 0), adj.P.Val, n = 6)
+) %>% distinct(gene, .keep_all = TRUE)
+
+ggplot(v, aes(logFC, neglog10p, color = logFC)) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey80") +
+  geom_point(shape = 16, size = 2, alpha = 0.8) +
+  scale_color_gradient2(low = "#2166AC", mid = "grey85", high = "#B2182B",
+                        midpoint = 0, limits = c(-xl, xl),
+                        oob = scales::squish, guide = "none") +
+  ggrepel::geom_text_repel(data = lab, aes(label = gene), color = "black", size = 3,
+    max.overlaps = 10, min.segment.length = 0, segment.size = 0.2,
+    segment.color = "grey20") +
+  coord_cartesian(xlim = c(-xl, xl), ylim = c(0, yl), expand = FALSE, clip = "off") +
+  labs(x = "log2FC  (Tumor vs PP)", y = expression(-log[10]~adj.P),
+       title = "Fibroblast: Tumor vs PP") +
+  theme_classic(base_size = 12)
+ggsave("figs/ctcl.lesion.fibroblast.volcano.tum_vs_pp.pdf", height = 4, width = 4.8, dpi = 600)
+```
+
+```{r feature_program_defs}
+# NICHE programs: literature-grounded FUNCTIONAL STATES (activation/polarization/
+# differentiation/dysfunction), scored WITHIN their home lineage. Sources: pan-cancer
+# myeloid (Cheng 2021, Mulder 2021), LAM (Jaitin 2019), T-cell states (Wherry; Mackay
+# TRM; Miller/Siddiqui progenitor-Tex; Plitas/De Simone tumor-Treg), B/plasma (King 2021),
+# CAF taxonomy (Tuveson; Buechler 2021 universal fibro; skin papillary/reticular),
+# endothelial (Goveia/Kalucka), keratinocyte states, TLS organizers.
+niche_programs <- list(
+  ## --- Macrophage ---
+  Mac_M1_classical    = c("CXCL9","CXCL10","CXCL11","IL1B","TNF","IL6","IL12B","IL23A","NOS2","SOCS3","CD40","PTGS2"),
+  Mac_M2_alternative  = c("CCL13","CCL17","CCL18","CCL22","CCL24","IL10","TGFB1","ARG1","IL4I1","CHI3L1","MMP9"),
+  Mac_LAM_SPP1_TREM2  = c("SPP1","TREM2","GPNMB","APOE","APOC1","FABP5","CD9","LGALS3","LPL","CTSD","CTSB"),
+  Mac_C1Q_complement  = c("C1QA","C1QB","C1QC","TREM2","APOE","SELENOP","FOLR2","MAF","SLC40A1"),
+  Mac_tissue_resident = c("FOLR2","LYVE1","MRC1","SELENOP","STAB1","F13A1","IGF1","GAS6","CD163"),
+  Mac_IFN_ISG         = c("ISG15","IFIT1","IFIT3","MX1","RSAD2","CXCL10","IFI6","IFITM3","GBP1","STAT1"),
+  Mac_phago_efferocyt = c("MERTK","GAS6","AXL","STAB1","C1QA","MARCO","TIMD4","ANXA1","CD36"),
+  Mac_angiogenic_VEGF = c("VEGFA","SPP1","ADM","SLC2A1","FLT1","EREG","HIF1A","CCL2"),
+  ## --- Monocyte ---
+  Mono_inflammatory   = c("S100A8","S100A9","S100A12","FCN1","VCAN","EREG","IL1B","CXCL8","THBS1"),
+  Mono_IFN            = c("ISG15","IFI6","IFIT1","IFITM3","MX1","LY6E","IFI44L","OAS1"),
+  ## --- DC ---
+  DC_maturation_mreg  = c("LAMP3","CCR7","CD40","CD83","RELB","FSCN1","CCL19","CCL22","MARCKSL1","BIRC3","CD274","PDCD1LG2"),
+  cDC1_licensing      = c("CLEC9A","XCR1","BATF3","IRF8","CLNK","WDFY4","CADM1","IDO1","IL12B"),
+  cDC2_inflammatory   = c("CD1C","FCER1A","CLEC10A","IL1B","CD14","S100A8","CXCL8","AREG"),
+  pDC_IFN_production   = c("LILRA4","IRF7","TCF4","GZMB","IL3RA","CLEC4C","PLD4","SERPINF1","TLR7"),
+  LC_migratory        = c("CD207","CCR7","CD83","FSCN1","LAMP3","CD40","IL15","MARCKSL1"),
+  ## --- CD8 T ---
+  CD8_exhaustion      = c("PDCD1","HAVCR2","LAG3","TIGIT","CTLA4","TOX","ENTPD1","BATF","NR4A2","CD160"),
+  CD8_cytotoxic       = c("GZMB","GZMA","GZMK","GZMH","PRF1","IFNG","NKG7","KLRG1","FASLG"),
+  CD8_TRM             = c("ITGAE","ZNF683","CXCR6","ITGA1","RUNX3","CD69","PRDM1","RBPJ","NR4A1"),
+  CD8_progenitor_Tex  = c("TCF7","SLAMF6","XCL1","IL7R","CCR7","CD28","LEF1","GPR183"),
+  CD8_IFN_response    = c("ISG15","IFIT3","MX1","IFI6","STAT1","IRF7","OAS1","IFI44L"),
+  ## --- CD4 T ---
+  CD4_Tfh             = c("CXCL13","IL21","ICOS","BCL6","CD200","TOX2","BTLA","PDCD1"),
+  CD4_Th1             = c("TBX21","IFNG","CXCR3","STAT1","IL2","TNF","CCL5","CCR5"),
+  CD4_Th2             = c("GATA3","IL4","IL5","IL13","IL17RB","IL1RL1","PTGDR2","HPGDS","GATA3"),
+  CD4_Th17            = c("RORC","IL17A","IL17F","IL23R","CCL20","CCR6","IL22","KLRB1"),
+  CD4_cytotoxic       = c("GZMB","GZMA","GZMK","PRF1","NKG7","GNLY","KLRG1"),
+  CD4_naive_memory    = c("TCF7","SELL","CCR7","IL7R","LEF1","CD27","GPR183"),
+  ## --- Treg ---
+  Treg_suppressive    = c("FOXP3","IL2RA","CTLA4","IKZF2","IL10","LRRC32","ENTPD1","TNFRSF18","TNFRSF4"),
+  Treg_activated_tumor = c("TNFRSF9","CCR8","IL1R2","LAYN","BATF","TIGIT","ICOS","CD177","TNFRSF18"),
+  ## --- NK ---
+  NK_cytotoxic_CD16   = c("FCGR3A","GNLY","PRF1","GZMB","KLRD1","NKG7","FGFBP2","SPON2","CX3CR1"),
+  NK_CD56bright       = c("NCAM1","GZMK","XCL1","XCL2","SELL","IL7R","GPR183","KLRC1"),
+  ## --- B / Plasma ---
+  Bcell_germinal_ctr  = c("AICDA","BCL6","RGS13","LRMP","MEF2B","SUGCT","STMN1","SERPINA9","MARCKSL1","MKI67"),
+  Bcell_memory        = c("CD27","TNFRSF13B","CD80","CD86","AIM2","TXNIP","S100A10"),
+  Bcell_naive         = c("TCL1A","IGHD","FCER2","IL4R","YBX3","PLPP5"),
+  Bcell_atypical      = c("ITGAX","TBX21","FCRL5","ZEB2","FGR","FCRL3","CR2"),
+  Plasma_secretory_UPR = c("XBP1","PRDM1","MZB1","DERL3","SSR4","SEC11C","HERPUD1","FKBP11"),
+  ## --- Fibroblast ---
+  CAF_myofibroblastic = c("ACTA2","TAGLN","MYL9","TNC","INHBA","COMP","CTHRC1","LRRC15","THBS2","TPM1"),
+  CAF_inflammatory    = c("IL6","IL11","LIF","CXCL1","CXCL2","CXCL12","CCL2","HAS1","IL1R1","ICAM1"),
+  CAF_antigen_pres    = c("CD74","HLA-DRA","HLA-DQA1","SAA1","SAA2","SLPI"),
+  CAF_complement      = c("C3","C7","CFD","C1S","C1R","CFH","C2"),
+  CAF_ECM_desmoplastic = c("POSTN","COL11A1","COL10A1","COL5A2","FN1","SPARC","LOX","COL1A1","COL3A1"),
+  Fibro_universal     = c("PI16","DPT","CD34","MFAP5","SEMA3C","PCOLCE2","CLEC3B","GSN"),
+  Fibro_papillary     = c("COL6A5","APCDD1","HSPB3","NKD2","WIF1","COL23A1","COL18A1"),
+  Fibro_reticular     = c("MGP","CCN5","SFRP2","SFRP4","WISP2","TNXB","CCN3"),
+  Fibro_TLS_FRC       = c("CCL19","CCL21","CXCL13","TNFSF13B","PDPN","CR2","FDCSP","CLU","VCAM1","LTBR","TNFSF14"),
+  ## --- Vascular / Lymphatic endothelium ---
+  Endo_angiogenic     = c("ESM1","ANGPT2","APLN","DLL4","KDR","NID2","PGF","CXCR4","INSR"),
+  Endo_inflamed       = c("SELE","SELP","VCAM1","ICAM1","CX3CL1","CCL2","CXCL10"),
+  Endo_HEV            = c("GLYCAM1","MADCAM1","CHST4","FUT7","ST3GAL6","CCL21","SELP","SELE","ICAM1","VCAM1"),
+  Endo_capillary      = c("CA4","RGCC","CD36","FABP4","BTNL9","SGK1","AQP1"),
+  Endo_IFN            = c("ISG15","IFI27","IFIT1","MX1","IFITM3","HLA-A","B2M"),
+  LEC_lymphangiogenic = c("PROX1","FLT4","PDPN","LYVE1","CCL21","MMRN1","RELN","TFF3"),
+  ## --- Keratinocyte ---
+  Kerat_inflammatory  = c("S100A7","S100A8","S100A9","DEFB4A","PI3","LCN2","SERPINB3","SERPINB4","CXCL8"),
+  Kerat_differentiation = c("KRT1","KRT10","FLG","LOR","IVL","SPINK5","CALML5","CDSN","KRT2","TGM1"),
+  Kerat_basal_prolif  = c("KRT5","KRT14","KRT15","COL17A1","TP63","ITGA6","ITGB1","MKI67"),
+  Kerat_IFN_response  = c("ISG15","IFI27","MX1","IFITM1","STAT1","CXCL10","HLA-A","B2M"),
+  ## --- Mural / Melanocyte ---
+  Mural_contractile   = c("ACTA2","MYH11","TAGLN","CNN1","DES","MYL9","PLN","ACTG2"),
+  Mural_activated     = c("RGS5","PDGFRB","NOTCH3","COL4A1","COL18A1","THY1","COL6A3"),
+  Melan_pigmentation  = c("MLANA","PMEL","TYR","TYRP1","DCT","MITF","GPR143","SLC45A2")
+)
+```
+
+```{r niche_score_test, fig.width = 9, fig.height = 6}
+# Score each niche program in its HOME-LINEAGE pseudobulk (per sample), then test
+# vs lesion_type with a cohort random effect (PP reference). Self-contained.
+MIN_CELLS_N <- 10; MIN_SAMP_N <- 3; MIN_OBS_N <- 5
+
+# --- self-containment: rebuild inputs if not already in the environment ---
+if (!exists("lesion_order")) lesion_order <- c("Patch_Plaque", "Tumor", "Erythroderma")
+if (!exists("tcr_bcr_re"))
+  tcr_bcr_re <- "^TR[ABDG][VDJC]|^IG[HKL][VDJ]|^IGH[ADEGM]|^IGKC|^IGLC"
+if (!exists("ctcl")) {
+  unified <- readRDS("../fig5/unified.rds")
+  ctcl <- subset(unified, Dx.simple == "CTCL" & Sample.Type.simple %in% lesion_order)
+  ctcl$lesion_type <- factor(as.character(ctcl$Sample.Type.simple), levels = lesion_order)
+}
+if (!exists("niche_programs"))
+  stop("run the `feature_program_defs` chunk first to define `niche_programs`")
+
+cnts_n <- GetAssayData(ctcl, "counts", assay = "RNA")
+cnts_n <- cnts_n[!grepl(tcr_bcr_re, rownames(cnts_n)), ]
+md_n   <- ctcl@meta.data
+all_s  <- sort(unique(as.character(ctcl$orig.merge)))
+
+pb_lcpm_ct <- function(ct) {
+  cells <- rownames(md_n)[md_n$celltype.unified == ct]
+  s <- md_n[cells, "orig.merge"]; cells <- cells[s %in% names(which(table(s) >= MIN_CELLS_N))]
+  if (n_distinct(md_n[cells, "orig.merge"]) < MIN_SAMP_N) return(NULL)
+  fs  <- factor(md_n[cells, "orig.merge"]); ind <- Matrix::sparse.model.matrix(~ 0 + fs)
+  colnames(ind) <- levels(fs)
+  pb  <- as.matrix(cnts_n[, cells] %*% ind)
+  edgeR::cpm(calcNormFactors(DGEList(pb[rowSums(pb) > 0, ])), log = TRUE, prior.count = 1)
+}
+score_on <- function(lcpm, genes, min_genes = 3) {
+  g <- base::intersect(genes, rownames(lcpm))
+  if (length(g) < min_genes) return(setNames(rep(NA_real_, ncol(lcpm)), colnames(lcpm)))
+  colMeans(t(scale(t(lcpm[g, , drop = FALSE]))), na.rm = TRUE)
+}
+
+# map each niche program to its HOME celltype.unified lineage (named: program -> celltype)
+pn <- names(niche_programs)
+niche_celltype <- setNames(dplyr::case_when(
+  grepl("^Mac_",          pn) ~ "Macrophage",
+  grepl("^Mono_",         pn) ~ "Monocyte",
+  grepl("^DC_",           pn) ~ "mregDC",
+  grepl("^cDC1",          pn) ~ "cDC1",
+  grepl("^cDC2",          pn) ~ "cDC2",
+  grepl("^pDC",           pn) ~ "pDC",
+  grepl("^LC_",           pn) ~ "Langerhans",
+  grepl("^CD8_",          pn) ~ "CD8_T",
+  grepl("^CD4_",          pn) ~ "CD4_T",
+  grepl("^Treg",          pn) ~ "Treg",
+  grepl("^NK_",           pn) ~ "NK_Cells",
+  grepl("^Bcell",         pn) ~ "B_Cells",
+  grepl("^Plasma",        pn) ~ "Plasma_Cells",
+  grepl("^(CAF_|Fibro_)", pn) ~ "Fibroblast",
+  grepl("^Endo_",         pn) ~ "Vasc_Endo",
+  grepl("^LEC_",          pn) ~ "Lymph_Endo",
+  grepl("^Kerat_",        pn) ~ "Keratinocyte",
+  grepl("^Mural_",        pn) ~ "Mural",
+  grepl("^Melan_",        pn) ~ "Melanocyte",
+  TRUE ~ NA_character_
+), pn)
+stopifnot(!anyNA(niche_celltype))   # every program must map to a home lineage
+home_cts <- unique(base::unname(niche_celltype[names(niche_programs)]))
+pb_home  <- setNames(lapply(home_cts, pb_lcpm_ct), home_cts)
+
+niche_scores <- sapply(names(niche_programs), function(p) {
+  L <- pb_home[[niche_celltype[p]]]
+  v <- setNames(rep(NA_real_, length(all_s)), all_s)
+  if (!is.null(L)) { sc <- score_on(L, niche_programs[[p]]); v[names(sc)] <- sc }
+  v
+})
+rownames(niche_scores) <- all_s
+niche_scores <- niche_scores[, colSums(!is.na(niche_scores)) >= MIN_OBS_N, drop = FALSE]
+cat("niche programs scored:", ncol(niche_scores), "/", length(niche_programs), "\n")
+
+nmeta <- md_n %>% distinct(orig.merge, lesion_type, GEO.Cohort) %>%
+  mutate(lesion_type = factor(as.character(lesion_type), levels = lesion_order))
+nmeta <- nmeta[match(rownames(niche_scores), nmeta$orig.merge), ]
+
+niche_de <- bind_rows(lapply(colnames(niche_scores), function(p) {
+  d <- data.frame(score = niche_scores[, p], lesion = nmeta$lesion_type, cohort = nmeta$GEO.Cohort)
+  d <- d[!is.na(d$score), ]
+  if (n_distinct(d$lesion) < 2 || nrow(d) < MIN_OBS_N) return(NULL)
+  fit <- tryCatch(lmerTest::lmer(score ~ lesion + (1 | cohort), d), error = function(e) NULL)
+  if (is.null(fit)) return(NULL)
+  cf <- as.data.frame(coef(summary(fit))); cf$term <- rownames(cf)
+  cf %>% filter(grepl("^lesion", term)) %>%
+    transmute(program = p, celltype = base::unname(niche_celltype[p]),
+              contrast = paste0(sub("^lesion", "", term), "_vs_PP"),
+              estimate = Estimate, t = `t value`, p_value = `Pr(>|t|)`)
+})) %>% group_by(contrast) %>% mutate(adj_p = p.adjust(p_value, "BH")) %>% ungroup() %>%
+  arrange(contrast, p_value)
+cat("niche programs FDR<0.05 by contrast:\n")
+niche_de %>% filter(adj_p < 0.05) %>% count(contrast) %>% as_tibble() %>% print()
+print(as_tibble(niche_de), n = Inf)
+
+# one point per niche program: Tumor_vs_PP effect (x) vs Ery_vs_PP effect (y),
+# colored by the Tumor - Ery difference (same scheme as lesion_da_scatter)
+niche_wide <- niche_de %>%
+  select(program, celltype, contrast, estimate) %>%
+  tidyr::pivot_wider(names_from = contrast, values_from = estimate) %>%
+  dplyr::filter(!is.na(Tumor_vs_PP), !is.na(Erythroderma_vs_PP)) %>%
+  mutate(dif = Tumor_vs_PP - Erythroderma_vs_PP)   # + = larger in Tumor, - = larger in Ery
+
+# tight limits (data range + 8% pad) so the points fill the panel
+pad  <- 0.08
+xr   <- range(niche_wide$Tumor_vs_PP); xr <- xr + c(-1, 1) * diff(xr) * pad
+yr   <- range(niche_wide$Erythroderma_vs_PP);   yr <- yr + c(-1, 1) * diff(yr) * pad
+dlim <- max(abs(niche_wide$dif), na.rm = TRUE)
+
+ggplot(niche_wide, aes(Tumor_vs_PP, Erythroderma_vs_PP)) +
+  geom_hline(yintercept = 0, color = "grey85", linewidth = 0.3) +
+  geom_vline(xintercept = 0, color = "grey85", linewidth = 0.3) +
+  geom_abline(slope = 1, linetype = "dashed", color = "grey80", linewidth = 0.3) +
+  geom_point(aes(color = dif), size = 3.5) +
+  ggrepel::geom_text_repel(aes(label = paste0(program, " (", celltype, ")")),
+    color = "grey15", size = 3, max.overlaps = 10, min.segment.length = 0,
+    segment.color = "grey80", box.padding = 0.5) +
+  scale_color_gradient2(low = base::unname(lesion_colors["Erythroderma"]),
+                        mid = "grey85", high = base::unname(lesion_colors["Tumor"]),
+                        midpoint = 0, limits = c(-dlim, dlim),
+                        name = "Tumor - Ery\neffect") +
+  coord_cartesian(xlim = xr, ylim = yr) +
+  labs(x = "niche score effect: Tumor vs PP",
+       y = "niche score effect: Ery vs PP",
+       title = "Niche program lesion-type effects") +
+  theme_classic(base_size = 11)
+
+saveRDS(niche_scores,   "results/niche_scores.rds")
+saveRDS(niche_celltype, "results/niche_celltype.rds")
+saveRDS(pb_home,        "results/niche_pb_home.rds")
+saveRDS(nmeta,          "results/niche_meta.rds")
+saveRDS(niche_de,       "results/niche_de.rds")
+```
+
+```{r niche_score_violin_pick, fig.width = 11, fig.height = 4}
+# violins of 3 niche scores by lesion type, side by side; each panel titled with its
+# program/celltype above, split by lesion_type (lesion_order). set `picks` to any
+# columns of niche_scores.
+picks <- c("CD8_exhaustion", "Mac_LAM_SPP1_TREM2", "Fibro_TLS_FRC")
+cat("available niche scores:\n"); print(colnames(niche_scores))
+stopifnot(all(picks %in% colnames(niche_scores)))
+
+mk_v <- function(pk) {
+  d <- data.frame(score = niche_scores[, pk], orig.merge = rownames(niche_scores)) %>%
+    left_join(distinct(md_n, orig.merge, lesion_type), by = "orig.merge") %>%
+    filter(!is.na(score)) %>%
+    mutate(lesion_type = factor(as.character(lesion_type), levels = lesion_order))
+  ggplot(d, aes(lesion_type, score, fill = lesion_type)) +
+    geom_violin(scale = "width", trim = FALSE, color = NA, alpha = 0.65) +
+    geom_boxplot(width = 0.12, outlier.shape = NA, fill = "white", alpha = 0.7) +
+    geom_jitter(width = 0.12, size = 1.5, alpha = 0.8) +
+    scale_fill_manual(values = lesion_colors, breaks = lesion_order, guide = "none") +
+    labs(x = NULL, y = "score",
+         title = paste0(pk, "\n(", base::unname(niche_celltype[pk]), ")")) +
+    theme_classic(base_size = 11) +
+    theme(plot.title  = element_text(hjust = 0.5, size = 10),
+          axis.text.x = element_text(angle = 45, hjust = 1))
+}
+plots <- lapply(picks, mk_v)
+p_row <- patchwork::wrap_plots(plots, nrow = 1)
+p_row
+ggsave("figs/niche_violins_row.pdf", p_row, height = 4, width = 11, dpi = 600)
+```
+
+```{r niche_gene_drivers, fig.width = 6, fig.height = 5}
+# Decompose a niche program's score into its per-GENE drivers for Tumor_vs_PP.
+# For the chosen program, z-score each program gene across samples (the SAME z that
+# score_on averages into the program score), then test each gene vs lesion_type with
+# the same cohort RE. The bar chart ranks which genes drive the program's score shift.
+# Reuses pb_home / niche_programs / niche_celltype / nmeta from niche_score_test.
+prog    <- "CD8_exhaustion"          # any name(niche_programs)
+prog_ct <- base::unname(niche_celltype[prog])
+stopifnot(prog %in% names(niche_programs), !is.null(pb_home[[prog_ct]]))
+
+L  <- pb_home[[prog_ct]]
+g  <- base::intersect(niche_programs[[prog]], rownames(L))
+zz <- t(scale(t(L[g, , drop = FALSE])))                              # genes x samples, per-gene z
+zz <- zz[apply(zz, 1, function(r) all(is.finite(r))), , drop = FALSE] # drop zero-variance genes
+gm <- nmeta[match(colnames(zz), nmeta$orig.merge), ]
+
+gene_de <- bind_rows(lapply(rownames(zz), function(gn) {
+  d <- data.frame(z = zz[gn, ], lesion = gm$lesion_type, cohort = gm$GEO.Cohort)
+  d <- d[!is.na(d$z), ]
+  if (n_distinct(d$lesion) < 2) return(NULL)
+  fit <- tryCatch(lmerTest::lmer(z ~ lesion + (1 | cohort), d), error = function(e) NULL)
+  if (is.null(fit)) return(NULL)
+  cf <- as.data.frame(coef(summary(fit))); cf$term <- rownames(cf)
+  cf %>% filter(grepl("^lesion", term)) %>%
+    transmute(gene = gn, contrast = paste0(sub("^lesion", "", term), "_vs_PP"),
+              estimate = Estimate, t = `t value`, p_value = `Pr(>|t|)`)
+})) %>% group_by(contrast) %>% mutate(adj_p = p.adjust(p_value, "BH")) %>% ungroup()
+
+tum <- gene_de %>% filter(contrast == "Tumor_vs_PP") %>% arrange(desc(estimate))
+prog_eff <- if (exists("niche_de"))
+  niche_de$estimate[niche_de$program == prog & niche_de$contrast == "Tumor_vs_PP"][1] else NA_real_
+cat(prog, "(", prog_ct, ") — n genes scored:", nrow(tum),
+    "| program-score Tumor_vs_PP effect:", round(prog_eff, 3),
+    "| mean per-gene effect:", round(mean(tum$estimate), 3), "\n")
+print(as_tibble(tum), n = Inf)
+
+tum %>%
+  mutate(gene = factor(gene, levels = gene),
+         star = ifelse(adj_p < 0.05, "*", ""),
+         star_vjust = ifelse(estimate >= 0, -0.2, 1.2)) %>%
+  ggplot(aes(gene, estimate, fill = estimate)) +
+  geom_col(width = 0.7) + geom_hline(yintercept = 0, color = "grey70") +
+  geom_text(aes(label = star, vjust = star_vjust), size = 4) +
+  scale_fill_gradient2(low = "#2166AC", mid = "grey90", high = "#B2182B", midpoint = 0, guide = "none") +
+  labs(x = NULL, y = "per-gene z effect (Tumor vs Patch_Plaque)",
+       title = paste0(prog, " (", prog_ct, "): per-gene z score")) +
+  theme_classic(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+ggsave(paste0("figs/niche_gene_drivers_", prog, ".pdf"), height = 4, width = 5, dpi = 600)
+```
+
+```{r niche_score_correlation, fig.width = 9, fig.height = 8}
+# Spearman correlation of the within-lineage niche scores across samples
+# (cohort-residualized, like the integrated heatmap). niche_scores + nmeta come
+# from niche_score_test.
+resid_cohort <- function(x, cohort) {
+  ok <- !is.na(x)
+  if (sum(ok) >= 3 && n_distinct(cohort[ok]) >= 2)
+    x[ok] <- residuals(lm(x[ok] ~ cohort[ok]))
+  x
+}
+ns_res <- apply(niche_scores, 2, resid_cohort, cohort = nmeta$GEO.Cohort)
+ns_cor <- cor(ns_res, use = "pairwise.complete.obs", method = "spearman")
+ns_cor[is.na(ns_cor)] <- 0          # guard: pairs with no shared samples -> 0 for clustering
+
+ann <- data.frame(celltype = base::unname(niche_celltype[colnames(ns_cor)]),
+                  row.names = colnames(ns_cor))
+pheatmap::pheatmap(ns_cor,
+  clustering_distance_rows = as.dist(1 - ns_cor),
+  clustering_distance_cols = as.dist(1 - ns_cor),
+  annotation_row = ann["celltype"], annotation_col = ann["celltype"],
+  color  = colorRampPalette(c("#2166AC", "white", "#B2182B"))(101),
+  breaks = seq(-1, 1, length.out = 102), fontsize = 8,
+  main = "Within-lineage niche program score correlation (cohort-residualized)")
+```
+
+```{r niche_bulk_score_test, fig.width = 9, fig.height = 11}
+# Score ALL niche programs on the WHOLE-SAMPLE bulk (not the home lineage), then
+# test vs lesion_type with a cohort RE (PP reference). CAVEAT: bulk mixes celltype
+# composition + per-cell state, so a hit here can be either; compare to the within-
+# lineage niche_score_test to tell them apart.
+fs_b    <- factor(ctcl$orig.merge)
+ind_b   <- Matrix::sparse.model.matrix(~ 0 + fs_b); colnames(ind_b) <- levels(fs_b)
+bulk_pb <- as.matrix(cnts_n[, colnames(ctcl)] %*% ind_b)   # cnts_n = TCR/BCR-filtered counts
+bulk_lcpm_n <- edgeR::cpm(calcNormFactors(DGEList(bulk_pb[rowSums(bulk_pb) > 0, ])),
+                          log = TRUE, prior.count = 1)
+
+score_bulk <- function(genes, min_genes = 3) {
+  g <- base::intersect(genes, rownames(bulk_lcpm_n))
+  if (length(g) < min_genes) return(setNames(rep(NA_real_, ncol(bulk_lcpm_n)), colnames(bulk_lcpm_n)))
+  colMeans(t(scale(t(bulk_lcpm_n[g, , drop = FALSE]))), na.rm = TRUE)
+}
+niche_bulk_scores <- sapply(niche_programs, score_bulk)    # samples x programs
+niche_bulk_scores <- niche_bulk_scores[, colSums(!is.na(niche_bulk_scores)) > 0, drop = FALSE]
+cat("niche programs scored on bulk:", ncol(niche_bulk_scores), "/", length(niche_programs), "\n")
+
+bmeta <- ctcl@meta.data %>% distinct(orig.merge, lesion_type, GEO.Cohort) %>%
+  mutate(lesion_type = factor(as.character(lesion_type), levels = lesion_order))
+bmeta <- bmeta[match(rownames(niche_bulk_scores), bmeta$orig.merge), ]
+
+niche_bulk_de <- bind_rows(lapply(colnames(niche_bulk_scores), function(p) {
+  d <- data.frame(score = niche_bulk_scores[, p], lesion = bmeta$lesion_type, cohort = bmeta$GEO.Cohort)
+  d <- d[!is.na(d$score), ]
+  if (n_distinct(d$lesion) < 2) return(NULL)
+  fit <- tryCatch(lmerTest::lmer(score ~ lesion + (1 | cohort), d), error = function(e) NULL)
+  if (is.null(fit)) return(NULL)
+  cf <- as.data.frame(coef(summary(fit))); cf$term <- rownames(cf)
+  cf %>% filter(grepl("^lesion", term)) %>%
+    transmute(program = p, celltype = base::unname(niche_celltype[p]),
+              contrast = paste0(sub("^lesion", "", term), "_vs_PP"),
+              estimate = Estimate, t = `t value`, p_value = `Pr(>|t|)`)
+})) %>% group_by(contrast) %>% mutate(adj_p = p.adjust(p_value, "BH")) %>% ungroup() %>%
+  arrange(contrast, p_value)
+cat("bulk niche programs FDR<0.05 by contrast:\n")
+niche_bulk_de %>% filter(adj_p < 0.05) %>% count(contrast) %>% as_tibble() %>% print()
+cat("\ntop up/down per contrast:\n")
+niche_bulk_de %>% group_by(contrast) %>%
+  group_modify(~ bind_rows(slice_max(.x, estimate, n = 6), slice_min(.x, estimate, n = 6))) %>%
+  ungroup() %>% as_tibble() %>% print(n = Inf)
+
+ord_b <- niche_bulk_de %>% filter(contrast == "Tumor_vs_PP") %>% arrange(estimate) %>%
+  mutate(label = paste0(program, " (", celltype, ")")) %>% pull(label)
+niche_bulk_de %>%
+  mutate(label = factor(paste0(program, " (", celltype, ")"), levels = ord_b),
+         star  = ifelse(adj_p < 0.05, "*", "")) %>%
+  ggplot(aes(estimate, label, fill = estimate)) +
+  geom_col(width = 0.7) + geom_vline(xintercept = 0, color = "grey70") +
+  geom_text(aes(label = star), hjust = -0.2, size = 4) +
+  scale_fill_gradient2(low = "#2166AC", mid = "grey90", high = "#B2182B", midpoint = 0, guide = "none") +
+  facet_wrap(~ contrast) +
+  labs(x = "niche score effect (vs Patch_Plaque)", y = NULL,
+       title = "Niche program scores (WHOLE-SAMPLE bulk): lesion-type differential test") +
+  theme_classic(base_size = 7)
+```
+
+```{r niche_bulk_violin_pick}
+# violin of ANY niche program's WHOLE-SAMPLE bulk score, grouped by lesion type.
+pick_b <- "CD8_exhaustion"
+cat("available bulk niche scores:\n"); print(colnames(niche_bulk_scores))
+stopifnot(pick_b %in% colnames(niche_bulk_scores))
+
+dpb <- data.frame(score = niche_bulk_scores[, pick_b], orig.merge = rownames(niche_bulk_scores)) %>%
+  left_join(distinct(ctcl@meta.data, orig.merge, lesion_type), by = "orig.merge") %>%
+  filter(!is.na(score)) %>%
+  mutate(lesion_type = factor(as.character(lesion_type), levels = lesion_order))
+
+ggplot(dpb, aes(lesion_type, score, fill = lesion_type)) +
+  geom_violin(scale = "width", trim = FALSE, color = NA, alpha = 0.5) +
+  geom_boxplot(width = 0.12, outlier.shape = NA, fill = "white", alpha = 0.7) +
+  geom_jitter(width = 0.12, size = 1.8, alpha = 0.8) +
+  scale_fill_manual(values = lesion_colors, guide = "none") +
+  labs(x = NULL, y = "program score (whole-sample bulk)",
+       title = paste0(pick_b, " (whole-sample bulk) by lesion type")) +
+  theme_classic(base_size = 11)
+```
+
+```{r feature_correlation_lesion, fig.width = 11, fig.height = 10}
+MIN_CELLS_F <- 10; MIN_SAMP_F <- 8; MIN_OBS_F <- 15
+
+cnts_f <- GetAssayData(ctcl, "counts", assay = "RNA")
+cnts_f <- cnts_f[!grepl(tcr_bcr_re, rownames(cnts_f)), ]
+md_f   <- ctcl@meta.data
+
+pb_lcpm <- function(cells) {           # pseudobulk -> logCPM (all genes, no HVG filter)
+  fs  <- factor(md_f[cells, "orig.merge"])
+  ind <- Matrix::sparse.model.matrix(~ 0 + fs); colnames(ind) <- levels(fs)
+  pb  <- as.matrix(cnts_f[, cells] %*% ind)
+  edgeR::cpm(calcNormFactors(DGEList(pb[rowSums(pb) > 0, ])), log = TRUE, prior.count = 1)
+}
+score_on <- function(lcpm, genes, min_genes = 3) {   # mean per-gene z across samples
+  g <- base::intersect(genes, rownames(lcpm))
+  if (length(g) < min_genes) return(setNames(rep(NA_real_, ncol(lcpm)), colnames(lcpm)))
+  colMeans(t(scale(t(lcpm[g, , drop = FALSE]))), na.rm = TRUE)
+}
+
+all_samp <- sort(unique(as.character(ctcl$orig.merge)))
+
+# (1) COMPOSITION: per-sample CLR of celltype proportions
+comp <- md_f %>% count(orig.merge, celltype.unified) %>%
+  tidyr::complete(orig.merge, celltype.unified, fill = list(n = 0)) %>%
+  group_by(orig.merge) %>% mutate(clr = log(n + 0.5) - mean(log(n + 0.5))) %>% ungroup()
+comp_mat <- comp %>% select(orig.merge, celltype.unified, clr) %>%
+  tidyr::pivot_wider(names_from = celltype.unified, values_from = clr) %>%
+  tibble::column_to_rownames("orig.merge"); comp_mat <- comp_mat[all_samp, ]
+
+# celltypes with enough cells/samples to pseudobulk
+ct_keep <- md_f %>% count(celltype.unified, orig.merge) %>% filter(n >= MIN_CELLS_F) %>%
+  count(celltype.unified) %>% filter(n >= MIN_SAMP_F) %>% pull(celltype.unified) %>% as.character()
+pb_ct      <- setNames(lapply(ct_keep, function(ct) {
+  cells <- rownames(md_f)[md_f$celltype.unified == ct]
+  s <- md_f[cells, "orig.merge"]; cells <- cells[s %in% names(which(table(s) >= MIN_CELLS_F))]
+  pb_lcpm(cells)
+}), ct_keep)
+bulk_lcpm  <- pb_lcpm(colnames(ctcl))    # (2) whole-sample bulk for global programs
+
+# assemble the per-sample feature matrix (all numeric); track gene support
+feat <- list(); det <- c(); defn <- c()
+for (cn in colnames(comp_mat)) { fn <- paste0("comp:", cn)
+  feat[[fn]] <- comp_mat[all_samp, cn]; det[fn] <- NA; defn[fn] <- NA }
+for (p in names(global_programs)) { fn <- paste0("global:", p)
+  feat[[fn]] <- score_on(bulk_lcpm, global_programs[[p]])[all_samp]
+  det[fn]  <- length(base::intersect(global_programs[[p]], rownames(bulk_lcpm)))
+  defn[fn] <- length(global_programs[[p]]) }
+skipped <- character(0)
+for (p in names(niche_programs)) {        # (3) niche programs in their home lineage
+  ct <- niche_celltype[p]
+  if (!ct %in% names(pb_ct)) { skipped <- c(skipped, paste0(p, "@", ct)); next }
+  fn <- paste0("niche:", p, "@", ct)
+  v  <- setNames(rep(NA_real_, length(all_samp)), all_samp)
+  sc <- score_on(pb_ct[[ct]], niche_programs[[p]]); v[names(sc)] <- sc
+  feat[[fn]] <- v
+  det[fn]  <- length(base::intersect(niche_programs[[p]], rownames(pb_ct[[ct]])))
+  defn[fn] <- length(niche_programs[[p]]) }
+F <- do.call(cbind, feat); rownames(F) <- all_samp
+F <- F[, colSums(!is.na(F)) >= MIN_OBS_F & apply(F, 2, function(x) sd(x, na.rm = TRUE) > 0)]
+cat("features:", ncol(F), " (",
+    sum(grepl("^comp:", colnames(F))), "comp /",
+    sum(grepl("^global:", colnames(F))), "global /",
+    sum(grepl("^niche:", colnames(F))), "niche )  samples:", nrow(F), "\n")
+if (length(skipped)) cat("niche programs SKIPPED (home lineage too sparse):",
+                         paste(skipped, collapse = ", "), "\n")
+
+# per-feature support: non-NA samples + genes detected/defined (for program features)
+support <- tibble::tibble(
+  feature = colnames(F), class = sub(":.*", "", colnames(F)),
+  n_obs = colSums(!is.na(F)),
+  genes_detected = det[colnames(F)], genes_defined = defn[colnames(F)]) %>%
+  arrange(class, n_obs)
+cat("\nper-feature support (watch low n_obs / few genes_detected):\n")
+print(as_tibble(support), n = Inf)
+
+# (4) lesion-type differential test per feature (PP reference, cohort RE)
+fmeta <- md_f %>% distinct(orig.merge, lesion_type, GEO.Cohort) %>%
+  mutate(lesion_type = factor(as.character(lesion_type), levels = lesion_order))
+fmeta <- fmeta[match(rownames(F), fmeta$orig.merge), ]
+feat_de <- bind_rows(lapply(colnames(F), function(fn) {
+  d <- data.frame(value = F[, fn], lesion = fmeta$lesion_type, cohort = fmeta$GEO.Cohort)
+  d <- d[!is.na(d$value), ]
+  if (n_distinct(d$lesion) < 2 || nrow(d) < MIN_OBS_F) return(NULL)
+  fit <- tryCatch(lmerTest::lmer(value ~ lesion + (1 | cohort), d), error = function(e) NULL)
+  if (is.null(fit)) return(NULL)
+  cf <- as.data.frame(coef(summary(fit))); cf$term <- rownames(cf)
+  cf %>% filter(grepl("^lesion", term)) %>%
+    transmute(feature = fn, contrast = paste0(sub("^lesion", "", term), "_vs_PP"),
+              estimate = Estimate, t = `t value`, p_value = `Pr(>|t|)`)
+})) %>% group_by(contrast) %>% mutate(adj_p = p.adjust(p_value, "BH")) %>% ungroup() %>%
+  arrange(contrast, p_value)
+cat("features FDR<0.05 by contrast:\n")
+feat_de %>% filter(adj_p < 0.05) %>% count(contrast) %>% as_tibble() %>% print()
+print(as_tibble(feat_de), n = Inf)
+
+# (PLOT 1) feature x feature Spearman correlation pheatmap. Correlate COHORT-
+# RESIDUALIZED features so the structure reflects within-cohort biology, not batch
+# (cohort = dominant variance driver). Lesion test above stays on raw F + (1|cohort).
+resid_cohort <- function(x, cohort) {
+  ok <- !is.na(x)
+  if (sum(ok) >= 3 && n_distinct(cohort[ok]) >= 2)
+    x[ok] <- residuals(lm(x[ok] ~ cohort[ok]))
+  x
+}
+F_res   <- apply(F, 2, resid_cohort, cohort = fmeta$GEO.Cohort)
+cor_mat <- cor(F_res, use = "pairwise.complete.obs", method = "spearman")
+tum_eff <- feat_de %>% filter(contrast == "Tumor_vs_PP") %>%
+  select(feature, estimate) %>% tibble::deframe()
+ann <- data.frame(class       = sub(":.*", "", colnames(F)),
+                  Tumor_vs_PP = tum_eff[colnames(F)],
+                  row.names   = colnames(F))
+pheatmap::pheatmap(cor_mat,
+  clustering_distance_rows = as.dist(1 - cor_mat),
+  clustering_distance_cols = as.dist(1 - cor_mat),
+  annotation_row = ann["class"], annotation_col = ann[c("class", "Tumor_vs_PP")],
+  color = colorRampPalette(c("#2166AC", "white", "#B2182B"))(101),
+  breaks = seq(-1, 1, length.out = 102), fontsize = 6,
+  main = "Feature-feature Spearman, cohort-residualized (composition + global + niche)")
+
+# (PLOT 2) which features move across lesion types (estimate, * = FDR<0.05)
+feat_de %>%
+  mutate(class = sub(":.*", "", feature),
+         star  = ifelse(adj_p < 0.05, "*", ""),
+         feature = factor(feature, levels = feat_de %>% filter(contrast == "Tumor_vs_PP") %>%
+                          arrange(estimate) %>% pull(feature))) %>%
+  ggplot(aes(estimate, feature, fill = estimate)) +
+  geom_col(width = 0.7) + geom_vline(xintercept = 0, color = "grey70") +
+  geom_text(aes(label = star), hjust = -0.2, size = 4) +
+  scale_fill_gradient2(low = "#2166AC", mid = "grey90", high = "#B2182B", midpoint = 0, guide = "none") +
+  facet_grid(class ~ contrast, scales = "free_y", space = "free_y") +
+  labs(x = "lesion effect (vs Patch_Plaque)", y = NULL,
+       title = "Integrated features differential across lesion types") +
+  theme_classic(base_size = 8)
+```
+
+```{r niche_score_violins, fig.width = 11, fig.height = 8}
+# per-sample niche program scores (within-lineage, raw) split by lesion type
+niche_cols <- grep("^niche:", colnames(F), value = TRUE)
+viol <- as.data.frame(F[, niche_cols, drop = FALSE]) %>%
+  tibble::rownames_to_column("orig.merge") %>%
+  tidyr::pivot_longer(-orig.merge, names_to = "feature", values_to = "score") %>%
+  filter(!is.na(score)) %>%
+  left_join(distinct(md_f, orig.merge, lesion_type), by = "orig.merge") %>%
+  mutate(feature     = sub("^niche:", "", feature),
+         lesion_type = factor(as.character(lesion_type), levels = lesion_order))
+
+ggplot(viol, aes(lesion_type, score, fill = lesion_type)) +
+  geom_violin(scale = "width", trim = FALSE, color = NA, alpha = 0.65) +
+  geom_boxplot(width = 0.12, outlier.shape = NA, fill = "white", alpha = 0.7) +
+  geom_jitter(width = 0.12, size = 0.5, alpha = 0.5) +
+  scale_fill_manual(values = lesion_colors, guide = "none") +
+  facet_wrap(~ feature, scales = "free_y") +
+  labs(x = NULL, y = "niche program score (within lineage)",
+       title = "Per-sample niche program scores by lesion type") +
+  theme_classic(base_size = 9) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+```{r niche_gene_t_violin}
+# For a given niche program x celltype: violin of per-GENE t-statistics (one point
+# per program gene) from the OLD per-celltype lesion pseudobulk DEG, split by
+# lesion contrast. Shows whether the program's genes are coordinately up/down in
+# that lineage even when individual genes aren't significant.
+names(niche_programs)
+prog    <- "Fibro_TLS_FRC"      # change to any name(niche_programs)
+prog_ct <- "Fibroblast"               # its home lineage (niche_celltype[prog])
+
+res_ct  <- read.csv("../fig6.testing/results.ctcl.final/res_lesion_tbl.csv",
+                    stringsAsFactors = FALSE)
+
+gv <- res_ct %>%
+  filter(celltype == prog_ct, gene %in% niche_programs[[prog]]) %>%
+  mutate(contrast = factor(contrast, levels = c("Tumor_vs_PP", "Ery_vs_PP")))
+
+cat(prog, "in", prog_ct, "- genes found per contrast:\n")
+gv %>% count(contrast) %>% as_tibble() %>% print()
+
+con_cols <- c(Tumor_vs_PP = base::unname(lesion_colors["Tumor"]),
+              Ery_vs_PP   = base::unname(lesion_colors["Erythroderma"]))
+
+ggplot(gv, aes(contrast, t, fill = contrast)) +
+  geom_hline(yintercept = 0, color = "grey70") +
+  geom_violin(scale = "width", trim = FALSE, color = NA, alpha = 0.45) +
+  stat_summary(fun = median, geom = "crossbar", width = 0.4, linewidth = 0.3, color = "grey25") +
+  geom_jitter(width = 0.1, size = 2.2, alpha = 0.9) +
+  ggrepel::geom_text_repel(aes(label = gene), size = 3, max.overlaps = Inf,
+    min.segment.length = 0, segment.color = "grey75", box.padding = 0.4) +
+  scale_fill_manual(values = con_cols, guide = "none") +
+  labs(x = NULL, y = "per-gene t  (vs Patch_Plaque)",
+       title = paste0(prog, " in ", prog_ct, ": per-gene t by lesion contrast")) +
+  theme_classic(base_size = 11)
+```
+
+```{r cd8_checkpoint_logcpm}
+# pseudobulk logCPM of LAG3 / HAVCR2 in CD8_T samples, grouped by lesion type
+# (pb_ct built in feature_correlation_lesion: per-celltype logCPM, sample columns).
+genes_pl <- c("LAG3", "HAVCR2"); ct_pl <- "CD8_T"
+lcpm_ct  <- pb_ct[[ct_pl]]
+genes_pl <- genes_pl[genes_pl %in% rownames(lcpm_ct)]
+
+pdat <- as.data.frame(t(lcpm_ct[genes_pl, , drop = FALSE])) %>%
+  tibble::rownames_to_column("orig.merge") %>%
+  tidyr::pivot_longer(-orig.merge, names_to = "gene", values_to = "logCPM") %>%
+  left_join(distinct(md_f, orig.merge, lesion_type), by = "orig.merge") %>%
+  mutate(lesion_type = factor(as.character(lesion_type), levels = lesion_order))
+
+ggplot(pdat, aes(lesion_type, logCPM, fill = lesion_type)) +
+  geom_boxplot(outlier.shape = NA, width = 0.6, alpha = 0.7) +
+  geom_jitter(width = 0.15, size = 1.8, alpha = 0.8) +
+  scale_fill_manual(values = lesion_colors, guide = "none") +
+  facet_wrap(~ gene, scales = "free_y") +
+  labs(x = NULL, y = "pseudobulk logCPM",
+       title = paste0(paste(genes_pl, collapse = " / "), " in ", ct_pl, " by lesion type")) +
+  theme_classic(base_size = 11)
+```
+
+```{r fibro_tls_logcpm}
+# pseudobulk logCPM of FDCSP / CXCL13 in Fibroblast samples, grouped by lesion type
+genes_pl <- c("FDCSP", "CXCL13"); ct_pl <- "Fibroblast"
+lcpm_ct  <- pb_ct[[ct_pl]]
+genes_pl <- genes_pl[genes_pl %in% rownames(lcpm_ct)]
+
+pdat <- as.data.frame(t(lcpm_ct[genes_pl, , drop = FALSE])) %>%
+  tibble::rownames_to_column("orig.merge") %>%
+  tidyr::pivot_longer(-orig.merge, names_to = "gene", values_to = "logCPM") %>%
+  left_join(distinct(md_f, orig.merge, lesion_type), by = "orig.merge") %>%
+  mutate(lesion_type = factor(as.character(lesion_type), levels = lesion_order))
+
+ggplot(pdat, aes(lesion_type, logCPM, fill = lesion_type)) +
+  geom_boxplot(outlier.shape = NA, width = 0.6, alpha = 0.7) +
+  geom_jitter(width = 0.15, size = 1.8, alpha = 0.8) +
+  scale_fill_manual(values = lesion_colors, guide = "none") +
+  facet_wrap(~ gene, scales = "free_y") +
+  labs(x = NULL, y = "pseudobulk logCPM",
+       title = paste0(paste(genes_pl, collapse = " / "), " in ", ct_pl, " by lesion type")) +
+  theme_classic(base_size = 11)
+```
+
+# Subtype analysis
+
+```{r subtype_prop_by_lesion}
+# per-SAMPLE subtype composition within each lesion type (subtype is sample-level
+# from fig4; drop ND = not determined)
+sub_prop <- ctcl@meta.data %>%
+  distinct(orig.merge, lesion_type, subtype) %>%
+  filter(subtype %in% c("Subtype_1", "Subtype_2")) %>%
+  mutate(lesion_type = factor(as.character(lesion_type), levels = lesion_order),
+         subtype     = factor(as.character(subtype), levels = c("Subtype_1", "Subtype_2")))
+
+cat("samples per lesion_type x subtype:\n")
+sub_prop %>% count(lesion_type, subtype) %>%
+  tidyr::pivot_wider(names_from = subtype, values_from = n, values_fill = 0) %>%
+  as_tibble() %>% print()
+
+ggplot(sub_prop, aes(x = lesion_type, fill = subtype)) +
+  geom_bar(position = "fill", width = 0.7) +
+  scale_fill_manual(values = subtype_colors, breaks = c("Subtype_1", "Subtype_2"), name = NULL) +
+  scale_y_continuous(expand = c(0, 0), labels = scales::percent) +
+  labs(x = NULL, y = "proportion of samples",
+       title = "") +
+  theme_classic(base_size = 11)
+ggsave("figs/subtype_prop_by_lesion.pdf", height = 4, width = 4.25, dpi = 600)
+```
+
+```{r subtype_da}
+# propeller DA across subtypes (Subtype_1 vs Subtype_2), Subtype_2 = reference.
+# Same engine as lesion_da: logit props + limma + GEO.Cohort via duplicateCorrelation.
+keep_sub <- ctcl$subtype %in% c("Subtype_1", "Subtype_2")
+
+samp_sub <- ctcl@meta.data %>%
+  filter(subtype %in% c("Subtype_1", "Subtype_2")) %>%
+  distinct(orig.merge, subtype, GEO.Cohort) %>%
+  mutate(subtype = factor(as.character(subtype), levels = c("Subtype_2", "Subtype_1")))  # S2 = ref
+
+props_sub <- speckle::getTransformedProps(
+  clusters  = as.character(ctcl$celltype.unified)[keep_sub],
+  sample    = as.character(ctcl$orig.merge)[keep_sub],
+  transform = "logit")
+
+tp_sub   <- props_sub$TransformedProps
+samp_sub <- samp_sub[match(colnames(tp_sub), samp_sub$orig.merge), ]
+stopifnot(identical(colnames(tp_sub), samp_sub$orig.merge))
+
+design_sub <- model.matrix(~ subtype, data = samp_sub)   # Subtype_2 = reference
+dc_sub  <- limma::duplicateCorrelation(tp_sub, design_sub, block = samp_sub$GEO.Cohort)
+fit_sub <- limma::eBayes(limma::lmFit(tp_sub, design_sub, block = samp_sub$GEO.Cohort,
+                                      correlation = dc_sub$consensus.correlation))
+
+da_sub <- limma::topTable(fit_sub, coef = "subtypeSubtype_1", number = Inf, sort.by = "none") %>%
+  tibble::rownames_to_column("celltype") %>%
+  transmute(celltype, estimate = logFC, t = t, p_value = P.Value, adj_p = adj.P.Val) %>%
+  arrange(p_value)
+
+cat("consensus intra-cohort correlation:", round(dc_sub$consensus.correlation, 3), "\n")
+cat("(+) estimate = higher in Subtype_1, (-) = higher in Subtype_2\n")
+print(as_tibble(da_sub), n = Inf)
+
+da_sub %>%
+  mutate(star = ifelse(adj_p < 0.05, "*", ""),
+         hj   = ifelse(estimate > 0, -0.4, 1.4)) %>%
+  ggplot(aes(estimate, reorder(celltype, estimate), fill = estimate)) +
+  geom_col(width = 0.7) +
+  geom_vline(xintercept = 0, color = "grey70") +
+  geom_text(aes(label = star, hjust = hj), size = 5) +
+  scale_fill_gradient2(low = "#2166AC", mid = "grey90", high = "#B2182B",
+                       midpoint = 0, guide = "none") +
+  labs(x = "logit prop Sub. 1 vs Sub. 2", y = NULL,
+       title = NULL) +
+  theme_classic(base_size = 11) +
+  theme(axis.text = element_text(size = 13))
+ggsave("figs/subtype_da.pdf", height = 5, width = 4.5, dpi = 600)
+
+write.csv(da_sub, "results/da_sub.csv", row.names = FALSE)
+saveRDS(da_sub, "results/da_sub.rds")
+```
+
+```{r subtype_bulk_deg, fig.width = 5, fig.height = 5}
+# whole-sample bulk DEG: Subtype_1 vs Subtype_2 (S2 reference), cohort RE.
+keep_sub  <- ctcl$subtype %in% c("Subtype_1", "Subtype_2")
+cells_sub <- colnames(ctcl)[keep_sub]
+f   <- factor(ctcl$orig.merge[keep_sub])
+ind <- Matrix::sparse.model.matrix(~ 0 + f); colnames(ind) <- levels(f)
+sub_bulk_pb <- as.matrix(GetAssayData(ctcl, "counts", assay = "RNA")[, cells_sub] %*% ind)
+sub_bulk_pb <- sub_bulk_pb[!grepl(tcr_bcr_re, rownames(sub_bulk_pb)), ]
+
+sub_sm <- ctcl@meta.data %>% filter(subtype %in% c("Subtype_1", "Subtype_2")) %>%
+  distinct(orig.merge, subtype, GEO.Cohort) %>% as.data.frame()
+rownames(sub_sm) <- sub_sm$orig.merge
+sub_sm <- sub_sm[colnames(sub_bulk_pb), ]
+sub_sm$subtype <- factor(as.character(sub_sm$subtype), levels = c("Subtype_2", "Subtype_1"))  # S2 = ref
+
+form    <- if (n_distinct(sub_sm$GEO.Cohort) >= 2) ~ subtype + (1 | GEO.Cohort) else ~ subtype
+dge_sub <- DGEList(sub_bulk_pb, samples = sub_sm)
+dge_sub <- calcNormFactors(dge_sub[filterByExpr(dge_sub, group = sub_sm$subtype, min.count = 5, min.prop = .1), ])
+vo_sub  <- voomWithDreamWeights(dge_sub, form, sub_sm, BPPARAM = bp)
+fit_sub <- eBayes(dream(vo_sub, form, sub_sm, BPPARAM = bp))
+res_sub_bulk <- topTable(fit_sub, coef = "subtypeSubtype_1", number = Inf, sort.by = "P") %>%
+  rownames_to_column("gene")
+cat("Subtype_1 vs Subtype_2 bulk DEGs (adj.P<0.05):", sum(res_sub_bulk$adj.P.Val < 0.05), "\n")
+cat("(+) logFC = up in Subtype_1, (-) = up in Subtype_2\n")
+print(as_tibble(res_sub_bulk), n = 20)
+
+res_sub_bulk <- readRDS("results/res_sub_bulk.rds")
+# volcano with top up/down labeled (top 6 by logFC + top 6 by adj.P each direction)
+xl <- quantile(abs(res_sub_bulk$logFC), 0.9995, na.rm = TRUE)
+yl <- quantile(-log10(res_sub_bulk$adj.P.Val), 0.9995, na.rm = TRUE)
+v   <- res_sub_bulk %>%
+  mutate(logFC_s = pmax(pmin(logFC, xl), -xl), nlp_s = pmin(-log10(adj.P.Val), yl))
+sig <- filter(v, adj.P.Val < 0.05)
+#tme_rec <- c("CSF2RA", "XCR1", "IFNGR1", "CXCR5", "CXCR3", "HAVCR2")
+lab <- bind_rows(slice_max(sig, logFC, n = 6), slice_min(sig, logFC, n = 6),
+                 slice_min(filter(sig, logFC > 0), adj.P.Val, n = 6),
+                 slice_min(filter(sig, logFC < 0), adj.P.Val, n = 6)) %>%
+  distinct(gene, .keep_all = TRUE)
+
+ggplot(v, aes(logFC_s, nlp_s, color = logFC_s)) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey80") +
+  geom_point(shape = 16, size = 2, alpha = 0.7) +
+  scale_color_gradient2(low = "#2166AC", mid = "grey85", high = "#B2182B",
+                        midpoint = 0, limits = c(-xl, xl), oob = scales::squish, guide = "none") +
+  ggrepel::geom_text_repel(data = lab, aes(logFC_s, nlp_s, label = gene), color = "black",
+    size = 4, max.overlaps = 20, min.segment.length = 0, segment.size = 0.2,
+    segment.color = "grey70") +
+  coord_cartesian(xlim = c(-xl, xl), ylim = c(0, yl)) +
+  labs(x = "log2FC  (Subtype_1 vs Subtype_2)", y = expression(-log[10]~adj.P),
+       title = "Whole-sample bulk: Subtype_1 vs Subtype_2") +
+  theme_classic(base_size = 11)
+ggsave("figs/subtype_bulk_volcano.pdf", height = 5, width = 5, dpi = 600)
+
+saveRDS(res_sub_bulk, "results/res_sub_bulk.rds")
+```
+
+```{r subtype_celltype_deg, fig.width = 6, fig.height = 5}
+# per-celltype pseudobulk DEG, Subtype_1 vs Subtype_2 (S2 reference), cohort RE.
+MIN_SAMP_S <- 2; MIN_CELLS_S <- 10
+keep_sub   <- ctcl$subtype %in% c("Subtype_1", "Subtype_2")
+ctcl$pb_id <- paste(ctcl$orig.merge, ctcl$celltype.unified, sep = "__")
+cells_sub  <- colnames(ctcl)[keep_sub]
+
+f   <- factor(ctcl$pb_id[keep_sub])
+ind <- Matrix::sparse.model.matrix(~ 0 + f); colnames(ind) <- levels(f)
+agg <- as.matrix(GetAssayData(ctcl, "counts", assay = "RNA")[, cells_sub] %*% ind)
+agg <- agg[!grepl(tcr_bcr_re, rownames(agg)), ]
+
+pb_meta_s <- ctcl@meta.data[keep_sub, ] %>%
+  distinct(pb_id, orig.merge, celltype.unified, subtype, GEO.Cohort) %>% as.data.frame()
+rownames(pb_meta_s) <- pb_meta_s$pb_id
+pb_meta_s$ncell   <- as.integer(table(f)[pb_meta_s$pb_id])
+pb_meta_s <- pb_meta_s[colnames(agg), ]
+pb_meta_s$subtype <- factor(as.character(pb_meta_s$subtype), levels = c("Subtype_2", "Subtype_1"))
+
+run_ct_sub <- function(ct) {
+  m <- pb_meta_s %>% filter(celltype.unified == ct, ncell >= MIN_CELLS_S)
+  if (any(table(m$subtype) < MIN_SAMP_S)) return(NULL)
+  form <- if (n_distinct(m$GEO.Cohort) >= 2) ~ subtype + (1 | GEO.Cohort) else ~ subtype
+  dge  <- DGEList(agg[, m$pb_id], samples = m)
+  dge  <- calcNormFactors(dge[filterByExpr(dge, group = m$subtype), ])
+  vo   <- voomWithDreamWeights(dge, form, m, BPPARAM = bp)
+  fit  <- eBayes(dream(vo, form, m, BPPARAM = bp))
+  topTable(fit, coef = "subtypeSubtype_1", number = Inf, sort.by = "P") %>%
+    rownames_to_column("gene") %>% mutate(celltype = ct)
+}
+cts <- sort(unique(pb_meta_s$celltype.unified))
+res_subtype_ct <- bind_rows(lapply(cts, function(ct)
+  tryCatch(run_ct_sub(ct), error = function(e) { message(ct, ": ", e$message); NULL })))
+
+res_subtype_ct <- readRDS("results/subtype_celltype_deg.rds")
+
+cat("sig DEGs (FDR<0.05) per celltype:\n")
+res_subtype_ct %>% filter(adj.P.Val < 0.05) %>% count(celltype, name = "n_deg") %>%
+  arrange(desc(n_deg)) %>% as_tibble() %>% print(n = Inf)
+
+res_subtype_ct %>% filter(adj.P.Val < 0.05) %>%
+  mutate(dir = ifelse(logFC > 0, "up in Subtype_1", "up in Subtype_2")) %>%
+  count(celltype, dir) %>%
+  ggplot(aes(n, reorder(celltype, n), fill = dir)) +
+  geom_col(width = 0.7) +
+  scale_fill_manual(values = c(`up in Subtype_1` = base::unname(subtype_colors["Subtype_1"]),
+                               `up in Subtype_2` = base::unname(subtype_colors["Subtype_2"])), name = NULL) +
+  labs(x = "sig DEGs (FDR<0.05)", y = NULL,
+       title = "Per-celltype DEGs: Subtype_1 vs Subtype_2") +
+  theme_classic(base_size = 11)
+```
+
+```{r subtype_niche_score_test, fig.width = 6, fig.height = 7}
+# Test the within-lineage niche scores (niche_scores from niche_score_test) vs
+# subtype (Subtype_1 vs Subtype_2, S2 reference), cohort RE.
+smeta <- ctcl@meta.data %>% filter(subtype %in% c("Subtype_1", "Subtype_2")) %>%
+  distinct(orig.merge, subtype, GEO.Cohort) %>%
+  mutate(subtype = factor(as.character(subtype), levels = c("Subtype_2", "Subtype_1")))
+ns_sub <- niche_scores[rownames(niche_scores) %in% smeta$orig.merge, , drop = FALSE]
+smeta  <- smeta[match(rownames(ns_sub), smeta$orig.merge), ]
+
+niche_sub_de <- bind_rows(lapply(colnames(ns_sub), function(p) {
+  d <- data.frame(score = ns_sub[, p], subtype = smeta$subtype, cohort = smeta$GEO.Cohort)
+  d <- d[!is.na(d$score), ]
+  if (n_distinct(d$subtype) < 2 || any(table(d$subtype) < 3)) return(NULL)
+  fit <- tryCatch(lmerTest::lmer(score ~ subtype + (1 | cohort), d), error = function(e) NULL)
+  if (is.null(fit)) return(NULL)
+  cf <- as.data.frame(coef(summary(fit))); cf$term <- rownames(cf)
+  cf %>% filter(grepl("^subtype", term)) %>%
+    transmute(program = p, celltype = base::unname(niche_celltype[p]),
+              estimate = Estimate, t = `t value`, p_value = `Pr(>|t|)`)
+})) %>% mutate(adj_p = p.adjust(p_value, "BH")) %>% arrange(p_value)
+cat("niche programs FDR<0.05 (subtype):", sum(niche_sub_de$adj_p < 0.05, na.rm = TRUE), "\n")
+print(as_tibble(niche_sub_de), n = Inf)
+
+niche_sub_de %>%
+  mutate(star  = ifelse(adj_p < 0.05, "*", ""),
+         label = paste0(program, " (", celltype, ")")) %>%
+  ggplot(aes(estimate, reorder(label, estimate), fill = estimate)) +
+  geom_col(width = 0.7) + geom_vline(xintercept = 0, color = "grey70") +
+  geom_text(aes(label = star), hjust = -0.2, size = 4) +
+  scale_fill_gradient2(low = "#2166AC", mid = "grey90", high = "#B2182B",
+                       midpoint = 0, guide = "none") +
+  labs(x = "niche score effect (Subtype_1 vs Subtype_2)", y = NULL,
+       title = "Niche program scores: subtype differential test") +
+  theme_classic(base_size = 8)
+```
+
+```{r subtype_lesion_bulk_scatter, fig.width = 5.5, fig.height = 6}
+# whole-sample bulk DEG: Tumor_vs_PP (x) vs Subtype_2_vs_Subtype_1 (y, flipped).
+# les_bulk_tum from lesion_bulk_deg; res_sub_bulk from subtype_bulk_deg.
+m <- inner_join(les_bulk_tum %>% select(gene, x = logFC, px = adj.P.Val),
+                res_sub_bulk %>% select(gene, y0 = logFC, py = adj.P.Val), by = "gene") %>%
+  mutate(y = -y0,                                  # flip -> Subtype_2 vs Subtype_1
+         sig = case_when(px < 0.05 & py < 0.05 ~ "both",
+                         px < 0.05              ~ "Tumor only",
+                         py < 0.05              ~ "Subtype only",
+                         TRUE                   ~ "ns"))
+r   <- cor(m$x, m$y, method = "spearman", use = "complete.obs")
+lim <- quantile(abs(c(m$x, m$y)), 0.995, na.rm = TRUE)
+
+w   <- m %>% mutate(s = x + y, d = x - y)
+lab <- bind_rows(slice_max(w, x, n = 6), slice_min(w, x, n = 6),
+                 slice_max(w, y, n = 6), slice_min(w, y, n = 6),
+                 slice_max(w, s, n = 4), slice_min(w, s, n = 4),
+                 slice_max(w, d, n = 4), slice_min(w, d, n = 4)) %>%
+  distinct(gene, .keep_all = TRUE) %>%
+  mutate(x = pmax(pmin(x, lim), -lim), y = pmax(pmin(y, lim), -lim))
+plt <- m %>% mutate(x = pmax(pmin(x, lim), -lim), y = pmax(pmin(y, lim), -lim))
+
+ggplot(plt, aes(x, y)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "grey80") +
+  geom_point(aes(color = sig), size = 1, alpha = 0.4) +
+  ggrepel::geom_text_repel(data = lab, aes(x = x, y = y, label = gene), inherit.aes = FALSE,
+    color = "black", size = 2.5, max.overlaps = Inf,
+    min.segment.length = 0, segment.size = 0.2, segment.color = "grey70", box.padding = 0.4) +
+  scale_color_manual(values = c("Tumor only"   = base::unname(lesion_colors["Tumor"]),
+                                "Subtype only" = base::unname(subtype_colors["Subtype_2"]),
+                                "both" = "black", "ns" = "grey80"), name = NULL) +
+  annotate("text", x = -Inf, y = Inf, label = sprintf("rho = %.2f", r),
+           hjust = -0.15, vjust = 1.5, size = 4) +
+  coord_equal(xlim = c(-lim, lim), ylim = c(-lim, lim)) +
+  labs(x = "log2FC  Tumor vs PP", y = "log2FC  Subtype_2 vs Subtype_1",
+       title = "Bulk DEG: lesion vs subtype") +
+  theme_classic(base_size = 11) + theme(legend.position = "bottom")
+```
+
+```{r subtype_lesion_niche_scatter, fig.width = 6, fig.height = 6}
+# niche scores: Tumor_vs_PP effect (x) vs Subtype_2_vs_Subtype_1 effect (y, flipped).
+# niche_de from niche_score_test (lesion); niche_sub_de from subtype_niche_score_test.
+mn <- inner_join(
+  niche_de %>% filter(contrast == "Tumor_vs_PP") %>% select(program, celltype, x = estimate, px = adj_p),
+  niche_sub_de %>% select(program, y0 = estimate, py = adj_p), by = "program") %>%
+  mutate(y = -y0,                                  # flip -> Subtype_2 vs Subtype_1
+         sig = (px < 0.05) | (py < 0.05))
+rn  <- cor(mn$x, mn$y, method = "spearman", use = "complete.obs")
+
+ggplot(mn, aes(x, y)) +
+  geom_hline(yintercept = 0, color = "grey85", linewidth = 0.3) +
+  geom_vline(xintercept = 0, color = "grey85", linewidth = 0.3) +
+  geom_abline(slope = 1, linetype = "dashed", color = "grey80", linewidth = 0.3) +
+  geom_point(aes(color = sig), size = 2.5) +
+  ggrepel::geom_text_repel(aes(label = paste0(program, " (", celltype, ")")), size = 2,
+    max.overlaps = 5, min.segment.length = 0, segment.color = "grey75", box.padding = 0.4) +
+  scale_color_manual(values = c(`TRUE` = "#B2182B", `FALSE` = "grey55"),
+                     name = "FDR<0.05 (either)") +
+  annotate("text", x = -Inf, y = Inf, label = sprintf("rho = %.2f", rn),
+           hjust = -0.15, vjust = 1.5, size = 4) +
+  #coord_equal(xlim = c(-ln, ln), ylim = c(-ln, ln)) +
+  labs(x = "niche effect  Tumor vs PP", y = "niche effect  Subtype_2 vs Subtype_1",
+       title = "Niche scores: lesion vs subtype") +
+  theme_classic(base_size = 11)
+```
+
+# Disentangling lesion type vs subtype
+
+```{r confound_feasibility}
+# how much off-diagonal (S1 Tumor / S2 PP) info is there to deconfound with?
+samp_ls <- ctcl@meta.data %>% filter(subtype %in% c("Subtype_1", "Subtype_2")) %>%
+  distinct(orig.merge, lesion_type, subtype, GEO.Cohort) %>%
+  mutate(lesion_type = factor(as.character(lesion_type), levels = lesion_order),
+         subtype     = factor(as.character(subtype), levels = c("Subtype_1", "Subtype_2")))
+cat("samples per lesion_type x subtype (off-diagonal = deconfounding power):\n")
+print(addmargins(table(samp_ls$lesion_type, samp_ls$subtype)))
+cat("\nlesion_type x subtype x cohort:\n")
+print(table(samp_ls$lesion_type, samp_ls$subtype, samp_ls$GEO.Cohort))
+```
+
+```{r joint_da, fig.width = 9, fig.height = 5}
+# propeller DA with BOTH covariates: ~ lesion_type + subtype -> each effect is
+# MUTUALLY ADJUSTED for the other (PP & Subtype_2 are the references).
+keep_j <- ctcl$subtype %in% c("Subtype_1", "Subtype_2")
+samp_j <- ctcl@meta.data %>% filter(subtype %in% c("Subtype_1", "Subtype_2")) %>%
+  distinct(orig.merge, lesion_type, subtype, GEO.Cohort) %>%
+  mutate(lesion_type = factor(as.character(lesion_type), levels = lesion_order),
+         subtype     = factor(as.character(subtype), levels = c("Subtype_2", "Subtype_1")))
+
+props_j <- speckle::getTransformedProps(
+  clusters = as.character(ctcl$celltype.unified)[keep_j],
+  sample   = as.character(ctcl$orig.merge)[keep_j], transform = "logit")
+tp_j   <- props_j$TransformedProps
+samp_j <- samp_j[match(colnames(tp_j), samp_j$orig.merge), ]
+stopifnot(identical(colnames(tp_j), samp_j$orig.merge))
+
+design_j <- model.matrix(~ lesion_type + subtype, data = samp_j)   # PP ref, S2 ref
+dc_j  <- limma::duplicateCorrelation(tp_j, design_j, block = samp_j$GEO.Cohort)
+fit_j <- limma::eBayes(limma::lmFit(tp_j, design_j, block = samp_j$GEO.Cohort,
+                                    correlation = dc_j$consensus.correlation))
+
+eff_map <- c(lesion_typeTumor = "Tumor_vs_PP", lesion_typeErythroderma = "Ery_vs_PP",
+             subtypeSubtype_1 = "S1_vs_S2")
+da_j <- bind_rows(lapply(names(eff_map), function(co) {
+  if (!co %in% colnames(design_j)) return(NULL)
+  limma::topTable(fit_j, coef = co, number = Inf, sort.by = "none") %>%
+    tibble::rownames_to_column("celltype") %>%
+    transmute(celltype, effect = eff_map[co], estimate = logFC, t = t,
+              p_value = P.Value, adj_p = adj.P.Val)
+}))
+cat("MUTUALLY ADJUSTED DA (lesion + subtype together):\n")
+print(as_tibble(da_j %>% arrange(effect, p_value)), n = Inf)
+
+ord_ct <- da_j %>% filter(effect == "S1_vs_S2") %>% arrange(estimate) %>% pull(celltype)
+da_j %>%
+  mutate(celltype = factor(celltype, levels = ord_ct),
+         star = ifelse(adj_p < 0.05, "*", ifelse(p_value < 0.05, "~", ""))) %>%
+  ggplot(aes(estimate, celltype, fill = estimate)) +
+  geom_col(width = 0.7) + geom_vline(xintercept = 0, color = "grey70") +
+  geom_text(aes(label = star), hjust = -0.2, size = 4) +
+  scale_fill_gradient2(low = "#2166AC", mid = "grey90", high = "#B2182B", midpoint = 0, guide = "none") +
+  facet_wrap(~ effect) +
+  labs(x = "adjusted logit-prop effect", y = NULL,
+       title = "Joint DA: lesion + subtype mutually adjusted (* FDR<0.05, ~ p<0.05)") +
+  theme_classic(base_size = 10)
+```
+
+```{r stratified_da, fig.width = 7, fig.height = 5}
+# subtype effect WITHIN each lesion type, and lesion effect WITHIN each subtype.
+# If a shift holds within a single stratum, it's not just the confound.
+prop_contrast <- function(cells, grp_col, grp_levels) {
+  md  <- ctcl@meta.data[cells, ]
+  pr  <- speckle::getTransformedProps(clusters = as.character(md$celltype.unified),
+                                      sample = as.character(md$orig.merge), transform = "logit")
+  tpm <- pr$TransformedProps
+  sm  <- md %>% distinct(orig.merge, .keep_all = TRUE)
+  sm  <- sm[match(colnames(tpm), sm$orig.merge), ]
+  grp <- factor(as.character(sm[[grp_col]]), levels = grp_levels)
+  if (any(table(grp) < 3)) return(NULL)
+  design <- model.matrix(~ grp)
+  fit <- tryCatch({
+    if (n_distinct(sm$GEO.Cohort) >= 2) {
+      dc <- limma::duplicateCorrelation(tpm, design, block = sm$GEO.Cohort)
+      limma::lmFit(tpm, design, block = sm$GEO.Cohort, correlation = dc$consensus.correlation)
+    } else limma::lmFit(tpm, design)
+  }, error = function(e) NULL)
+  if (is.null(fit)) return(NULL)
+  fit <- limma::eBayes(fit)
+  limma::topTable(fit, coef = 2, number = Inf, sort.by = "none") %>%
+    tibble::rownames_to_column("celltype") %>%
+    transmute(celltype, estimate = logFC, t = t, p_value = P.Value, adj_p = adj.P.Val)
+}
+
+strat <- list(
+  `S1_vs_S2 | PP`    = list(m = ctcl$lesion_type == "Patch_Plaque" & ctcl$subtype %in% c("Subtype_1", "Subtype_2"),
+                            col = "subtype", lev = c("Subtype_2", "Subtype_1")),
+  `S1_vs_S2 | Tumor` = list(m = ctcl$lesion_type == "Tumor" & ctcl$subtype %in% c("Subtype_1", "Subtype_2"),
+                            col = "subtype", lev = c("Subtype_2", "Subtype_1")),
+  `Tumor_vs_PP | S1` = list(m = ctcl$subtype == "Subtype_1" & ctcl$lesion_type %in% c("Patch_Plaque", "Tumor"),
+                            col = "lesion_type", lev = c("Patch_Plaque", "Tumor")),
+  `Tumor_vs_PP | S2` = list(m = ctcl$subtype == "Subtype_2" & ctcl$lesion_type %in% c("Patch_Plaque", "Tumor"),
+                            col = "lesion_type", lev = c("Patch_Plaque", "Tumor")))
+strat_da <- bind_rows(lapply(names(strat), function(nm) {
+  s <- strat[[nm]]; r <- prop_contrast(colnames(ctcl)[s$m], s$col, s$lev)
+  if (is.null(r)) { message("stratum skipped (too few samples): ", nm); return(NULL) }
+  r %>% mutate(stratum = nm)
+}))
+cat("stratified DA (full):\n"); print(as_tibble(strat_da %>% arrange(stratum, p_value)), n = Inf)
+
+# focus on the two confounded hits
+strat_da %>% filter(celltype %in% c("B_Cells", "cDC1")) %>%
+  mutate(star = ifelse(adj_p < 0.05, "*", ifelse(p_value < 0.05, "~", ""))) %>%
+  ggplot(aes(estimate, stratum, fill = estimate)) +
+  geom_col(width = 0.7) + geom_vline(xintercept = 0, color = "grey70") +
+  geom_text(aes(label = star), hjust = -0.2, size = 4) +
+  scale_fill_gradient2(low = "#2166AC", mid = "grey90", high = "#B2182B", midpoint = 0, guide = "none") +
+  facet_wrap(~ celltype) +
+  labs(x = "logit-prop effect within stratum", y = NULL,
+       title = "Stratified DA: B_Cells & cDC1 (* FDR<0.05, ~ p<0.05)") +
+  theme_classic(base_size = 10)
+```
+
+# Malignant - TME integration (subtype)
+
+```{r malignant_tme_pathway, fig.width = 6, fig.height = 6}
+# Malignant subtype DEG (fig4) vs whole-sample TME subtype DEG (res_sub_bulk):
+# which pathways are coordinately enriched in BOTH compartments per subtype?
+# res_skin_subtypes: + logFC = up in Subtype_1, - = up in Subtype_2.
+res_malig <- readRDS("../fig4/results/res_skin_subtypes.rds")
+if (!"gene" %in% colnames(res_malig))
+  res_malig <- tibble::rownames_to_column(as.data.frame(res_malig), "gene")
+
+if (!exists("pathways")) {
+  msig_tbl <- bind_rows(
+    msigdbr(species = "Homo sapiens", collection = "H"),
+    msigdbr(species = "Homo sapiens", collection = "C2", subcollection = "CP:REACTOME")
+  ) %>% select(gs_name, gene_symbol) %>% distinct()
+  pathways <- split(msig_tbl$gene_symbol, msig_tbl$gs_name)
+}
+gsea_rank <- function(res) { set.seed(42)
+  fgsea(pathways, res %>% arrange(desc(t)) %>% { setNames(.$t, .$gene) }, nproc = 16) %>% as_tibble() }
+
+gsea_malig <- gsea_rank(res_malig)      # + NES = up in Subtype_1
+gsea_tme   <- gsea_rank(res_sub_bulk)   # + NES = up in Subtype_1 (coef subtypeSubtype_1)
+
+pw <- inner_join(gsea_malig %>% select(pathway, nes_mal = NES, p_mal = padj),
+                 gsea_tme   %>% select(pathway, nes_tme = NES, p_tme = padj), by = "pathway") %>%
+  mutate(both_sig = p_mal < 0.1 & p_tme < 0.1,
+         concordant = sign(nes_mal) == sign(nes_tme))
+rpw <- cor(pw$nes_mal, pw$nes_tme, use = "complete.obs", method = "spearman")
+lim <- max(abs(c(pw$nes_mal, pw$nes_tme)), na.rm = TRUE)
+lab <- pw %>% filter(both_sig & concordant) %>%
+  mutate(score = abs(nes_mal) + abs(nes_tme)) %>% slice_max(score, n = 14)
+
+ggplot(pw, aes(nes_mal, nes_tme)) +
+  geom_hline(yintercept = 0, color = "grey85") + geom_vline(xintercept = 0, color = "grey85") +
+  geom_point(aes(color = both_sig & concordant), size = 1.4, alpha = 0.6) +
+  ggrepel::geom_text_repel(data = lab,
+    aes(label = scales::label_wrap(28)(gsub("_", " ", sub("^(HALLMARK|REACTOME)_", "", pathway)))),
+    size = 2.4, max.overlaps = Inf, min.segment.length = 0, segment.color = "grey75") +
+  scale_color_manual(values = c(`TRUE` = "#B2182B", `FALSE` = "grey70"),
+                     name = "shared (both padj<0.1, same dir)") +
+  annotate("text", x = -Inf, y = Inf, label = sprintf("rho = %.2f", rpw),
+           hjust = -0.15, vjust = 1.5, size = 4) +
+  coord_equal(xlim = c(-lim, lim), ylim = c(-lim, lim)) +
+  labs(x = "malignant NES (S1 vs S2)", y = "TME bulk NES (S1 vs S2)",
+       title = "Shared malignant<->TME pathways by subtype") +
+  theme_classic(base_size = 11) + theme(legend.position = "bottom")
+```
+
+```{r malignant_tme_lr, fig.width = 7, fig.height = 6}
+# Concordant ligand(malignant) -> receptor(TME celltype) pairs by subtype.
+# Curated canonical TME L-R panel (literature; swap in liana/CellChatDB if installed).
+lr_pairs <- tibble::tribble(
+  ~ligand,   ~receptor,
+  "CCL2","CCR2", "CCL3","CCR1", "CCL4","CCR5", "CCL5","CCR5", "CCL5","CCR1", "CCL5","CCR4",
+  "CCL17","CCR4", "CCL22","CCR4", "CCL19","CCR7", "CCL21","CCR7", "CCL20","CCR6",
+  "CXCL9","CXCR3", "CXCL10","CXCR3", "CXCL11","CXCR3", "CXCL12","CXCR4", "CXCL13","CXCR5",
+  "XCL1","XCR1", "XCL2","XCR1", "CX3CL1","CX3CR1",
+  "IFNG","IFNGR1", "IL2","IL2RA", "IL4","IL4R", "IL13","IL13RA1", "IL13","IL4R", "IL10","IL10RA",
+  "IL15","IL15RA", "IL6","IL6R", "IL1B","IL1R1", "TNF","TNFRSF1B", "TGFB1","TGFBR2",
+  "CSF1","CSF1R", "CSF2","CSF2RA", "FLT3LG","FLT3", "KITLG","KIT", "TNFSF13B","TNFRSF13B",
+  "CD274","PDCD1", "PDCD1LG2","PDCD1", "CD80","CTLA4", "CD86","CTLA4", "CD86","CD28",
+  "CD200","CD200R1", "LGALS9","HAVCR2", "TNFSF9","TNFRSF9", "TNFSF4","TNFRSF4",
+  "CD40LG","CD40", "ICOSLG","ICOS", "TNFSF14","TNFRSF14", "NECTIN2","TIGIT", "PVR","TIGIT",
+  "SPP1","CD44", "SPP1","ITGAV", "VEGFA","FLT1", "VEGFA","KDR", "MIF","CD74")
+
+mal_l <- res_malig      %>% transmute(ligand = gene,   lfc_L = logFC, p_L = adj.P.Val)
+tme_r <- res_subtype_ct %>% transmute(receptor = gene, celltype, lfc_R = logFC, p_R = adj.P.Val)
+
+lr_tab <- lr_pairs %>%
+  inner_join(mal_l, by = "ligand") %>%
+  inner_join(tme_r, by = "receptor") %>%
+  mutate(concordant = sign(lfc_L) == sign(lfc_R),
+         subtype    = ifelse(lfc_L > 0, "Subtype_1", "Subtype_2"),
+         any_sig    = p_L < 0.1 | p_R < 0.1)
+
+cat("concordant L-R pairs (same subtype direction), >=1 side padj<0.1:\n")
+lr_tab %>% filter(concordant, any_sig) %>%
+  transmute(subtype, ligand, receptor, celltype,
+            lfc_L = round(lfc_L, 2), p_L = signif(p_L, 2),
+            lfc_R = round(lfc_R, 2), p_R = signif(p_R, 2)) %>%
+  arrange(subtype, desc(abs(lfc_L) + abs(lfc_R))) %>% as_tibble() %>% print(n = Inf)
+
+lim <- max(abs(c(lr_tab$lfc_L, lr_tab$lfc_R)), na.rm = TRUE)
+lab <- lr_tab %>% filter(concordant, any_sig) %>%
+  mutate(s = abs(lfc_L) + abs(lfc_R)) %>% slice_max(s, n = 18)
+ggplot(lr_tab, aes(lfc_L, lfc_R)) +
+  geom_hline(yintercept = 0, color = "grey85") + geom_vline(xintercept = 0, color = "grey85") +
+  geom_point(aes(color = ifelse(concordant, subtype, "discordant")), size = 2, alpha = 0.7) +
+  ggrepel::geom_text_repel(data = lab, aes(label = paste0(ligand, "->", receptor, " (", celltype, ")")),
+    size = 2.4, max.overlaps = Inf, min.segment.length = 0, segment.color = "grey75") +
+  scale_color_manual(values = c(Subtype_1 = "#B2182B", Subtype_2 = "#2166AC",
+                                discordant = "grey80"), name = NULL) +
+  coord_equal(xlim = c(-lim, lim), ylim = c(-lim, lim)) +
+  labs(x = "malignant ligand logFC (S1 vs S2)", y = "TME receptor logFC (S1 vs S2)",
+       title = "Concordant malignant ligand -> TME receptor by subtype") +
+  theme_classic(base_size = 11) + theme(legend.position = "bottom")
+```
+
+```{r secretome_dotplots, fig.width = 13, fig.height = 11}
+# DotPlots: malignant ligand expression (by subtype) paired with cognate receptor
+# expression across TME celltypes, per subtype. Malignant cells come from the FULL
+# fig1 object (removed from the TME re-subset); TME cells = ctcl.
+if (!exists("obj")) obj <- readRDS("../fig1/results/obj.fig1.rds")
+mcells <- colnames(obj)[obj$celltype.malig == "CTCL" & obj$Tissue == "skin"]
+malig  <- obj[, mcells]
+malig$subtype <- base::unname(orig_to_subtype[as.character(malig$orig.merge)])
+malig  <- malig[, malig$subtype %in% c("Subtype_1", "Subtype_2")]
+malig$subtype <- factor(as.character(malig$subtype), levels = c("Subtype_1", "Subtype_2"))
+malig  <- NormalizeData(malig, verbose = FALSE)
+
+ctcl$subtype <- factor(as.character(ctcl$subtype), levels = c("Subtype_1", "Subtype_2", "ND"))
+ctcl_s1 <- ctcl[, ctcl$subtype == "Subtype_1"]
+ctcl_s2 <- ctcl[, ctcl$subtype == "Subtype_2"]
+
+present <- function(o, f) f[f %in% rownames(o)]
+# S1: ligand -> receptor;  S2: ligand -> receptor
+s1_lig <- c("CSF2", "XCL1", "IFNG");        s1_rec <- c("CSF2RA", "XCR1", "IFNGR1")
+s2_lig <- c("CXCL13", "CXCL10", "LGALS9");  s2_rec <- c("CXCR5", "CXCR3", "HAVCR2")
+
+dp <- function(o, feats, grp, ttl)
+  DotPlot(o, features = present(o, feats), group.by = grp) +
+    Seurat::RotatedAxis() + ggtitle(ttl) +
+    theme(plot.title = element_text(size = 10), axis.title = element_blank())
+
+d1 <- dp(malig,   s1_lig, "subtype",          "S1 ligands - malignant")
+d2 <- dp(ctcl_s1, s1_rec, "celltype.unified", "S1 receptors - TME (Subtype_1)")
+d3 <- dp(malig,   s2_lig, "subtype",          "S2 ligands - malignant")
+d4 <- dp(ctcl_s2, s2_rec, "celltype.unified", "S2 receptors - TME (Subtype_2)")
+
+((d1 | d2) + patchwork::plot_layout(widths = c(1, 3))) /
+((d3 | d4) + patchwork::plot_layout(widths = c(1, 3)))
+```
+
+```{r malignant_ligand_dotplot, fig.width = 3.6, fig.height = 4}
+# single malignant dotplot, FLIPPED: genes on y (CSF2 top), subtypes on x (S1 left).
+stopifnot(exists("malig"))
+malig$subtype <- factor(as.character(malig$subtype),
+                        levels = c("Subtype_1", "Subtype_2"))   # S1 on the left
+malig_genes <- c("CSF2", "XCL1", "IFNG", "CXCL13", "CXCL10", "LGALS9")
+
+p_malig <- DotPlot(malig, features = rev(present(malig, malig_genes)), group.by = "subtype") +
+  coord_flip() +
+  labs(x = NULL, y = NULL, title = "Malignant subtype ligand expression") +
+  theme(plot.title = element_text(size = 11), axis.text.x = element_text(angle = 0, hjust = 0.5))
+p_malig
+ggsave("figs/malignant_ligand_dotplot.pdf", p_malig, height = 4, width = 5, dpi = 600)
+```
+
+```{r tme_receptor_dotplot, fig.width = 6, fig.height = 2.6}
+# single TME dotplot: cognate receptor genes left->right, S1 on top, ALL TME cells
+# collapsed into one group per subtype (dilutes celltype-specific receptors).
+ctcl_lr <- ctcl[, ctcl$subtype %in% c("Subtype_1", "Subtype_2")]
+ctcl_lr$subtype <- factor(as.character(ctcl_lr$subtype),
+                          levels = c("Subtype_2", "Subtype_1"))   # reversed -> S1 on top
+tme_genes <- c("CSF2RA", "XCR1", "IFNGR1", "CXCR5", "CXCR3", "HAVCR2")
+
+DotPlot(ctcl_lr, features = present(ctcl_lr, tme_genes), group.by = "subtype") +
+  Seurat::RotatedAxis() +
+  labs(x = NULL, y = NULL, title = "TME receptor expression (all TME collapsed)") +
+  theme(plot.title = element_text(size = 11))
+```
+
+```{r tme_receptor_celltype_dotplot, fig.width = 7, fig.height = 8}
+# all 6 receptor genes across every TME celltype; each celltype's two subtypes are
+# adjacent rows (S1 then S2). raw avg expression; specificity via dot size.
+recs   <- c("CSF2RA", "XCR1", "IFNGR1", "CXCR5", "CXCR3", "HAVCR2")
+expr_d <- GetAssayData(ctcl, "data", assay = "RNA")
+md_t   <- ctcl@meta.data
+recs   <- recs[recs %in% rownames(expr_d)]
+
+cells_k <- rownames(md_t)[md_t$subtype %in% c("Subtype_1", "Subtype_2")]
+em   <- as.matrix(t(expr_d[recs, cells_k, drop = FALSE]))   # cells x genes
+long <- tibble::tibble(celltype = as.character(md_t[cells_k, "celltype.unified"]),
+                       subtype  = as.character(md_t[cells_k, "subtype"])) %>%
+  bind_cols(as.data.frame(em)) %>%
+  tidyr::pivot_longer(tidyr::all_of(recs), names_to = "gene", values_to = "expr")
+
+summ <- long %>% group_by(gene, celltype, subtype) %>%
+  summarise(pct = 100 * mean(expr > 0), avg = mean(expr), .groups = "drop") %>%
+  mutate(gene    = factor(gene, levels = recs),
+         subtype = factor(subtype, levels = c("Subtype_1", "Subtype_2")))
+
+# interleave: each celltype's S1 then S2 adjacent (celltypes alphabetical, top->bottom)
+ct_order <- sort(unique(summ$celltype))
+lev <- as.vector(t(outer(ct_order, levels(summ$subtype), paste, sep = " | ")))
+summ$ct_sub <- factor(paste(summ$celltype, summ$subtype, sep = " | "), levels = rev(lev))
+ycol <- ifelse(grepl("Subtype_1$", levels(summ$ct_sub)), "#B2182B", "#2166AC")
+
+ggplot(summ, aes(gene, ct_sub, size = pct, color = avg)) +
+  geom_point() +
+  scale_size(range = c(0, 7), name = "% expressing") +
+  scale_color_gradient(low = "lightgrey", high = "blue", name = "avg expression") +
+  labs(x = NULL, y = NULL,
+       title = "TME receptor expression per celltype x subtype (S1 red / S2 blue)") +
+  theme_classic(base_size = 9) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text.y = element_text(color = ycol))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

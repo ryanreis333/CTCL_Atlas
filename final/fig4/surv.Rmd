@@ -1,0 +1,524 @@
+---
+title: "surv.check"
+output: html_document
+date: "2026-02-10"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load and clean data
+
+```{r load-data, message=FALSE, warning=FALSE}
+library(GEOquery)
+library(data.table)
+library(edgeR)
+
+# ── Expression matrix ──────────────────────────────────────────────────────────
+expr_raw <- fread("int/GSE168508_gene_expression-MF_skin-biopsy_sample_.txt")
+
+# Drop non-expression column, aggregate duplicate gene symbols by mean
+expr_raw[, genes := NULL]
+expr_agg      <- expr_raw[, lapply(.SD, mean), by = Symbol, .SDcols = -"Symbol"]
+mat           <- as.matrix(expr_agg[, -"Symbol"])
+rownames(mat) <- expr_agg$Symbol
+
+# ── GEO metadata ───────────────────────────────────────────────────────────────
+gse  <- getGEO("GSE168508", GSEMatrix = TRUE)
+meta <- pData(gse[[1]])
+
+# Strip ":ch1" suffix, collapse whitespace/special chars to underscore, lowercase
+clean_names <- function(x) {
+  x <- gsub(":ch1$", "", x)
+  x <- gsub("[^[:alnum:]]", "_", x)
+  x <- gsub("_+", "_", x)
+  x <- gsub("^_|_$", "", x)
+  tolower(x)
+}
+colnames(meta) <- clean_names(colnames(meta))
+rownames(meta) <- meta$title
+
+# Extract key clinical variables with clean names
+meta$os_time   <- as.numeric(meta$os_time_mo)
+meta$os_event  <- as.integer(meta$survival)        # already 0/1
+meta$pfs_time  <- as.numeric(meta$pfs_time_mo)
+meta$pfs_event <- as.integer(meta$progression)     # already 0/1
+meta$lct       <- ifelse(is.na(meta$lct) | meta$lct == "", "NLCT", meta$lct)
+
+# ── Align samples ──────────────────────────────────────────────────────────────
+common <- intersect(colnames(mat), rownames(meta))
+mat    <- mat[, common]
+meta   <- meta[common, ]
+
+# ── Log-normalize ──────────────────────────────────────────────────────────────
+logcpm <- edgeR::cpm(mat, log = TRUE)
+
+cat("Expression matrix:", nrow(mat), "genes x", ncol(mat), "samples\n")
+cat("Metadata:", nrow(meta), "samples,", ncol(meta), "variables\n")
+cat("LCT status:", table(meta$lct), "\n")
+
+saveRDS(mat, "surv.mat.rds")
+saveRDS(meta, "surv.meta.rds")
+```
+
+## Clean metadata
+
+```{r clean-metadata}
+# Keep only clinically relevant, variable columns — drop GEO boilerplate,
+# protocol fields, contact info, and redundant characteristics_ch1.* columns
+keep_cols <- c(
+  "title", "geo_accession",
+  "sex", "onset_age_yr", "duration_of_disease_yr",
+  "lct",
+  "tnmb_stage", "tnmb_staging_t", "tnmb_staging_n", "tnmb_staging_m", "tnmb_staging_b",
+  "os_time", "os_event",
+  "pfs_time", "pfs_event"
+)
+meta.ss <- meta[, keep_cols]
+
+meta.ss$onset_age_yr           <- as.numeric(meta.ss$onset_age_yr)
+meta.ss$duration_of_disease_yr <- suppressWarnings(as.numeric(meta.ss$duration_of_disease_yr))  # one true NA in source
+meta.ss$lct                    <- factor(meta.ss$lct, levels = c("NLCT", "LCT"))
+meta.ss$sex                    <- factor(meta.ss$sex)
+meta.ss$tnmb_stage             <- factor(meta.ss$tnmb_stage,
+                                      levels = c("IA","IB","IIA","IIB","IIIA","IIIB","IVA1","IVA2","IVB"))
+meta.ss$tnmb_staging_t         <- as.integer(meta.ss$tnmb_staging_t)
+meta.ss$tnmb_staging_n         <- as.integer(meta.ss$tnmb_staging_n)
+meta.ss$tnmb_staging_m         <- as.integer(meta.ss$tnmb_staging_m)
+meta.ss$tnmb_staging_b         <- as.integer(meta.ss$tnmb_staging_b)
+
+str(meta.ss)
+
+saveRDS(meta.ss, "surv.meta.ss.rds")
+```
+
+
+```{r load-saved}
+library(survival)
+library(survminer)
+mat  <- readRDS("~/Rstudio/CTCL/int/surv.mat.rds")
+meta <- readRDS("~/Rstudio/CTCL/int/surv.meta.ss.rds")
+logcpm <- edgeR::cpm(mat, log = TRUE)
+```
+
+```{r optimize_n_genes}
+res_skin  <- readRDS("results/res_skin_subtypes.rds")
+n_vals    <- c(5, 10, 15, 20, 25, 30, 40, 50, 75, 100)
+
+score_search <- lapply(n_vals, function(n) {
+  genes_up   <- intersect(res_skin %>% arrange(desc(t)) %>% slice_head(n = n) %>% pull(gene), rownames(logcpm))
+  genes_down <- intersect(res_skin %>% arrange(t)        %>% slice_head(n = n) %>% pull(gene), rownames(logcpm))
+
+  s_up   <- colMeans(logcpm[genes_up,   , drop = FALSE])
+  s_down <- colMeans(logcpm[genes_down, , drop = FALSE])
+
+  df <- meta %>%
+    rownames_to_column("sample") %>%
+    mutate(composite = s_up[sample] - s_down[sample]) %>%
+    filter(!is.na(os_time), !is.na(os_event), !is.na(pfs_time), !is.na(pfs_event), !is.na(composite))
+
+  cox_os  <- coxph(Surv(os_time,  os_event)  ~ composite, data = df)
+  cox_pfs <- coxph(Surv(pfs_time, pfs_event) ~ composite, data = df)
+
+  data.frame(
+    n         = n,
+    c_os      = concordance(cox_os)$concordance,
+    c_pfs     = concordance(cox_pfs)$concordance,
+    p_os      = summary(cox_os)$coefficients[, "Pr(>|z|)"],
+    p_pfs     = summary(cox_pfs)$coefficients[, "Pr(>|z|)"]
+  )
+})
+
+score_search_df <- bind_rows(score_search) %>%
+  pivot_longer(c(c_os, c_pfs), names_to = "endpoint", values_to = "cindex") %>%
+  mutate(endpoint = recode(endpoint, c_os = "OS", c_pfs = "PFS"))
+
+best_os  <- score_search_df %>% filter(endpoint == "OS")  %>% slice_max(cindex, n = 1)
+best_pfs <- score_search_df %>% filter(endpoint == "PFS") %>% slice_max(cindex, n = 1)
+message(sprintf("Best n for OS:  %d (C-index = %.3f)", best_os$n,  best_os$cindex))
+message(sprintf("Best n for PFS: %d (C-index = %.3f)", best_pfs$n, best_pfs$cindex))
+
+ggplot(score_search_df, aes(x = n, y = cindex, color = endpoint)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2.5) +
+  geom_vline(xintercept = best_os$n,  linetype = "dashed", color = "#E41A1C", linewidth = 0.4) +
+  geom_vline(xintercept = best_pfs$n, linetype = "dashed", color = "#377EB8", linewidth = 0.4) +
+  scale_color_manual(values = c("OS" = "#E41A1C", "PFS" = "#377EB8")) +
+  scale_x_continuous(breaks = n_vals) +
+  labs(x = "Number of genes (top/bottom n)", y = "C-index", color = "Endpoint",
+       title = "C-index by signature size",
+       caption = "Dashed lines = optimal n per endpoint. Note: optimized on same data — exploratory only.") +
+  theme_classic(base_size = 11)
+```
+
+```{r km_by_n}
+for (n in n_vals) {
+  genes_up   <- intersect(res_skin %>% arrange(desc(t)) %>% slice_head(n = n) %>% pull(gene), rownames(logcpm))
+  genes_down <- intersect(res_skin %>% arrange(t)        %>% slice_head(n = n) %>% pull(gene), rownames(logcpm))
+
+  s_up   <- colMeans(logcpm[genes_up,   , drop = FALSE])
+  s_down <- colMeans(logcpm[genes_down, , drop = FALSE])
+
+  df <- meta %>%
+    rownames_to_column("sample") %>%
+    mutate(
+      composite     = s_up[sample] - s_down[sample],
+      subtype_class = factor(ifelse(composite >= mean(composite, na.rm = TRUE),
+                                    "Subtype2-like", "Subtype1-like"),
+                             levels = c("Subtype1-like", "Subtype2-like"))
+    ) %>%
+    filter(!is.na(os_time), !is.na(os_event), !is.na(subtype_class))
+
+  print(plot_km(df, "subtype_class", paste0("OS — n = ", n, " genes per direction")))
+}
+```
+
+```{r subtype_survival}
+res_skin <- readRDS("results/res_skin_subtypes.rds")
+
+# top 25 up (Subtype2-high) and bottom 25 (Subtype1-high) by t
+top25_up   <- res_skin %>% arrange(desc(t)) %>% slice_head(n = 25) %>% pull(gene)
+top25_down <- res_skin %>% arrange(t)        %>% slice_head(n = 25) %>% pull(gene)
+
+genes_up   <- intersect(top25_up,   rownames(logcpm))
+genes_down <- intersect(top25_down, rownames(logcpm))
+
+# mean expression scores per sample
+score_up   <- colMeans(logcpm[genes_up,   , drop = FALSE])
+score_down <- colMeans(logcpm[genes_down, , drop = FALSE])
+
+surv_df <- meta %>%
+  rownames_to_column("sample") %>%
+  mutate(
+    score_up   = score_up[sample],
+    score_down = score_down[sample],
+    high_up    = score_up   >= mean(score_up,   na.rm = TRUE),
+    high_down  = score_down >= mean(score_down, na.rm = TRUE),
+    subtype_class = case_when(
+       high_up & !high_down ~ "Subtype2-like",
+      !high_up &  high_down ~ "Subtype1-like",
+      TRUE ~ NA_character_
+    )
+  )
+
+plot_km <- function(df, group_var, title, time_var = "os_time", event_var = "os_event") {
+  df <- df[!is.na(df[[group_var]]) & !is.na(df[[time_var]]) & !is.na(df[[event_var]]), ]
+  form <- as.formula(paste0("Surv(", time_var, ", ", event_var, ") ~ ", group_var))
+  fit  <- eval(bquote(survfit(.(form), data = df)))
+  ggsurvplot(fit, data = df, pval = TRUE, risk.table = TRUE,
+             title = title, xlab = "Time (months)", legend.title = group_var,
+             ggtheme = theme_classic(base_size = 11))
+}
+
+km_up    <- plot_km(surv_df %>% mutate(group = ifelse(high_up,   "High", "Low")), "group", "Subtype2 score (up genes)")
+km_down  <- plot_km(surv_df %>% mutate(group = ifelse(high_down, "High", "Low")), "group", "Subtype1 score (down genes)")
+km_class <- plot_km(surv_df, "subtype_class", "Combined subtype class")
+
+km_up
+km_down
+km_class
+```
+
+```{r lct_survival}
+km_lct <- plot_km(surv_df, "lct", "LCT status")
+km_lct
+```
+
+```{r lct_deg}
+library(limma)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+
+meta_lct <- meta[colnames(logcpm), ]
+meta_lct$lct <- factor(meta_lct$lct, levels = c("NLCT", "LCT"))
+design <- model.matrix(~ lct, data = meta_lct)
+
+fit_lct <- lmFit(logcpm, design)
+fit_lct <- eBayes(fit_lct)
+
+res_lct <- topTable(fit_lct, coef = "lctLCT", number = Inf) %>%
+  rownames_to_column("gene") %>%
+  mutate(sig = adj.P.Val < 0.05) %>%
+  arrange(adj.P.Val)
+
+message(sprintf("LCT vs NLCT significant DEGs: %d", sum(res_lct$sig)))
+
+lfc_lim_lct <- quantile(abs(res_lct$logFC), 0.99)
+ggplot(res_lct, aes(x = logFC, y = -log10(P.Value),
+                     color = pmin(pmax(logFC, -lfc_lim_lct), lfc_lim_lct),
+                     size = abs(t))) +
+  geom_point(alpha = 0.6) +
+  scale_color_gradient2(low = "steelblue", mid = "grey80", high = "firebrick",
+                        midpoint = 0, limits = c(-lfc_lim_lct, lfc_lim_lct), name = "log2FC") +
+  scale_size_continuous(range = c(0.3, 3), name = "|t|") +
+  geom_hline(yintercept = -log10(0.05 / nrow(res_lct)), linetype = "dashed", linewidth = 0.4) +
+  labs(x = "log2FC (LCT vs NLCT)", y = "-log10(p-value)", title = "LCT vs NLCT DEGs") +
+  theme_classic(base_size = 11)
+```
+
+```{r lct_vs_subtype}
+res_skin <- readRDS("results/res_skin_subtypes.rds")
+
+shared <- inner_join(
+  res_lct  %>% select(gene, t_lct = t, lfc_lct = logFC, sig_lct = sig),
+  res_skin %>% select(gene, t_sub = t, lfc_sub = logFC, sig_sub = sig),
+  by = "gene"
+)
+
+cor_val <- cor(shared$t_lct, shared$t_sub, method = "spearman")
+message(sprintf("Spearman correlation of t-statistics: %.3f", cor_val))
+
+shared <- shared %>%
+  mutate(concordance = case_when(
+    sig_lct & sig_sub ~ "Both significant",
+    sig_lct           ~ "LCT only",
+    sig_sub           ~ "Subtype only",
+    TRUE              ~ "Neither"
+  ))
+
+ggplot(shared, aes(x = t_sub, y = t_lct, color = concordance)) +
+  geom_point(size = 0.8, alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE, color = "black", linewidth = 0.5) +
+  scale_color_manual(values = c("Both significant" = "firebrick",
+                                "LCT only"         = "#FF7F00",
+                                "Subtype only"     = "#377EB8",
+                                "Neither"          = "grey70")) +
+  annotate("text", x = Inf, y = -Inf, hjust = 1.1, vjust = -0.5,
+           label = sprintf("rho = %.3f", cor_val), size = 3.5) +
+  labs(x = "t statistic (Subtype2 vs Subtype1)",
+       y = "t statistic (NLCT vs LCT)",
+       title = "Subtype vs LCT DEG concordance") +
+  theme_classic(base_size = 11)
+```
+
+```{r subtype_within_lct}
+for (lct_grp in c("LCT", "NLCT")) {
+  df_sub <- surv_df %>%
+    filter(lct == lct_grp) %>%
+    mutate(
+      s2_group = ifelse(score_up   >= mean(score_up,   na.rm = TRUE), "S2-high", "S2-low"),
+      s1_group = ifelse(score_down >= mean(score_down, na.rm = TRUE), "S1-high", "S1-low")
+    )
+
+  print(plot_km(df_sub, "s2_group", paste0(lct_grp, ": Subtype2 score")))
+  print(plot_km(df_sub, "s1_group", paste0(lct_grp, ": Subtype1 score")))
+}
+```
+
+```{r cox_composite_score}
+cox_df <- surv_df %>%
+  filter(!is.na(os_time), !is.na(os_event), !is.na(lct), !is.na(score_up), !is.na(score_down)) %>%
+  mutate(
+    lct            = factor(lct, levels = c("NLCT", "LCT")),
+    composite_z    = scale(score_up - score_down)[, 1]
+  )
+
+cox_lct_uni  <- coxph(Surv(os_time, os_event) ~ lct,         data = cox_df)
+cox_comp_uni <- coxph(Surv(os_time, os_event) ~ composite_z, data = cox_df)
+cox_multi1   <- coxph(Surv(os_time, os_event) ~ lct + composite_z, data = cox_df)
+
+cat("── Univariate: LCT ──\n");             print(summary(cox_lct_uni)$coefficients)
+cat("── Univariate: composite score ──\n"); print(summary(cox_comp_uni)$coefficients)
+cat("── Multivariate ──\n");               print(summary(cox_multi1)$coefficients)
+
+ggforest(cox_multi1, data = cox_df,
+         main = "Multivariate Cox: LCT + composite subtype score")
+```
+
+```{r cox_binary_subtype}
+cox_df2 <- surv_df %>%
+  filter(!is.na(os_time), !is.na(os_event), !is.na(lct), !is.na(score_up), !is.na(score_down)) %>%
+  mutate(
+    lct           = factor(lct, levels = c("NLCT", "LCT")),
+    composite     = score_up - score_down,
+    subtype_class = factor(ifelse(composite >= median(composite), "Subtype2-like", "Subtype1-like"),
+                           levels = c("Subtype1-like", "Subtype2-like"))
+  )
+
+cox_sub_uni <- coxph(Surv(os_time, os_event) ~ subtype_class, data = cox_df2)
+cox_multi2  <- coxph(Surv(os_time, os_event) ~ lct + subtype_class, data = cox_df2)
+
+cat("── Univariate: subtype class ──\n"); print(summary(cox_sub_uni)$coefficients)
+cat("── Multivariate ──\n");             print(summary(cox_multi2)$coefficients)
+
+ggforest(cox_multi2, data = cox_df2,
+         main = "Multivariate Cox: LCT + binary subtype class")
+```
+
+```{r subtype_lct_association}
+# Fisher's exact test: are subtypes distributed independently of LCT?
+assoc_tbl <- table(cox_df2$subtype_class, cox_df2$lct)
+print(assoc_tbl)
+fisher.test(assoc_tbl)
+```
+
+```{r cindex_improvement}
+# C-index: does adding the composite score improve discrimination over LCT alone?
+c_lct   <- concordance(cox_lct_uni)
+c_multi <- concordance(cox_multi1)
+
+cat(sprintf("C-index — LCT alone:          %.3f (SE: %.3f)\n", c_lct$concordance,   sqrt(c_lct$var)))
+cat(sprintf("C-index — LCT + composite:    %.3f (SE: %.3f)\n", c_multi$concordance, sqrt(c_multi$var)))
+cat(sprintf("Delta C-index:                %.3f\n", c_multi$concordance - c_lct$concordance))
+```
+
+```{r lrt_nested_cox}
+# Likelihood ratio test: does composite score improve model fit over LCT alone?
+lrt <- anova(cox_lct_uni, cox_multi1, test = "LRT")
+print(lrt)
+```
+
+```{r composite_by_lct}
+# Is the composite score distribution different between LCT and NLCT?
+wilcox.test(composite ~ lct, data = cox_df2)
+
+ggplot(cox_df2, aes(x = lct, y = composite, fill = lct)) +
+  geom_boxplot(outlier.shape = NA, width = 0.5) +
+  geom_jitter(width = 0.15, size = 1.5, alpha = 0.7) +
+  scale_fill_manual(values = c("NLCT" = "#F8766D", "LCT" = "#00BFC4")) +
+  labs(x = NULL, y = "Composite subtype score (S2 – S1)",
+       title = "Subtype score by LCT status") +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "none")
+```
+
+```{r km_nlct_only}
+# KM within NLCT only — if score separates here, LCT cannot explain it
+nlct_df <- cox_df2 %>% filter(lct == "NLCT")
+plot_km(nlct_df, "subtype_class", "NLCT only: Subtype1-like vs Subtype2-like")
+```
+
+```{r timedep_auc_os}
+#install.packages("timeROC")
+library(timeROC)
+
+# build a clean df with all predictors, complete cases only
+auc_df <- cox_df2 %>%
+  filter(!is.na(os_time), !is.na(os_event), !is.na(composite), !is.na(lct)) %>%
+  mutate(lct_bin = as.integer(lct == "LCT"))
+
+times <- c(12, 24, 36, 48, 60)
+
+roc_comp <- timeROC(T = auc_df$os_time, delta = auc_df$os_event,
+                    marker = auc_df$composite, cause = 1,
+                    times = times, iid = TRUE)
+
+roc_lct  <- timeROC(T = auc_df$os_time, delta = auc_df$os_event,
+                    marker = auc_df$lct_bin, cause = 1,
+                    times = times, iid = TRUE)
+
+auc_os_df <- bind_rows(
+  data.frame(time = times, AUC = roc_comp$AUC, se = roc_comp$inference$vect_sd_1, predictor = "Composite score"),
+  data.frame(time = times, AUC = roc_lct$AUC,  se = roc_lct$inference$vect_sd_1,  predictor = "LCT binary")
+) %>%
+  mutate(lo = AUC - 1.96 * se, hi = AUC + 1.96 * se)
+
+ggplot(auc_os_df, aes(x = time, y = AUC, color = predictor, fill = predictor)) +
+  geom_line(linewidth = 0.9) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.15, color = NA) +
+  geom_point(size = 2.5) +
+  scale_x_continuous(breaks = times) +
+  scale_color_manual(values = c("Composite score" = "#E41A1C", "LCT binary" = "#377EB8")) +
+  scale_fill_manual(values  = c("Composite score" = "#E41A1C", "LCT binary" = "#377EB8")) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", linewidth = 0.4) +
+  ylim(0.4, 1) +
+  labs(x = "Time (months)", y = "Time-dependent AUC",
+       title = "OS: composite score vs LCT binary", color = NULL, fill = NULL) +
+  theme_classic(base_size = 11)
+
+# formal AUC difference test at each time point
+cat("── OS: AUC difference (composite - LCT) ──\n")
+for (i in seq_along(times)) {
+  cmp <- compare(roc_comp, roc_lct, adjusted = FALSE)
+  cat(sprintf("t=%d mo: ΔAUC=%.3f, p=%.3f\n", times[i],
+              roc_comp$AUC[i] - roc_lct$AUC[i], cmp$p_values_AUC[i]))
+}
+```
+
+```{r timedep_auc_pfs}
+auc_df_pfs <- cox_df2 %>%
+  filter(!is.na(pfs_time), !is.na(pfs_event), !is.na(composite), !is.na(lct)) %>%
+  mutate(lct_bin = as.integer(lct == "LCT"))
+
+roc_comp_pfs <- timeROC(T = auc_df_pfs$pfs_time, delta = auc_df_pfs$pfs_event,
+                         marker = auc_df_pfs$composite, cause = 1,
+                         times = times, iid = TRUE)
+
+roc_lct_pfs  <- timeROC(T = auc_df_pfs$pfs_time, delta = auc_df_pfs$pfs_event,
+                         marker = auc_df_pfs$lct_bin, cause = 1,
+                         times = times, iid = TRUE)
+
+auc_pfs_df <- bind_rows(
+  data.frame(time = times, AUC = roc_comp_pfs$AUC, se = roc_comp_pfs$inference$vect_sd_1, predictor = "Composite score"),
+  data.frame(time = times, AUC = roc_lct_pfs$AUC,  se = roc_lct_pfs$inference$vect_sd_1,  predictor = "LCT binary")
+) %>%
+  mutate(lo = AUC - 1.96 * se, hi = AUC + 1.96 * se)
+
+ggplot(auc_pfs_df, aes(x = time, y = AUC, color = predictor, fill = predictor)) +
+  geom_line(linewidth = 0.9) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.15, color = NA) +
+  geom_point(size = 2.5) +
+  scale_x_continuous(breaks = times) +
+  scale_color_manual(values = c("Composite score" = "#E41A1C", "LCT binary" = "#377EB8")) +
+  scale_fill_manual(values  = c("Composite score" = "#E41A1C", "LCT binary" = "#377EB8")) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", linewidth = 0.4) +
+  ylim(0.4, 1) +
+  labs(x = "Time (months)", y = "Time-dependent AUC",
+       title = "PFS: composite score vs LCT binary", color = NULL, fill = NULL) +
+  theme_classic(base_size = 11)
+
+cat("── PFS: AUC difference (composite - LCT) ──\n")
+for (i in seq_along(times)) {
+  cmp <- compare(roc_comp_pfs, roc_lct_pfs, adjusted = FALSE)
+  cat(sprintf("t=%d mo: ΔAUC=%.3f, p=%.3f\n", times[i],
+              roc_comp_pfs$AUC[i] - roc_lct_pfs$AUC[i], cmp$p_values_AUC[i]))
+}
+```
+
+```{r cindex_difference}
+# formal test of C-index difference between continuous score and LCT binary
+cox_lct_bin  <- coxph(Surv(os_time, os_event) ~ lct_bin,   data = auc_df)
+cox_comp_con <- coxph(Surv(os_time, os_event) ~ composite, data = auc_df)
+
+c_lct_bin  <- concordance(cox_lct_bin)
+c_comp_con <- concordance(cox_comp_con)
+
+# contrast: difference and its SE
+c_diff <- concordance(cox_lct_bin, cox_comp_con)
+cat(sprintf("C-index LCT binary:       %.3f (SE %.3f)\n", c_lct_bin$concordance,  sqrt(c_lct_bin$var)))
+cat(sprintf("C-index composite score:  %.3f (SE %.3f)\n", c_comp_con$concordance, sqrt(c_comp_con$var)))
+diff_est <- c_comp_con$concordance - c_lct_bin$concordance
+diff_se  <- sqrt(sum(c_diff$var) - 2 * c_diff$var[3])
+cat(sprintf("Delta C-index:            %.3f (95%% CI: %.3f – %.3f, p=%.3f)\n",
+            diff_est,
+            diff_est - 1.96 * diff_se,
+            diff_est + 1.96 * diff_se,
+            2 * pnorm(-abs(diff_est / diff_se))))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

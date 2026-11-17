@@ -1,0 +1,270 @@
+---
+title: "fig2"
+output: html_document
+date: "2026-04-17"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(BPCells)
+library(Seurat)
+library(tidyverse)
+library(future)
+library(ggplot2)
+library(patchwork)
+
+plan(multisession, workers = 16)
+options(future.globals.maxSize = 8 * 1024^3)
+```
+
+```{r load}
+obj <- readRDS("../fig1/results/obj.fig1.rds")
+```
+
+```{r subset_tcells}
+t.cells <- subset(obj, celltype == "T_Cells")
+
+umap_df <- as.data.frame(Embeddings(t.cells, "umap"))
+
+keep <- rownames(umap_df)[
+  abs(umap_df$UMAP_1 - mean(umap_df$UMAP_1)) < 3 * sd(umap_df$UMAP_1) &
+  abs(umap_df$UMAP_2 - mean(umap_df$UMAP_2)) < 3 * sd(umap_df$UMAP_2)
+]
+
+cat("T cells before filtering:", ncol(t.cells), "\n")
+t.cells <- t.cells[, keep]
+cat("T cells after filtering: ", ncol(t.cells), "\n")
+```
+
+```{r}
+DimPlot(t.cells, group.by = "cloneSize", label = F, pt.size = 1, alpha = 1, raster = T, raster.dpi = c(2048, 2048)) +
+  NoLegend() + ggtitle(NULL)
+ggsave("figs/umap.t.cells.cloneSize.pdf", height = 5, width = 5, dpi = 600)
+
+DimPlot(t.cells, group.by = "cloneSize", label = F, pt.size = 1, alpha = 1, raster = T, raster.dpi = c(1024, 1024)) +
+  theme_void() +
+  theme(plot.title = element_blank(), plot.margin = margin(0, 0, 0, 0),
+        legend.position = "none", aspect.ratio = 1)
+ggsave("figs/umap.t.cells.cloneSize.png", height = 8, width = 8, dpi = 600, bg = "transparent")
+```
+
+```{r marker_density}
+genes <- c("CD3E", "CD4", "CD8A", "CD8B", "FOXP3", "TRDC", "NCAM1", "MKI67")
+
+FeaturePlot(t.cells, features = genes, ncol = 4, pt.size = 4, order = TRUE,
+            raster = TRUE, raster.dpi = c(3600, 1800)) &
+  theme(legend.position  = "none",
+        plot.title       = element_blank(),
+        axis.title       = element_blank(),
+        axis.text        = element_blank(),
+        axis.ticks       = element_blank(),
+        axis.line        = element_blank())
+ggsave("figs/featureplot.tcells.markers.pdf", height = 6, width = 12, dpi = 600)
+
+FeaturePlot(t.cells, features = genes, ncol = 4, pt.size = 2, order = TRUE,
+            raster = TRUE, raster.dpi = c(1024, 1024)) &
+  theme(legend.position  = "none",
+        plot.title       = element_blank(),
+        axis.title       = element_blank(),
+        axis.text        = element_blank(),
+        axis.ticks       = element_blank(),
+        axis.line        = element_blank())
+ggsave("figs/featureplot.tcells.markers.png", height = 6, width = 12, dpi = 600)
+```
+
+```{r clonesize_proportions}
+table(t.cells$cloneSize)
+clone_levels <- c("Hyperexpanded (0.1 < X <= 1)", "Large (0.01 < X <= 0.1)",
+                  "Medium (0.001 < X <= 0.01)", "Small (1e-04 < X <= 0.001)",
+                  "Rare (0 < X <= 1e-04)", "Missing")
+
+clone_colors <- c(
+  "Hyperexpanded (0.1 < X <= 1)" = "#F8766D",
+  "Large (0.01 < X <= 0.1)"      = "#A3A500",
+  "Medium (0.001 < X <= 0.01)"   = "#00BF7D",
+  "Small (1e-04 < X <= 0.001)"   = "#00B0F6",
+  "Rare (0 < X <= 1e-04)"        = "#E76BF3",
+  "Missing"                      = "#999999"
+)
+
+clone_df <- t.cells@meta.data %>%
+  mutate(cloneSize = ifelse(is.na(cloneSize), "Missing", as.character(cloneSize)),
+         cloneSize = factor(cloneSize, levels = clone_levels)) %>%
+  group_by(orig.merge, cloneSize) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  complete(orig.merge, cloneSize, fill = list(n = 0)) %>%
+  group_by(orig.merge) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+sample_order <- clone_df %>%
+  select(orig.merge, cloneSize, prop) %>%
+  pivot_wider(names_from = cloneSize, values_from = prop, values_fill = 0) %>%
+  arrange(desc(Missing == 1), `Hyperexpanded (0.1 < X <= 1)`) %>%
+  pull(orig.merge)
+
+clone_df <- clone_df %>%
+  mutate(orig.merge = factor(orig.merge, levels = sample_order))
+
+ggplot(clone_df, aes(x = orig.merge, y = prop, fill = cloneSize)) +
+  geom_bar(stat = "identity", width = 1, color = "white", linewidth = 0.15,
+           position = position_stack(reverse = TRUE)) +
+  scale_fill_manual(values = clone_colors) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(x = NULL, y = "Proportion") +
+  theme_classic() +
+  theme(axis.text.x  = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.y  = element_text(size = 8),
+        legend.position = "none")
+ggsave("figs/barplot.clonesize.proportions.pdf", height = 4, width = 15, dpi = 600)
+```
+
+
+
+```{r}
+s10 <- subset(t.cells, orig.ident == "S10")
+table(s10$orig.ident)
+
+s10 <- FindVariableFeatures(s10, nfeatures = 1000)
+s10 <- ScaleData(s10)
+s10 <- RunPCA(s10)
+s10 <- RunUMAP(s10, dims = 1:10)
+
+tmp <- FindMarkers(s10, ident.1 = "CTCL", ident.2 = "T_Cells", group.by = "celltype.malig")
+tmp$dif <- tmp$pct.1 - tmp$pct.2
+
+DimPlot(s10, group.by = "cloneSize", cols = clone_colors)
+FeaturePlot(s10, features = "TRDC")
+FeaturePlot(s10, features = "TRDV1")
+FeaturePlot(s10, features = "TRGV2")
+FeaturePlot(s10, features = "IL32")
+
+p1 <- DimPlot(s10, group.by = "cloneSize", reduction = "umap", cols = clone_colors)
+p2 <- FeaturePlot(s10, features = "TRDV1", reduction = "umap")
+p3 <- FeaturePlot(s10, features = "TRGV2", reduction = "umap")
+p4 <- FeaturePlot(s10, features = "TOX", reduction = "umap")
+p5 <- FeaturePlot(s10, features = "CD7", reduction = "umap")
+p6 <- FeaturePlot(s10, features = "S100A6", reduction = "umap")
+
+combined_row <- (p1 + p2 + p3 + p4 + p5 + p6) +
+  plot_layout(nrow = 1) &
+  theme_void() &
+  NoLegend() &
+  theme(plot.title = element_blank(),
+        plot.margin = margin(0, 16, 0, 16))
+combined_row
+ggsave("figs/s10_plots.png", plot = combined_row, height = 4, width = 28)
+```
+
+
+```{r}
+s99 <- subset(t.cells, orig.ident == "S99")
+table(s99$orig.ident)
+
+s99 <- FindVariableFeatures(s99, nfeatures = 1000)
+s99 <- ScaleData(s99)
+s99 <- RunPCA(s99)
+s99 <- RunUMAP(s99, dims = 1:10)
+
+tmp <- FindMarkers(s99, ident.1 = "CTCL", ident.2 = "T_Cells", group.by = "celltype.malig")
+tmp$dif <- tmp$pct.1 - tmp$pct.2
+
+DimPlot(s99, group.by = "cloneSize", cols = clone_colors)
+FeaturePlot(s99, features = "TRBV30")
+FeaturePlot(s99, features = "TRAV27")
+FeaturePlot(s99, features = "TRAV26-1")
+FeaturePlot(s99, features = "IL32")
+
+p1 <- DimPlot(s99, group.by = "cloneSize", reduction = "umap", cols = clone_colors)
+p2 <- FeaturePlot(s99, features = "TRAV27", reduction = "umap")
+p3 <- FeaturePlot(s99, features = "TRBV30", reduction = "umap")
+p4 <- FeaturePlot(s99, features = "TOX", reduction = "umap")
+p5 <- FeaturePlot(s99, features = "CD7", reduction = "umap")
+p6 <- FeaturePlot(s99, features = "SPINT2", reduction = "umap")
+
+combined_row <- (p1 + p2 + p3 + p4 + p5 + p6) +
+  plot_layout(nrow = 1) &
+  theme_void() &
+  NoLegend() &
+  theme(plot.title = element_blank(),
+        plot.margin = margin(0, 16, 0, 16))
+combined_row
+ggsave("figs/s99_plots.png", plot = combined_row, height = 4, width = 28)
+```
+
+
+```{r}
+s126 <- subset(t.cells, orig.ident == "S126")
+table(s126$orig.ident)
+
+s126 <- FindVariableFeatures(s126, nfeatures = 1000)
+s126 <- ScaleData(s126)
+s126 <- RunPCA(s126)
+s126 <- RunUMAP(s126, dims = 1:10)
+
+tmp <- FindMarkers(s126, ident.1 = "CTCL", ident.2 = "T_Cells", group.by = "celltype.malig")
+tmp$dif <- tmp$pct.1 - tmp$pct.2
+
+DimPlot(s126, group.by = "cloneSize", cols = clone_colors)
+
+FeaturePlot(s126, features = "CD4")
+FeaturePlot(s126, features = "CD8A")
+FeaturePlot(s126, features = "FOXP3")
+FeaturePlot(s126, features = "TRDC")
+FeaturePlot(s126, features = "TRAV21")
+FeaturePlot(s126, features = "TRBV13")
+FeaturePlot(s126, features = "ID3")
+
+p1 <- DimPlot(s126, group.by = "cloneSize", reduction = "umap", cols = clone_colors)
+p2 <- FeaturePlot(s126, features = "TRAV21", reduction = "umap")
+p3 <- FeaturePlot(s126, features = "TRBV13", reduction = "umap")
+p4 <- FeaturePlot(s126, features = "TOX", reduction = "umap")
+p5 <- FeaturePlot(s126, features = "CD7", reduction = "umap")
+p6 <- FeaturePlot(s126, features = "ID3", reduction = "umap")
+
+combined_row <- (p1 + p2 + p3 + p4 + p5 + p6) +
+  plot_layout(nrow = 1) &
+  theme_void() &
+  NoLegend() &
+  theme(plot.title = element_blank(),
+        plot.margin = margin(0, 16, 0, 16))
+combined_row
+ggsave("figs/s126_plots.png", plot = combined_row, height = 4, width = 28)
+
+PCHeatmap(s126, 1:3)
+
+pca <- as.matrix(s126@reductions[["pca"]]@feature.loadings)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

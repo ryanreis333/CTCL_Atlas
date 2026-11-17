@@ -1,0 +1,2777 @@
+---
+title: "fig7"
+output: html_document
+date: "2026-04-17"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, cache = FALSE)
+```
+
+# Libraries
+
+```{r libraries}
+library(Seurat)
+library(BPCells)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(ggrepel)
+library(patchwork)
+library(pheatmap)
+library(edgeR)
+library(variancePartition)
+library(BiocParallel)
+library(conflicted)
+conflicts_prefer(
+  dplyr::filter, dplyr::select, dplyr::mutate, dplyr::arrange,
+  dplyr::summarise, dplyr::summarize, dplyr::rename, dplyr::count,
+  dplyr::lag, dplyr::desc, dplyr::first, dplyr::last,
+  dplyr::slice, dplyr::group_by, dplyr::ungroup, dplyr::n,
+  base::intersect, base::setdiff, base::union,
+  base::as.data.frame, base::Reduce, base::cbind, base::rbind,
+  base::pmin, base::pmax, base::table, base::which,
+  variancePartition::eBayes, variancePartition::topTable,
+  ComplexHeatmap::pheatmap,
+  .quiet = TRUE
+)
+
+BPPARAM <- MulticoreParam(16)
+
+# ── Shared color palette ───────────────────────────────────────────────────────
+col_subtype <- c("Subtype_1" = "#B2182B", "Subtype_2" = "#2166AC")
+
+# Tissue — muted Tableau-10, matches fig1/fig4 tissue_cols
+tissue_cols <- c(
+  "blood"       = "#E15759",
+  "lymph node"  = "#59A14F",
+  "skin"        = "#4E79A7"
+)
+
+# Malignant phenotype — no project-wide standard; fig7-local
+pheno_cols <- c(
+  "GDT" = "#A65628",
+  "CD8" = "#56B4E9",
+  "CD4" = "#E41A1C"
+)
+
+# Molecular subtype — matches fig4/fig5/fig6 subtype_cols; Blood keyed to tissue blood
+subtype_cols <- c(
+  "ND"        = "#AAAAAA",
+  "Blood"     = "#E15759",
+  "Subtype_1" = "#B2182B",
+  "Subtype_2" = "#2166AC"
+)
+
+# Sample.Type.simple — lesion hues match fig5/fig6 lesion_cols;
+# blood / lymph node keyed to tissue_cols, Nonlesional grey = ND
+stype_cols <- c(
+  "Blood"        = "#E15759",
+  "lymph node"   = "#59A14F",
+  "Nonlesional"  = "#AAAAAA",
+  "Patch_Plaque" = "#E69F00",
+  "Tumor"        = "#9F86C0",
+  "Erythroderma" = "#E07A5F"
+)
+
+theme_fig <- theme_classic(base_size = 11) +
+  theme(
+    plot.title  = element_text(face = "bold", size = 11),
+    legend.text = element_text(size = 9),
+    axis.text   = element_text(size = 9)
+  )
+```
+
+---
+
+# Load & Prepare Malignant CTCL T Cells
+
+```{r load_data}
+ctcl <- readRDS("../fig1/results/obj.fig1.rds")
+
+# ── Subtype assignment from fig4 consensus clustering (k=4, S1 and S2) ────────
+subtype_df_fig4 <- readRDS("../fig4/results/subtype_df.rds") %>%
+  mutate(orig.merge = sub("__[^_]+$", "", sample))
+
+s1_samples    <- subtype_df_fig4$orig.merge[subtype_df_fig4$subtype == "Subtype_1"]
+s2_samples    <- subtype_df_fig4$orig.merge[subtype_df_fig4$subtype == "Subtype_2"]
+blood_samples <- subtype_df_fig4$orig.merge[subtype_df_fig4$subtype == "Subtype_3"]
+
+# Any orig.merge that is blood tissue gets forced to Blood, even if misclustered as S1/S2
+blood_origs   <- unique(ctcl$orig.merge[tolower(ctcl$Tissue) == "blood"])
+s1_samples    <- setdiff(s1_samples, blood_origs)
+s2_samples    <- setdiff(s2_samples, blood_origs)
+blood_samples <- union(blood_samples, blood_origs)
+
+ctcl$subtype.ctcl <- case_when(
+  ctcl$orig.merge %in% s1_samples    ~ "Subtype_1",
+  ctcl$orig.merge %in% s2_samples    ~ "Subtype_2",
+  ctcl$orig.merge %in% blood_samples ~ "Blood",
+  TRUE                               ~ "ND"
+)
+ctcl$subtype.ctcl <- factor(ctcl$subtype.ctcl,
+                             levels = c("ND", "Blood", "Subtype_1", "Subtype_2"))
+
+ctcl$CTCL_Phenotype <- case_when(
+  ctcl$malig.pheno %in% c("CD4", "DNT") ~ "CD4",
+  ctcl$malig.pheno == "CD8"             ~ "CD8",
+  ctcl$malig.pheno == "GDT"             ~ "GDT",
+  TRUE                                  ~ "ND"
+)
+
+cat("Samples — Subtype_1:", length(unique(ctcl$orig.merge[ctcl$subtype.ctcl == "Subtype_1"])),
+    "| Subtype_2:", length(unique(ctcl$orig.merge[ctcl$subtype.ctcl == "Subtype_2"])), "\n")
+cat("Cohorts:", length(unique(ctcl$GEO.Cohort)), "\n")
+table(ctcl$CTCL_Phenotype)
+```
+
+---
+
+# Panel A — Pseudobulk logCPM Heatmap (CTCL Cells per Sample)
+
+```{r pseudobulk_logcpm}
+ctcl_malig <- subset(ctcl, celltype.malig == "CTCL")
+
+pb <- AggregateExpression(
+  ctcl_malig,
+  group.by      = "orig.merge",
+  assays        = "RNA",
+  return.seurat = FALSE
+)$RNA
+
+# malignant CTCL cells contributing to each pseudobulk sample
+ncell_malig <- table(ctcl_malig$orig.merge)
+
+dge    <- DGEList(counts = pb)
+dge    <- calcNormFactors(dge)
+# prior.count = 3 damps low-count marker noise (FOXP3, AIRE, IL2RA, ...)
+logcpm <- cpm(dge, log = TRUE, prior.count = 3)
+
+# Drop unreliable small pseudobulks (< MIN_CELLS malignant cells). This filters
+# `logcpm`, which flows into `sample_meta` (via the Panel A column intersect) and
+# therefore into every downstream panel that reads `sample_meta`. `pb` (raw
+# counts) is left intact for the panels that rebuild their own DGEList.
+MIN_CELLS    <- 10
+keep_display <- names(ncell_malig)[ncell_malig >= MIN_CELLS]
+logcpm       <- logcpm[, colnames(logcpm) %in% keep_display, drop = FALSE]
+
+cat("Pseudobulk matrix:", nrow(logcpm), "genes x", ncol(logcpm), "samples",
+    "(dropped", sum(ncell_malig < MIN_CELLS), "samples with <", MIN_CELLS, "cells)\n")
+```
+
+```{r gene_groups}
+gene_groups <- list(
+  "Lineage"      = c("PTPRC", "CD3D", "CD3E", "CD3G", "CD4", "FOXP3", "CD8A", "CD8B", "TRDC", "CD2", "CD5"),
+  "Diagnosis"    = c("CD7", "DPP4", "TOX", "GATA3", "PLS3", "AIRE", "CD164", "CADM1"),
+  "Targets"      = c("CCR4", "TNFRSF8", "IL2RA", "CD52", "KIR3DL2"),
+  "Homing"       = c("CCR7", "SELL", "CCR10", "CD69", "ITGAE"),
+  "Checkpoints"  = c("PDCD1", "CD274", "CTLA4", "LAG3", "TIGIT"),
+  "HLA Class I"  = c("HLA-A", "HLA-B", "HLA-C"),
+  "HLA Class II" = c("HLA-DRA", "HLA-DRB1", "HLA-DRB5", "HLA-DQA1", "HLA-DQB1",
+                     "HLA-DPA1", "HLA-DPB1")
+)
+
+genes_ordered <- lapply(gene_groups, function(g) intersect(g, rownames(logcpm)))
+genes_ordered <- genes_ordered[sapply(genes_ordered, length) > 0]
+
+gene_vec <- unlist(genes_ordered)
+gap_rows <- cumsum(sapply(genes_ordered, length))
+gap_rows <- gap_rows[-length(gap_rows)]
+
+mat <- logcpm[gene_vec, , drop = FALSE]
+
+cat("Genes in heatmap:", length(gene_vec), "\n")
+cat("Missing genes:", setdiff(unlist(gene_groups), rownames(logcpm)), "\n")
+```
+
+```{r sample_metadata}
+sample_meta <- ctcl_malig@meta.data %>%
+  distinct(orig.merge, .keep_all = TRUE) %>%
+  select(orig.merge, Tissue, CTCL_Phenotype, subtype.ctcl, Sample.Type.simple, GEO.Cohort) %>%
+  remove_rownames() %>%
+  column_to_rownames("orig.merge")
+
+common_samples <- intersect(colnames(mat), rownames(sample_meta))
+mat            <- mat[, common_samples, drop = FALSE]
+sample_meta    <- sample_meta[common_samples, , drop = FALSE]
+
+tissue_order  <- c("blood", "lymph node", "skin")
+pheno_order   <- c("GDT", "CD8", "CD4")
+subtype_order <- c("ND", "Blood", "Subtype_1", "Subtype_2")
+stype_order   <- c("Blood", "lymph node", "Nonlesional", "Patch_Plaque", "Tumor", "Erythroderma")
+
+sample_meta <- sample_meta %>%
+  mutate(
+    Sample.Type.simple = ifelse(is.na(Sample.Type.simple), Tissue, Sample.Type.simple),
+    Tissue             = factor(Tissue,             levels = tissue_order),
+    CTCL_Phenotype     = factor(CTCL_Phenotype,     levels = pheno_order),
+    subtype.ctcl       = factor(subtype.ctcl,       levels = subtype_order),
+    Sample.Type.simple = factor(Sample.Type.simple, levels = stype_order)
+  )
+
+base_order  <- order(sample_meta$Tissue, sample_meta$CTCL_Phenotype,
+                     sample_meta$subtype.ctcl, sample_meta$Sample.Type.simple)
+mat         <- mat[, base_order, drop = FALSE]
+sample_meta <- sample_meta[base_order, , drop = FALSE]
+
+# Hierarchical clustering within each Tissue × CTCL_Phenotype × subtype.ctcl × Sample.Type.simple group
+group_key <- paste(sample_meta$Tissue, sample_meta$CTCL_Phenotype,
+                   sample_meta$subtype.ctcl, sample_meta$Sample.Type.simple, sep = "___")
+
+clustered_order <- unlist(lapply(unique(group_key), function(grp) {
+  idx <- which(group_key == grp)
+  if (length(idx) <= 2) return(idx)
+  sub_mat <- mat[, idx, drop = FALSE]
+  d  <- dist(t(sub_mat), method = "euclidean")
+  hc <- hclust(d, method = "ward.D2")
+  idx[hc$order]
+}))
+
+mat         <- mat[, clustered_order, drop = FALSE]
+sample_meta <- sample_meta[clustered_order, , drop = FALSE]
+
+# cells per pseudobulk (aligned by sample name, survives reordering)
+sample_meta$ncells <- as.integer(ncell_malig[rownames(sample_meta)])
+
+# Column gaps at tissue and phenotype boundaries
+tissue_int <- as.integer(sample_meta$Tissue)
+pheno_int  <- as.integer(sample_meta$CTCL_Phenotype)
+gaps_col   <- sort(unique(c(which(diff(tissue_int) != 0), which(diff(pheno_int) != 0))))
+
+cat("Samples per tissue:\n")
+print(table(sample_meta$Tissue))
+cat("Samples per phenotype:\n")
+print(table(sample_meta$CTCL_Phenotype))
+cat("Samples per subtype:\n")
+print(table(sample_meta$subtype.ctcl))
+```
+
+```{r heatmap_plot, fig.width=14, fig.height=6}
+ann_col <- data.frame(
+  nCells_log10       = log10(sample_meta$ncells),   # renamed below (closest to heatmap)
+  Tissue             = sample_meta$Tissue,
+  CTCL_Phenotype     = sample_meta$CTCL_Phenotype,
+  subtype.ctcl       = sample_meta$subtype.ctcl,
+  Sample.Type.simple = sample_meta$Sample.Type.simple,
+  row.names          = rownames(sample_meta)
+)
+colnames(ann_col)[1] <- "log10(nCells)"
+
+ann_col$subtype.ctcl[ann_col$Tissue == "blood"] <- "Blood"
+
+ann_colors <- list(
+  `log10(nCells)`    = c("#F7FBFF", "#08306B"),   # scaled blue, light -> dark
+  Tissue             = tissue_cols,
+  CTCL_Phenotype     = pheno_cols,
+  subtype.ctcl       = subtype_cols,
+  Sample.Type.simple = stype_cols
+)
+
+mat_vals  <- as.numeric(mat)
+cap_hi    <- quantile(mat_vals, 0.99, na.rm = TRUE)
+cap_lo    <- max(0, quantile(mat_vals, 0.01, na.rm = TRUE))
+heat_cols <- colorRampPalette(c("#F7F7F7", "#FEE08B", "#D53E4F", "#9E0142"))(100)
+heat_breaks <- seq(cap_lo, cap_hi, length.out = 101)
+
+pheatmap(
+  mat,
+  color             = heat_cols,
+  breaks            = heat_breaks,
+  annotation_col    = ann_col,
+  annotation_colors = ann_colors,
+  gaps_col          = gaps_col,
+  gaps_row          = gap_rows,
+  cluster_rows      = FALSE,
+  cluster_cols      = FALSE,
+  scale             = "none",
+  show_colnames     = FALSE,
+  fontsize_row      = 9,
+  border_color      = NA,
+  main              = "Malignant CTCL Cells — Pseudobulk logCPM by Sample"
+)
+
+pdf("figs/ctcl_pseudobulk_logcpm_heatmap.pdf", width = 18, height = 8, useDingbats = FALSE)
+pheatmap(
+  mat,
+  color             = heat_cols,
+  breaks            = heat_breaks,
+  annotation_col    = ann_col,
+  annotation_colors = ann_colors,
+  gaps_col          = gaps_col,
+  gaps_row          = gap_rows,
+  cluster_rows      = FALSE,
+  cluster_cols      = FALSE,
+  scale             = "none",
+  show_colnames     = FALSE,
+  fontsize_row      = 9,
+  border_color      = NA,
+  main              = "Malignant CTCL Cells — Pseudobulk logCPM by Sample"
+)
+dev.off()
+```
+
+---
+
+# Panel B — Gene-Gene Correlation Heatmap (CD4 skin + blood, dream residuals)
+
+```{r dream_setup}
+# ── CD4 samples, skin + blood only (drop lymph node) ─────────────────────────
+#    Samples come from sample_meta, so the Panel A ncell filter (>= MIN_CELLS)
+#    already applies; voom/dream need counts, so rebuild the DGE from `pb`.
+samples_cor <- rownames(sample_meta)[
+  sample_meta$CTCL_Phenotype == "CD4" & sample_meta$Tissue != "lymph node"
+]
+meta_cor <- droplevels(sample_meta[samples_cor, , drop = FALSE])
+
+cat("CD4 samples (skin + blood):", nrow(meta_cor), "\n")
+cat("Tissue breakdown:\n"); print(table(meta_cor$Tissue))
+
+dge_cor <- DGEList(counts = pb[, samples_cor, drop = FALSE])
+dge_cor <- calcNormFactors(dge_cor)
+keep_cor <- filterByExpr(dge_cor, min.count = 5) | rownames(dge_cor) %in% gene_vec
+dge_cor  <- dge_cor[keep_cor, , keep.lib.sizes = FALSE]
+cat("Genes retained for voom/dream:", nrow(dge_cor), "\n")
+cat("Panel genes retained:", sum(gene_vec %in% rownames(dge_cor)), "/", length(gene_vec), "\n")
+```
+
+```{r dream_fit}
+# ── voom + dream: remove tissue (fixed) + cohort (random), keep intrinsic signal
+form_resid <- ~ Tissue + (1 | GEO.Cohort)
+vobj_resid <- voomWithDreamWeights(dge_cor, form_resid, meta_cor, BPPARAM = BPPARAM)
+fit_resid  <- dream(vobj_resid, form_resid, meta_cor, BPPARAM = BPPARAM)
+
+# ── Residuals for the panel genes (tissue + cohort removed) ───────────────────
+panel_genes <- intersect(setdiff(gene_vec, c("TRDC", "CD8A", "CD8B")), rownames(fit_resid))
+resid_mat   <- residuals(fit_resid)[panel_genes, , drop = FALSE]
+
+# drop any gene with zero residual variance (else cor() -> NA rows, which breaks
+# the correlation-distance clustering below)
+keep_var    <- apply(resid_mat, 1, sd) > 0
+resid_mat   <- resid_mat[keep_var, , drop = FALSE]
+panel_genes <- rownames(resid_mat)
+
+# ── Gene functional-group annotation ─────────────────────────────────────────
+gene_group_map <- stack(lapply(genes_ordered, function(g) intersect(g, rownames(logcpm))))
+gene_group_map <- setNames(as.character(gene_group_map$ind), gene_group_map$values)
+group_labels   <- gene_group_map[panel_genes]
+
+n_groups  <- length(unique(group_labels))
+group_pal <- setNames(
+  RColorBrewer::brewer.pal(max(n_groups, 3), "Set2")[seq_len(n_groups)],
+  unique(group_labels)
+)
+```
+
+```{r panel_b_heatmap, fig.width=8, fig.height=7}
+# ── Gene-gene Spearman r on dream residuals (CD4 skin + blood; tissue + cohort removed)
+cor_mat  <- cor(t(resid_mat), method = "spearman")
+ann_gene <- data.frame(Group = group_labels, row.names = panel_genes)
+
+# cluster on correlation distance so co-varying genes group together
+cor_dist <- as.dist(1 - cor_mat)
+
+cor_heatmap_args <- list(
+  cor_mat,
+  color                    = colorRampPalette(c("#2166AC", "#F7F7F7", "#B2182B"))(100),
+  breaks                   = seq(-1, 1, length.out = 101),
+  annotation_row           = ann_gene,
+  annotation_col           = ann_gene,
+  annotation_colors        = list(Group = group_pal),
+  cluster_rows             = TRUE,
+  cluster_cols             = TRUE,
+  clustering_distance_rows = cor_dist,
+  clustering_distance_cols = cor_dist,
+  clustering_method        = "ward.D2",
+  show_rownames            = TRUE,
+  show_colnames            = FALSE,
+  fontsize_row             = 8,
+  border_color             = NA,
+  main                     = "Gene–Gene Spearman r — CD4 skin + blood (tissue + cohort removed)"
+)
+
+do.call(pheatmap, cor_heatmap_args)
+
+pdf("figs/gene_gene_cor_dream_residuals.pdf", width = 9, height = 8, useDingbats = FALSE)
+do.call(pheatmap, cor_heatmap_args)
+dev.off()
+```
+
+---
+
+# Panels C–D — CD4 Trajectory DEG (lesion, subtype, subtype-reversed)
+
+```{r traj_setup}
+# ── Patient ID per sample (adds the (1|Patient.ID) term, matching fig4/fig6) ──
+patient_lookup <- ctcl_malig@meta.data %>%
+  distinct(orig.merge, Patient.ID)
+patient_lookup <- setNames(as.character(patient_lookup$Patient.ID),
+                           patient_lookup$orig.merge)
+
+# ── Base CD4 skin + blood metadata (inherits the Panel A ncell filter) ────────
+traj_base <- sample_meta %>%
+  rownames_to_column("sample_id") %>%
+  filter(CTCL_Phenotype == "CD4", Tissue %in% c("skin", "blood")) %>%
+  mutate(Patient.ID = patient_lookup[sample_id])
+
+# ── Three ordinal trajectory encodings ───────────────────────────────────────
+#    `prog(m)` returns the ordinal stage (1..3) per row; rows returning NA are
+#    dropped, so each ordering selects its own sample set.
+traj_specs <- list(
+  lesion = list(
+    title  = "CD4 Disease Trajectory (Early CTCL → Late CTCL → Blood)",
+    labels = c("1" = "Early CTCL", "2" = "Late CTCL", "3" = "Blood"),
+    prog   = function(m) unname(c(Nonlesional = 1, Patch_Plaque = 1, Tumor = 2,
+                                  Erythroderma = 2, Blood = 3)[as.character(m$Sample.Type.simple)])
+  ),
+  subtype = list(
+    title  = "CD4 Subtype Trajectory (Subtype_1 → Subtype_2 → Blood)",
+    labels = c("1" = "Subtype_1", "2" = "Subtype_2", "3" = "Blood"),
+    prog   = function(m) dplyr::case_when(
+      m$Tissue == "skin"  & m$subtype.ctcl == "Subtype_1" ~ 1,
+      m$Tissue == "skin"  & m$subtype.ctcl == "Subtype_2" ~ 2,
+      m$Tissue == "blood"                                 ~ 3
+    )
+  ),
+  subtype_rev = list(
+    title  = "CD4 Subtype Trajectory — Reversed (Subtype_2 → Subtype_1 → Blood)",
+    labels = c("1" = "Subtype_2", "2" = "Subtype_1", "3" = "Blood"),
+    prog   = function(m) dplyr::case_when(
+      m$Tissue == "skin"  & m$subtype.ctcl == "Subtype_2" ~ 1,
+      m$Tissue == "skin"  & m$subtype.ctcl == "Subtype_1" ~ 2,
+      m$Tissue == "blood"                                 ~ 3
+    )
+  )
+)
+```
+
+```{r traj_deg}
+tcr_pat <- "^TR[ABDG][VDJ]|^TR[AB]C|^IG[HKL][VDJ]|^IGH[ADEGM]|^IGKC|^IGLC"
+
+run_traj_dream <- function(spec) {
+  m <- traj_base
+  m$progression <- spec$prog(m)
+  m <- m %>%
+    filter(!is.na(progression)) %>%
+    mutate(
+      GEO.Cohort = factor(GEO.Cohort),
+      Patient.ID = factor(Patient.ID),
+      stage      = factor(spec$labels[as.character(progression)], levels = spec$labels)
+    )
+
+  # ── DGE from shared pseudobulk counts; drop low-expressed + TCR/Ig genes ────
+  dge  <- calcNormFactors(DGEList(counts = pb[, m$sample_id, drop = FALSE]))
+  keep <- filterByExpr(dge, group = factor(m$progression), min.count = 5, min.prop = 0.2)
+  dge  <- dge[keep, , keep.lib.sizes = FALSE]
+  dge  <- dge[!grepl(tcr_pat, rownames(dge)), , keep.lib.sizes = FALSE]
+
+  # ── Cohort + patient as random effects, added only when each has structure ──
+  use_cohort  <- n_distinct(m$GEO.Cohort) >= 2
+  use_patient <- any(duplicated(m$Patient.ID))
+  form <- if (use_cohort && use_patient) ~ progression + (1 | GEO.Cohort) + (1 | Patient.ID)
+          else if (use_cohort)           ~ progression + (1 | GEO.Cohort)
+          else if (use_patient)          ~ progression + (1 | Patient.ID)
+          else                           ~ progression
+
+  vobj <- voomWithDreamWeights(dge, form, m, BPPARAM = BPPARAM)
+  fit  <- eBayes(dream(vobj, form, m, BPPARAM = BPPARAM))
+  deg  <- topTable(fit, coef = "progression", number = Inf) %>%
+    rownames_to_column("gene") %>% arrange(P.Value)
+
+  list(meta = m, form = form,
+       logcpm = cpm(dge, log = TRUE, prior.count = 3), deg = deg)
+}
+
+traj_res <- lapply(traj_specs, run_traj_dream)
+
+# back-compatible names for the downstream comparison section
+deg_traj     <- traj_res$lesion$deg
+deg_sub_traj <- traj_res$subtype$deg
+deg_sub_rev  <- traj_res$subtype_rev$deg
+
+for (nm in names(traj_res)) {
+  cat("\n=====", traj_specs[[nm]]$title, "=====\n")
+  cat("model:", deparse(traj_res[[nm]]$form), "\n")
+  cat("samples per stage:\n"); print(table(traj_res[[nm]]$meta$stage))
+  cat("FDR < 0.05:", sum(traj_res[[nm]]$deg$adj.P.Val < 0.05), "\n")
+}
+
+saveRDS(deg_traj,     "results/deg_traj.rds")
+saveRDS(deg_sub_traj, "results/deg_sub_traj.rds")
+saveRDS(deg_sub_rev,  "results/deg_sub_rev.rds")
+```
+
+```{r traj_lollipop, fig.width=6, fig.height=6}
+# ── Lollipop of the top 10 up + top 10 down genes — LESION trajectory ─────────
+n_top <- 15
+deg_traj <- readRDS("results/deg_traj.rds")
+deg_sub_traj <- readRDS("results/deg_sub_traj.rds")
+deg_sub_rev <- readRDS("results/deg_sub_rev.rds")
+
+top_lolli <- bind_rows(
+  deg_traj %>% filter(adj.P.Val < 0.05, logFC > 0) %>%
+    slice_max(logFC, n = n_top, with_ties = FALSE),
+  deg_traj %>% filter(adj.P.Val < 0.05, logFC < 0) %>%
+    slice_min(logFC, n = n_top, with_ties = FALSE)
+) %>%
+  mutate(gene     = factor(gene, levels = gene[order(logFC)]),
+         neg_logp = -log10(adj.P.Val))
+
+lfc_lim <- max(abs(top_lolli$logFC))
+
+p_traj_lolli <- ggplot(top_lolli, aes(x = logFC, y = gene, color = logFC)) +
+  geom_vline(xintercept = 0, linewidth = 0.3, linetype = "dashed", color = "grey60") +
+  geom_segment(aes(x = 0, xend = logFC, y = gene, yend = gene),
+               linewidth = 0.5, color = "grey70") +
+  geom_point(aes(size = neg_logp)) +
+  scale_color_gradient2(low = "#2166AC", mid = "grey85", high = "#B2182B",
+                        midpoint = 0, limits = c(-lfc_lim, lfc_lim),
+                        oob = scales::squish, name = expression(log[2]~FC)) +
+  scale_size_continuous(name = expression(-log[10]~FDR), range = c(1, 5)) +
+  labs(x = expression("log2FC (per step)"), y = NULL,
+       title = "Stage-based Trajectory") +
+  theme_fig
+
+print(p_traj_lolli)
+ggsave("figs/cd4_trajectory_lollipop.pdf", plot = p_traj_lolli,
+       width = 4.5, height = 6.5, useDingbats = FALSE)
+```
+
+```{r traj_ribbons, fig.width=5, fig.height=7}
+# ── Ribbon trajectories for selected genes — LESION trajectory ────────────────
+# Source expression + staging from the canonical pseudobulk objects (`logcpm`,
+# `traj_base`), staging samples with the shared lesion prog function so the
+# ribbon uses exactly the same samples/encoding as the lesion DEG.
+meta_les <- traj_base %>%
+  mutate(progression = traj_specs$lesion$prog(traj_base)) %>%
+  filter(!is.na(progression), sample_id %in% colnames(logcpm))
+
+stage_plot_labels <- c("1" = "Patch/Plaque", "2" = "Tumor/Ery", "3" = "Blood")
+gene_cols <- c("#B2182B", "#2166AC", "#4DAF4A")
+
+make_traj_ribbon <- function(genes) {
+  genes <- intersect(genes, rownames(logcpm))
+  df <- as.data.frame(t(logcpm[genes, meta_les$sample_id, drop = FALSE])) %>%
+    rownames_to_column("sample_id") %>%
+    pivot_longer(-sample_id, names_to = "gene", values_to = "logCPM") %>%
+    left_join(meta_les %>% select(sample_id, progression), by = "sample_id") %>%
+    mutate(stage = factor(stage_plot_labels[as.character(progression)],
+                          levels = stage_plot_labels),
+           gene  = factor(gene, levels = genes))
+
+  ggplot(df, aes(x = stage, y = logCPM, color = gene, fill = gene, group = gene)) +
+    stat_summary(fun.data = mean_cl_normal, geom = "ribbon", alpha = 0.15, color = NA) +
+    stat_summary(fun = mean, geom = "line",  linewidth = 0.9) +
+    stat_summary(fun = mean, geom = "point", size = 3) +
+    scale_color_manual(values = setNames(gene_cols[seq_along(genes)], genes), name = "Gene") +
+    scale_fill_manual(values  = setNames(gene_cols[seq_along(genes)], genes), name = "Gene") +
+    labs(x = "Disease stage", y = "Mean logCPM ± 95% CI") +
+    theme_fig + theme(legend.position = "right")
+}
+
+p_up   <- make_traj_ribbon(c("AIRE", "KLF2", "SELL")) +
+  theme(axis.title.x = element_blank(), axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+p_down <- make_traj_ribbon(c("GZMB", "CSF2", "CCL4"))
+
+p_traj_ribbons <- p_up / p_down
+print(p_traj_ribbons)
+
+ggsave("figs/cd4_trajectory_ribbon_selected.pdf", plot = p_traj_ribbons,
+       width = 4, height = 5.5, useDingbats = FALSE)
+```
+
+---
+
+# Trajectory DEG Comparison — Significant Gene Barcharts
+
+```{r traj_deg_barcharts, fig.width=7, fig.height=4}
+# ── Count FDR<0.05 up/down genes for all three trajectories ───────────────────
+traj_counts <- bind_rows(
+  deg_traj %>%
+    filter(adj.P.Val < 0.05) %>%
+    count(direction = ifelse(logFC > 0, "Up", "Down")) %>%
+    mutate(trajectory = "Disease\n(Early→Late→Blood)"),
+  deg_sub_traj %>%
+    filter(adj.P.Val < 0.05) %>%
+    count(direction = ifelse(logFC > 0, "Up", "Down")) %>%
+    mutate(trajectory = "Subtype\n(S1→S2→Blood)"),
+  deg_sub_rev %>%
+    filter(adj.P.Val < 0.05) %>%
+    count(direction = ifelse(logFC > 0, "Up", "Down")) %>%
+    mutate(trajectory = "Subtype Rev.\n(S2→S1→Blood)")
+) %>%
+  mutate(
+    trajectory = factor(trajectory,
+                        levels = c("Disease\n(Early→Late→Blood)",
+                                   "Subtype\n(S1→S2→Blood)",
+                                   "Subtype Rev.\n(S2→S1→Blood)")),
+    direction  = factor(direction, levels = c("Up", "Down"))
+  )
+
+dir_cols <- c("Up" = "#B2182B", "Down" = "#2166AC")
+
+p_traj_bar <- ggplot(traj_counts, aes(x = trajectory, y = n, fill = direction)) +
+  geom_col(position = "stack", width = 0.6) +
+  geom_text(aes(label = n),
+            position = position_stack(vjust = 0.5),
+            color = "white", size = 3.2, fontface = "bold") +
+  scale_fill_manual(values = dir_cols, name = "Direction") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(
+    title = "FDR < 0.05 DEGs across CD4 trajectories",
+    x     = NULL,
+    y     = "Number of significant genes"
+  ) +
+  theme_fig +
+  theme(legend.position = "right")
+
+print(p_traj_bar)
+
+ggsave("figs/cd4_trajectory_deg_barcharts.pdf", plot = p_traj_bar,
+       width = 3.5, height = 4, useDingbats = FALSE)
+```
+
+```{r traj_tvalue_correlation, fig.width=5.5, fig.height=5}
+# ── Join t-values and significance flags for disease vs subtype (S1→S2→Blood) ──
+t_joined <- deg_traj %>%
+  select(gene, t_disease = t, sig_disease = adj.P.Val) %>%
+  inner_join(
+    deg_sub_traj %>% select(gene, t_subtype = t, sig_subtype = adj.P.Val),
+    by = "gene"
+  ) %>%
+  mutate(
+    category = case_when(
+      sig_disease < 0.05 & sig_subtype < 0.05 ~ "Both",
+      sig_disease < 0.05 & sig_subtype >= 0.05 ~ "Lesion only",
+      sig_disease >= 0.05 & sig_subtype < 0.05 ~ "Subtype only",
+      TRUE                                      ~ "ns"
+    ),
+    category = factor(category, levels = c("Both", "Lesion only", "Subtype only", "ns"))
+  )
+
+rho <- cor(t_joined$t_disease, t_joined$t_subtype, method = "spearman")
+cat(sprintf("Genes compared: %d\nSpearman ρ — Disease vs. Subtype (S1→S2→Blood): %.3f\n",
+            nrow(t_joined), rho))
+print(table(t_joined$category))
+
+cat_cols <- c("Both" = "#7B1B2E", "Lesion only" = "#F77F00",
+              "Subtype only" = "#4393C3", "ns" = "grey80")
+
+# plot ns first so sig points render on top
+t_plot <- t_joined %>% arrange(category == "ns", category)
+
+p_t_scatter <- ggplot(t_plot, aes(x = t_disease, y = t_subtype, color = category)) +
+  geom_hline(yintercept = 0, linewidth = 0.4, color = "black") +
+  geom_vline(xintercept = 0, linewidth = 0.4, color = "black") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.5) +
+  geom_point(size = 1, alpha = 0.6, stroke = 0) +
+  scale_color_manual(values = cat_cols, name = NULL,
+                     guide = guide_legend(override.aes = list(size = 2.5, alpha = 1))) +
+  annotate("text", x = Inf, y = -Inf,
+           label = sprintf("ρ = %.3f", rho),
+           hjust = 1.1, vjust = -0.5, size = 3.2, fontface = "italic") +
+  labs(
+    title = "",
+    x     = "t (Stage-based encoding)",
+    y     = "t (Subtype-based encoding)"
+  ) +
+  theme_fig +
+  theme(
+    legend.position  = "top",
+    legend.direction = "horizontal",
+    legend.text      = element_text(size = 9)
+  )
+
+print(p_t_scatter)
+
+ggsave("figs/cd4_trajectory_tvalue_scatter.pdf", plot = p_t_scatter,
+       width = 4, height = 4.5, useDingbats = FALSE)
+```
+
+
+# Validation — Independent Bulk Cohort (GSE168508)
+
+```{r surv_load}
+library(scales)
+
+mat_indep  <- readRDS("~/Rstudio/CTCL/int/surv.mat.rds")
+meta_indep <- readRDS("~/Rstudio/CTCL/int/surv.meta.ss.rds")
+
+# Log-normalize
+logcpm_indep <- edgeR::cpm(mat_indep, log = TRUE)
+
+# Filter: keep genes expressed (logCPM > 1) in at least 10% of samples
+keep_indep   <- rowSums(logcpm_indep > 1) >= ceiling(0.10 * ncol(logcpm_indep))
+logcpm_indep <- logcpm_indep[keep_indep, ]
+
+meta_indep$lct <- factor(meta_indep$lct, levels = c("NLCT", "LCT"))
+
+cat("Independent dataset:", nrow(logcpm_indep), "genes x", ncol(logcpm_indep), "samples\n")
+cat("LCT status:\n"); print(table(meta_indep$lct))
+```
+
+```{r surv_score_build}
+# ── Load skin S1 vs S2 DEG results (positive logFC = Subtype_1 high) ──────────
+deg_s1s2 <- readRDS("../fig4/results/res_skin_subtypes.rds")
+
+n_sig <- 25
+
+genes_s1 <- deg_s1s2 %>%
+  filter(adj.P.Val < 0.05, logFC > 0) %>%
+  slice_max(t, n = n_sig) %>%
+  pull(gene) %>%
+  intersect(rownames(logcpm_indep))
+
+genes_s2 <- deg_s1s2 %>%
+  filter(adj.P.Val < 0.05, logFC < 0) %>%
+  slice_min(t, n = n_sig) %>%
+  pull(gene) %>%
+  intersect(rownames(logcpm_indep))
+
+cat("Subtype_1 signature genes in dataset:", length(genes_s1), "\n")
+cat("Subtype_2 signature genes in dataset:", length(genes_s2), "\n")
+
+# ── Score each sample as mean logCPM of signature genes ───────────────────────
+score_df <- data.frame(
+  sample     = colnames(logcpm_indep),
+  score_s1   = colMeans(logcpm_indep[genes_s1, , drop = FALSE]),
+  score_s2   = colMeans(logcpm_indep[genes_s2, , drop = FALSE]),
+  lct        = meta_indep[colnames(logcpm_indep), "lct"]
+)
+```
+
+
+```{r surv_score_violin, fig.width=3, fig.height=6}
+score_long <- score_df %>%
+  pivot_longer(c(score_s1, score_s2),
+               names_to  = "signature",
+               values_to = "score") %>%
+  mutate(
+    signature = factor(
+      ifelse(signature == "score_s1", "Subtype_1", "Subtype_2"),
+      levels = c("Subtype_1", "Subtype_2")
+    )
+  )
+
+lct_cols  <- c("NLCT" = "#4393C3", "LCT" = "#B2182B")
+sig_cols  <- c("Subtype_1" = "#B2182B", "Subtype_2" = "#2166AC")
+
+# ── Wilcoxon p-values ─────────────────────────────────────────────────────────
+pval_s1 <- wilcox.test(score_s1 ~ lct, data = score_df)$p.value
+pval_s2 <- wilcox.test(score_s2 ~ lct, data = score_df)$p.value
+cat(sprintf("Wilcoxon p — Subtype_1 score (NLCT vs LCT): %.4f\n", pval_s1))
+cat(sprintf("Wilcoxon p — Subtype_2 score (NLCT vs LCT): %.4f\n", pval_s2))
+
+make_violin <- function(scores, lct_vec, title, ylab) {
+  df <- data.frame(score = scores, lct = lct_vec)
+  pval <- wilcox.test(score ~ lct, data = df)$p.value
+  ggplot(df, aes(x = lct, y = score, fill = lct)) +
+    geom_violin(trim = TRUE, alpha = 0.7, color = NA) +
+    geom_boxplot(width = 0.15, outlier.shape = NA, fill = "white", color = "grey30") +
+    geom_jitter(width = 0.08, size = 0.8, alpha = 0.6, color = "grey20") +
+    annotate("text", x = 1.5, y = Inf,
+             label = sprintf("p = %.3f", pval),
+             vjust = 1.5, size = 3.2) +
+    scale_fill_manual(values = lct_cols) +
+    labs(title = title, x = NULL, y = ylab) +
+    theme_fig +
+    theme(legend.position = "none")
+}
+
+p_v1 <- make_violin(score_df$score_s1, score_df$lct,
+                    "Subtype 1 Signature",
+                    paste0("Mean logCPM (top ", n_sig, " genes)"))
+p_v2 <- make_violin(score_df$score_s2, score_df$lct,
+                    "Subtype 2 Signature",
+                    paste0("Mean logCPM (top ", n_sig, " genes)"))
+
+p_surv_violin <- p_v1 | p_v2
+print(p_surv_violin)
+
+ggsave("figs/surv_subtype_signature_lct_violin.pdf", plot = p_surv_violin,
+       width = 5.5, height = 3, useDingbats = FALSE)
+```
+
+```{r lct_deg, fig.width=5, fig.height=5}
+library(limma)
+
+# ── DEG: NLCT vs LCT (LCT = reference; positive logFC = NLCT high) ────────────
+meta_lct <- meta_indep[colnames(logcpm_indep), ] %>%
+  mutate(lct = relevel(factor(lct), ref = "LCT"))
+
+design_lct <- model.matrix(~ lct, data = meta_lct)
+
+fit_lct  <- lmFit(logcpm_indep, design_lct)
+fit_lct  <- eBayes(fit_lct)
+deg_lct  <- topTable(fit_lct, coef = "lctNLCT", number = Inf) %>%
+  rownames_to_column("gene") %>%
+  arrange(P.Value)
+
+cat("NLCT vs LCT — FDR < 0.05:", sum(deg_lct$adj.P.Val < 0.05), "\n")
+cat("\nTop NLCT-high (positive logFC):\n")
+deg_lct %>% filter(adj.P.Val < 0.05, logFC > 0) %>%
+  select(gene, logFC, adj.P.Val) %>% head(5) %>% print()
+cat("\nTop LCT-high (negative logFC):\n")
+deg_lct %>% filter(adj.P.Val < 0.05, logFC < 0) %>%
+  select(gene, logFC, adj.P.Val) %>% head(5) %>% print()
+
+saveRDS(deg_lct, "results/deg_lct.rds")
+# ── Merge with S1 vs S2 skin DEG (pos logFC = Subtype_1 high) ─────────────────
+t_merged <- deg_lct %>%
+  select(gene, t_lct = t, sig_lct = adj.P.Val) %>%
+  inner_join(
+    deg_s1s2 %>% select(gene, t_subtype = t, sig_subtype = adj.P.Val),
+    by = "gene"
+  ) %>%
+  mutate(
+    category = case_when(
+      sig_lct < 0.05 & sig_subtype < 0.05 ~ "Both",
+      sig_lct < 0.05 & sig_subtype >= 0.05 ~ "LCT only",
+      sig_lct >= 0.05 & sig_subtype < 0.05 ~ "Subtype only",
+      TRUE                                  ~ "ns"
+    ),
+    category = factor(category, levels = c("Both", "LCT only", "Subtype only", "ns"))
+  )
+
+rho_lct <- cor(t_merged$t_lct, t_merged$t_subtype, method = "spearman")
+cat(sprintf("\nGenes compared: %d\nSpearman ρ — LCT vs Subtype: %.3f\n",
+            nrow(t_merged), rho_lct))
+print(table(t_merged$category))
+
+cat_cols_lct <- c("Both" = "#7B1B2E", "LCT only" = "#F77F00",
+                  "Subtype only" = "#4393C3", "ns" = "grey80")
+
+# label genes at the extremes of each axis + both diagonals, restricted to
+# genes significant in at least one contrast (deduped)
+lab_lct <- t_merged %>%
+  filter(category != "ns") %>%
+  mutate(s = t_lct + t_subtype, d = t_lct - t_subtype)
+lab_lct <- bind_rows(
+  slice_max(lab_lct, t_lct,     n = 6), slice_min(lab_lct, t_lct,     n = 6),
+  slice_max(lab_lct, t_subtype, n = 6), slice_min(lab_lct, t_subtype, n = 6),
+  slice_max(lab_lct, s,         n = 4), slice_min(lab_lct, s,         n = 4),
+  slice_max(lab_lct, d,         n = 4), slice_min(lab_lct, d,         n = 4)
+) %>% distinct(gene, .keep_all = TRUE)
+
+p_lct_scatter <- ggplot(t_merged %>% arrange(category == "ns", category),
+                        aes(x = t_lct, y = t_subtype, color = category)) +
+  geom_hline(yintercept = 0, linewidth = 0.4, color = "black") +
+  geom_vline(xintercept = 0, linewidth = 0.4, color = "black") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              color = "grey50", linewidth = 0.5) +
+  geom_point(size = 1, alpha = 1, stroke = 0) +
+  ggrepel::geom_text_repel(
+    data = lab_lct, aes(label = gene), color = "black", size = 2.8,
+    max.overlaps = Inf, min.segment.length = 0,
+    segment.size = 0.2, segment.color = "grey60", box.padding = 0.4,
+    show.legend = FALSE) +
+  scale_color_manual(values = cat_cols_lct, name = NULL,
+                     guide = guide_legend(override.aes = list(size = 2.5, alpha = 1))) +
+  annotate("text", x = Inf, y = -Inf,
+           label = sprintf("ρ = %.3f", rho_lct),
+           hjust = 1.1, vjust = -0.5, size = 3.2, fontface = "italic") +
+  labs(
+    title = "NLCT vs LCT / Subtype — Gene-level t-statistic",
+    x     = "t (NLCT vs LCT)",
+    y     = "t (Subtype_1 vs Subtype_2)"
+  ) +
+  theme_fig +
+  theme(
+    legend.position  = "top",
+    legend.direction = "horizontal",
+    legend.text      = element_text(size = 9)
+  )
+
+print(p_lct_scatter)
+
+ggsave("figs/lct_vs_subtype_tvalue_scatter.pdf", plot = p_lct_scatter,
+       width = 4.25, height = 4.5, useDingbats = FALSE)
+```
+
+```{r subtype_score_scatter, fig.width=6, fig.height=6}
+library(ggridges)
+library(cowplot)
+
+# ── Subtype scores per sample, colored by composite (S1 - S2) axis ────────────
+sc_df <- score_df %>% mutate(composite = score_s1 - score_s2)
+
+comp_lim <- quantile(abs(sc_df$composite), 0.99, na.rm = TRUE)
+
+# correlation between the two subtype scores
+cor_pearson  <- cor.test(sc_df$score_s1, sc_df$score_s2, method = "pearson")
+cor_spearman <- cor.test(sc_df$score_s1, sc_df$score_s2, method = "spearman")
+print(cor_pearson)
+print(cor_spearman)
+rho_sub <- unname(cor_spearman$estimate)
+
+p_main <- ggplot(sc_df, aes(x = score_s1, y = score_s2, fill = composite)) +
+  geom_point(shape = 21, size = 2.5, stroke = 0.2, color = "grey30") +
+  scale_fill_gradient2(low = "#2166AC", mid = "grey90", high = "#B2182B", midpoint = 0,
+    limits = c(-comp_lim, comp_lim), oob = scales::squish, name = "Composite\n(S1 - S2)") +
+  annotate("text", x = -Inf, y = Inf,
+           label = sprintf("rho = %.2f", rho_sub),
+           hjust = -0.15, vjust = 1.5, size = 4, fontface = "italic") +
+  labs(x = "Subtype_1 score", y = "Subtype_2 score",
+       title = "") +
+  theme_fig +
+  theme(legend.position = "none")
+
+# marginal ridge densities aligned to each axis, colored by subtype
+x_ridge <- axis_canvas(p_main, axis = "x") +
+  geom_density_ridges(data = sc_df, aes(x = score_s1, y = 0),
+                      fill = "#B2182B", color = "grey30", linewidth = 0.3, alpha = 0.7)
+y_ridge <- axis_canvas(p_main, axis = "y", coord_flip = TRUE) +
+  geom_density_ridges(data = sc_df, aes(x = score_s2, y = 0),
+                      fill = "#2166AC", color = "grey30", linewidth = 0.3, alpha = 0.7) +
+  coord_flip()
+
+p_score_scatter <- p_main %>%
+  insert_xaxis_grob(x_ridge, grid::unit(0.2, "null"), position = "top") %>%
+  insert_yaxis_grob(y_ridge, grid::unit(0.2, "null"), position = "right")
+ggdraw(p_score_scatter)
+
+ggsave("figs/subtype_score_scatter.pdf", plot = ggdraw(p_score_scatter),
+       width = 4, height = 4, useDingbats = FALSE)
+```
+
+```{r surv_km, fig.width=12, fig.height=8}
+library(survival)
+library(survminer)
+library(broom)
+
+# ── Merge scores with survival data ───────────────────────────────────────────
+surv_df <- score_df %>%
+  left_join(
+    meta_indep %>%
+      select(pfs_time, pfs_event, os_time, os_event) %>%
+      rownames_to_column("sample"),
+    by = "sample"
+  ) %>%
+  mutate(
+    Group_S1   = ifelse(score_s1 >= mean(score_s1), "S1_High", "S1_Low"),
+    Group_S2   = ifelse(score_s2 >= mean(score_s2), "S2_High", "S2_Low"),
+    score_diff = score_s1 - score_s2,
+    Group_Diff = ifelse(score_diff >= mean(score_diff), "Subtype_1_Like", "Subtype_2_Like"),
+    Group_S1   = factor(Group_S1,   levels = c("S1_High", "S1_Low")),
+    Group_S2   = factor(Group_S2,   levels = c("S2_High", "S2_Low")),
+    Group_Diff = factor(Group_Diff, levels = c("Subtype_1_Like", "Subtype_2_Like"))
+  )
+
+km_theme <- theme_classic(base_size = 10) +
+  theme(
+    legend.position    = "top",
+    legend.title       = element_blank(),
+    legend.text        = element_text(size = 8),
+    plot.title         = element_text(face = "bold", size = 10),
+    axis.title         = element_text(size = 9)
+  )
+
+# ── Helper: tidy survfit → ggplot2 KM ─────────────────────────────────────────
+logrank_p <- function(formula, data) {
+  sd <- survdiff(formula, data = data)
+  pchisq(sd$chisq, df = length(sd$n) - 1, lower.tail = FALSE)
+}
+
+tidy_km <- function(fit) {
+  broom::tidy(fit) %>%
+    mutate(strata = sub("^[^=]+=", "", strata))   # strip "Group_XX=" prefix
+}
+
+make_km <- function(formula, data, title, col_map) {
+  fit  <- survfit(formula, data = data)
+  pval <- logrank_p(formula, data)
+  td   <- tidy_km(fit)
+
+  ggplot(td, aes(x = time, y = estimate, color = strata)) +
+    geom_step(linewidth = 0.8) +
+    geom_point(data = td %>% filter(n.censor > 0),
+               aes(x = time, y = estimate, color = strata),
+               shape = 3, size = 2, show.legend = FALSE) +
+    scale_color_manual(values = col_map) +
+    scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
+    scale_x_continuous(expand = expansion(mult = c(0, 0.05))) +
+    annotate("text", x = -Inf, y = -Inf,
+             label = sprintf("p = %s", signif(pval, 2)),
+             hjust = -0.1, vjust = -0.5, size = 3.2) +
+    labs(title = title, x = "Time (months)", y = "Survival probability") +
+    km_theme
+}
+
+# ── Color maps (keyed to stripped strata labels) ───────────────────────────────
+cm_s1   <- c("S1_High" = "#B2182B", "S1_Low" = "grey65")
+cm_s2   <- c("S2_High" = "#2166AC", "S2_Low" = "grey65")
+cm_diff <- c("Subtype_1_Like" = "#B2182B", "Subtype_2_Like" = "#2166AC")
+
+# ── Build all 6 panels ────────────────────────────────────────────────────────
+p_pfs_s1   <- make_km(Surv(pfs_time, pfs_event) ~ Group_S1,   surv_df, "PFS: Subtype 1 Score", cm_s1)
+p_pfs_s2   <- make_km(Surv(pfs_time, pfs_event) ~ Group_S2,   surv_df, "PFS: Subtype 2 Score", cm_s2)
+p_pfs_diff <- make_km(Surv(pfs_time, pfs_event) ~ Group_Diff, surv_df, "PFS: S1 vs S2",        cm_diff)
+p_os_s1    <- make_km(Surv(os_time, os_event) ~ Group_S1,   surv_df, "OS: Subtype 1 Score",  cm_s1)
+p_os_s2    <- make_km(Surv(os_time, os_event) ~ Group_S2,   surv_df, "OS: Subtype 2 Score",  cm_s2)
+p_os_diff  <- make_km(Surv(os_time, os_event) ~ Group_Diff, surv_df, "OS: S1 vs S2",         cm_diff)
+
+p_km_grid <- (p_pfs_s1 | p_pfs_s2 | p_pfs_diff) /
+  (p_os_s1  | p_os_s2  | p_os_diff)
+
+print(p_km_grid)
+
+ggsave("figs/surv_subtype_km_curves.pdf", plot = p_km_grid,
+       width = 10, height = 5.5, useDingbats = FALSE)
+```
+
+
+#extra
+
+```{r extra_sub_bulk_score}
+# ── Whole-sample TME Subtype_1-vs-Subtype_2 bulk DEG (fig6); +logFC = S1 high ──
+res_sub_bulk <- readRDS("../fig6/results/res_sub_bulk.rds")
+
+n_top <- 25
+# rank within genes present in the independent cohort (top 25 by t each direction)
+cand     <- res_sub_bulk %>% filter(gene %in% rownames(logcpm_indep))
+genes_up <- cand %>% slice_max(t, n = n_top) %>% pull(gene)   # Subtype_1-high
+genes_dn <- cand %>% slice_min(t, n = n_top) %>% pull(gene)   # Subtype_2-high
+cat("Up (S1) genes:", length(genes_up), "| Down (S2) genes:", length(genes_dn), "\n")
+
+# ── Score each sample as mean logCPM of each set + composite (up - down) ───────
+sub_score_df <- data.frame(
+  sample   = colnames(logcpm_indep),
+  score_up = colMeans(logcpm_indep[genes_up, , drop = FALSE]),
+  score_dn = colMeans(logcpm_indep[genes_dn, , drop = FALSE])
+) %>%
+  mutate(score_comp = score_up - score_dn)   # composite: Subtype_1-like axis
+```
+
+```{r extra_sub_bulk_km, fig.width=12, fig.height=8}
+# ── Merge with survival, split high/low at the mean (reuses make_km from above) ─
+sub_surv <- sub_score_df %>%
+  left_join(
+    meta_indep %>%
+      select(pfs_time, pfs_event, os_time, os_event) %>%
+      rownames_to_column("sample"),
+    by = "sample"
+  ) %>%
+  mutate(
+    Group_Up   = factor(ifelse(score_up   >= mean(score_up),   "Up_High",   "Up_Low"),
+                        levels = c("Up_High", "Up_Low")),
+    Group_Dn   = factor(ifelse(score_dn   >= mean(score_dn),   "Down_High", "Down_Low"),
+                        levels = c("Down_High", "Down_Low")),
+    Group_Comp = factor(ifelse(score_comp >= mean(score_comp), "Comp_High", "Comp_Low"),
+                        levels = c("Comp_High", "Comp_Low"))
+  )
+
+cm_up   <- c("Up_High"   = "#B2182B", "Up_Low"   = "grey65")
+cm_dn   <- c("Down_High" = "#2166AC", "Down_Low" = "grey65")
+cm_comp <- c("Comp_High" = "#B2182B", "Comp_Low" = "#2166AC")
+
+p_pfs_up   <- make_km(Surv(pfs_time, pfs_event) ~ Group_Up,   sub_surv, "PFS: Top25 Up (S1)",   cm_up)
+p_pfs_dn   <- make_km(Surv(pfs_time, pfs_event) ~ Group_Dn,   sub_surv, "PFS: Top25 Down (S2)", cm_dn)
+p_pfs_comp <- make_km(Surv(pfs_time, pfs_event) ~ Group_Comp, sub_surv, "PFS: Composite",       cm_comp)
+p_os_up    <- make_km(Surv(os_time, os_event)   ~ Group_Up,   sub_surv, "OS: Top25 Up (S1)",    cm_up)
+p_os_dn    <- make_km(Surv(os_time, os_event)   ~ Group_Dn,   sub_surv, "OS: Top25 Down (S2)",  cm_dn)
+p_os_comp  <- make_km(Surv(os_time, os_event)   ~ Group_Comp, sub_surv, "OS: Composite",        cm_comp)
+
+(p_pfs_up | p_pfs_dn | p_pfs_comp) /
+  (p_os_up  | p_os_dn  | p_os_comp)
+```
+
+```{r extra_composite_scatter, fig.height=4.5, fig.width=5}
+# TME composite (res_sub_bulk) vs subtype composite (fig4 skin DEG, from surv_df)
+comp_merge <- sub_score_df %>%
+  select(sample, score_comp) %>%
+  inner_join(surv_df %>% select(sample, score_diff, lct), by = "sample")
+
+cor_p <- cor(comp_merge$score_comp, comp_merge$score_diff)
+cor_s <- cor(comp_merge$score_comp, comp_merge$score_diff, method = "spearman")
+
+ggplot(comp_merge, aes(x = score_diff, y = score_comp)) +
+  geom_point(aes(color = lct), size = 2, alpha = 0.8) +
+  geom_smooth(method = "lm", se = FALSE, color = "black", linewidth = 0.6) +
+  scale_color_manual(values = lct_cols, name = NULL) +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 1.4,
+           label = sprintf("r = %.2f  (rho = %.2f)", cor_p, cor_s), size = 4) +
+  labs(x = "Subtype composite (S1-S2, fig4 skin malignant DEG)",
+       y = "TME composite (S1-S2, res_sub_bulk)",
+       title = "Composite score concordance") +
+  theme_classic(base_size = 12)
+```
+
+```{r extra_tme_by_subtype_test, fig.height=4, fig.width=3.2}
+# Does the TME composite differ by the subtype-composite assignment?
+# Group_Diff (from surv_df): S1-like vs S2-like, split at the mean of score_diff.
+tme_by_sub <- sub_score_df %>%
+  select(sample, score_comp) %>%
+  inner_join(surv_df %>% select(sample, Group_Diff), by = "sample")
+
+pval_w <- wilcox.test(score_comp ~ Group_Diff, data = tme_by_sub)$p.value
+pval_t <- t.test(score_comp ~ Group_Diff, data = tme_by_sub)$p.value
+cat(sprintf("TME composite ~ subtype assignment:  Wilcoxon p = %.4g | t-test p = %.4g\n",
+            pval_w, pval_t))
+print(tme_by_sub %>% group_by(Group_Diff) %>%
+        summarise(n = n(), median = median(score_comp), mean = mean(score_comp), .groups = "drop"))
+
+ggplot(tme_by_sub, aes(x = Group_Diff, y = score_comp, fill = Group_Diff)) +
+  geom_violin(trim = TRUE, alpha = 0.7, color = NA) +
+  geom_boxplot(width = 0.15, outlier.shape = NA, fill = "white", color = "grey30") +
+  geom_jitter(width = 0.08, size = 0.8, alpha = 0.6, color = "grey20") +
+  annotate("text", x = 1.5, y = Inf, label = sprintf("Wilcoxon p = %.3g", pval_w),
+           vjust = 1.5, size = 3.4) +
+  scale_fill_manual(values = cm_diff) +
+  labs(x = NULL, y = "TME composite (S1-S2)",
+       title = "TME composite by subtype assignment") +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "none")
+```
+
+```{r surv_cox_continuous}
+# ── Continuous Cox models: Subtype-1, Subtype-2, and composite (S1−S2) signature
+#    scores as continuous predictors of PFS and OS, each fit UNADJUSTED and
+#    ADJUSTED for LCT status. Scores are z-scored, so HR is per 1 SD and directly
+#    comparable across signatures and between the unadjusted/+LCT models.
+#    Results saved for reporting. Reuses `surv_df` (scores + survival + lct).
+library(survival); library(broom)
+stopifnot(exists("surv_df"),
+          all(c("score_s1", "score_s2", "score_diff", "lct") %in% names(surv_df)))
+
+# composite = the S1-minus-S2 axis already carried in surv_df as score_diff
+score_map <- c(score_s1 = "Subtype_1", score_s2 = "Subtype_2",
+               score_diff = "Composite (S1-S2)")
+specs <- expand.grid(sc = names(score_map), ep = c("PFS", "OS"),
+                     model = c("unadjusted", "+LCT"), stringsAsFactors = FALSE)
+
+cox_cont_res <- dplyr::bind_rows(lapply(seq_len(nrow(specs)), function(i) {
+  sc <- specs$sc[i]; ep <- specs$ep[i]; mdl <- specs$model[i]
+  d  <- surv_df
+  d$x <- as.numeric(scale(d[[sc]]))                    # z-score -> HR per 1 SD
+  surv_lhs <- if (ep == "PFS") "Surv(pfs_time, pfs_event)" else "Surv(os_time, os_event)"
+  rhs      <- if (mdl == "+LCT") "x + lct" else "x"
+  fit <- coxph(as.formula(paste(surv_lhs, "~", rhs)), data = d)
+  sm  <- summary(fit)
+  tf  <- broom::tidy(fit, exponentiate = TRUE, conf.int = TRUE) %>%
+    dplyr::filter(term == "x")                         # isolate the score effect
+  data.frame(
+    score     = unname(score_map[sc]),
+    endpoint  = ep,
+    model     = mdl,
+    n         = sm$n,
+    n_events  = sm$nevent,
+    HR_per_SD = tf$estimate,
+    conf.low  = tf$conf.low,
+    conf.high = tf$conf.high,
+    z         = tf$statistic,
+    p.value   = tf$p.value,
+    C_index   = unname(sm$concordance["C"]),           # +LCT rows: joint score+LCT discrimination
+    stringsAsFactors = FALSE
+  )
+}))
+
+cox_cont_res <- cox_cont_res %>%
+  dplyr::arrange(endpoint, factor(score, levels = unname(score_map)),
+                 factor(model, levels = c("unadjusted", "+LCT"))) %>%
+  dplyr::mutate(dplyr::across(c(HR_per_SD, conf.low, conf.high, z, C_index), \(v) round(v, 3)),
+                p.value = signif(p.value, 3))
+
+print(cox_cont_res)
+
+write.csv(cox_cont_res, "results/cox_continuous_subtype_scores.csv", row.names = FALSE)
+saveRDS(cox_cont_res,   "results/cox_continuous_subtype_scores.rds")
+```
+
+
+```{r surv_lct_km, fig.width=6, fig.height=4}
+cm_lct <- c("NLCT" = "#4393C3", "LCT" = "#B2182B")
+
+p_pfs_lct <- make_km(Surv(pfs_time, pfs_event) ~ lct, surv_df, "PFS by LCT Status", cm_lct)
+p_os_lct  <- make_km(Surv(os_time, os_event) ~ lct, surv_df, "OS by LCT Status",  cm_lct)
+
+p_lct_grid <- p_pfs_lct | p_os_lct
+print(p_lct_grid)
+
+ggsave("figs/surv_lct_km_curves.pdf", plot = p_lct_grid,
+       width = 6, height = 4, useDingbats = FALSE)
+```
+
+```{r surv_subtype_within_lct, fig.width=12, fig.height=16}
+# ── Classify within each LCT group for all 3 scoring approaches ───────────────
+surv_lct_sub <- surv_df %>%
+  dplyr::group_by(lct) %>%
+  dplyr::mutate(
+    score_diff   = score_s1 - score_s2,
+    Group_S1_w   = factor(ifelse(score_s1   >= mean(score_s1),   "S1_High",        "S1_Low"),
+                          levels = c("S1_High", "S1_Low")),
+    Group_S2_w   = factor(ifelse(score_s2   >= mean(score_s2),   "S2_High",        "S2_Low"),
+                          levels = c("S2_High", "S2_Low")),
+    Group_Within = factor(ifelse(score_diff >= mean(score_diff), "Subtype_1_Like", "Subtype_2_Like"),
+                          levels = c("Subtype_1_Like", "Subtype_2_Like"))
+  ) %>%
+  dplyr::ungroup()
+
+cat("S1 High/Low within LCT groups:\n"); print(table(surv_lct_sub$lct, surv_lct_sub$Group_S1_w))
+cat("S2 High/Low within LCT groups:\n"); print(table(surv_lct_sub$lct, surv_lct_sub$Group_S2_w))
+cat("Combo within LCT groups:\n");       print(table(surv_lct_sub$lct, surv_lct_sub$Group_Within))
+
+cm_s1_w   <- c("S1_High"        = "#B2182B", "S1_Low"        = "grey65")
+cm_s2_w   <- c("S2_High"        = "#2166AC", "S2_Low"        = "grey65")
+cm_within <- c("Subtype_1_Like" = "#B2182B", "Subtype_2_Like" = "#2166AC")
+
+# ── 4-row × 3-col grid: rows = LCT PFS / LCT OS / NLCT PFS / NLCT OS ─────────
+lct_levels <- c("LCT", "NLCT")
+
+km_rows <- lapply(lct_levels, function(grp) {
+  df <- surv_lct_sub %>% dplyr::filter(lct == grp)
+
+  list(
+    pfs_s1  = make_km(Surv(pfs_time, pfs_event) ~ Group_S1_w,   df,
+                      sprintf("PFS — %s: S1 Score",  grp), cm_s1_w),
+    pfs_s2  = make_km(Surv(pfs_time, pfs_event) ~ Group_S2_w,   df,
+                      sprintf("PFS — %s: S2 Score",  grp), cm_s2_w),
+    pfs_cmb = make_km(Surv(pfs_time, pfs_event) ~ Group_Within, df,
+                      sprintf("PFS — %s: S1 vs S2",  grp), cm_within),
+    os_s1   = make_km(Surv(os_time, os_event) ~ Group_S1_w,   df,
+                      sprintf("OS — %s: S1 Score",   grp), cm_s1_w),
+    os_s2   = make_km(Surv(os_time, os_event) ~ Group_S2_w,   df,
+                      sprintf("OS — %s: S2 Score",   grp), cm_s2_w),
+    os_cmb  = make_km(Surv(os_time, os_event) ~ Group_Within, df,
+                      sprintf("OS — %s: S1 vs S2",   grp), cm_within)
+  )
+})
+
+p_within_grid <-
+  (km_rows[[1]]$pfs_s1 | km_rows[[1]]$pfs_s2 | km_rows[[1]]$pfs_cmb) /
+  (km_rows[[1]]$os_s1  | km_rows[[1]]$os_s2  | km_rows[[1]]$os_cmb)  /
+  (km_rows[[2]]$pfs_s1 | km_rows[[2]]$pfs_s2 | km_rows[[2]]$pfs_cmb) /
+  (km_rows[[2]]$os_s1  | km_rows[[2]]$os_s2  | km_rows[[2]]$os_cmb)
+
+print(p_within_grid)
+
+ggsave("figs/surv_subtype_within_lct_km.pdf", plot = p_within_grid,
+       width = 12, height = 16, useDingbats = FALSE)
+```
+
+```{r surv_score_scatter, fig.width=9, fig.height=12}
+# ── Score vs survival time scatters, colored by LCT status ────────────────────
+scatter_df <- surv_df %>%
+  dplyr::select(sample, score_s1, score_s2, score_diff,
+                pfs_time, os_time, lct) %>%
+  dplyr::mutate(lct = factor(lct, levels = c("NLCT", "LCT")))
+
+make_score_scatter <- function(x_var, y_var, x_lab, y_lab) {
+  ggplot(scatter_df, aes(x = .data[[x_var]], y = .data[[y_var]], color = lct)) +
+    geom_point(size = 1.5, alpha = 0.8, stroke = 0) +
+    geom_smooth(aes(group = lct), method = "lm", se = TRUE,
+                linewidth = 0.8, alpha = 0.15) +
+    scale_color_manual(values = lct_cols, name = NULL) +
+    labs(x = x_lab, y = y_lab) +
+    theme_classic(base_size = 11) +
+    theme(legend.position = "top")
+}
+
+p_s1_pfs  <- make_score_scatter("score_s1",   "pfs_time", "Subtype 1 score", "PFS time")
+p_s1_os   <- make_score_scatter("score_s1",   "os_time",  "Subtype 1 score", "OS time")
+p_s2_pfs  <- make_score_scatter("score_s2",   "pfs_time", "Subtype 2 score", "PFS time")
+p_s2_os   <- make_score_scatter("score_s2",   "os_time",  "Subtype 2 score", "OS time")
+p_dif_pfs <- make_score_scatter("score_diff", "pfs_time", "Score diff (S1 − S2)", "PFS time")
+p_dif_os  <- make_score_scatter("score_diff", "os_time",  "Score diff (S1 − S2)", "OS time")
+
+p_score_scatter <- (p_s1_pfs  | p_s1_os)  /
+                   (p_s2_pfs  | p_s2_os)  /
+                   (p_dif_pfs | p_dif_os)
+
+print(p_score_scatter)
+
+ggsave("figs/surv_score_scatter.pdf", plot = p_score_scatter,
+       width = 9, height = 12, useDingbats = FALSE)
+```
+
+```{r surv_cox, fig.width=7, fig.height=5}
+# ── 1. Cox regression: subtype scores as continuous predictors ─────────────────
+library(broom)
+
+cox_df <- surv_df %>%
+  dplyr::mutate(lct_bin = as.integer(lct == "LCT"))  # LCT=1, NLCT=0
+
+# Fit 4 models for each endpoint: score alone, + lct, + interaction
+cox_models <- list(
+  pfs_diff        = coxph(Surv(pfs_time, pfs_event) ~ score_diff,           data = cox_df),
+  pfs_diff_lct    = coxph(Surv(pfs_time, pfs_event) ~ score_diff + lct,     data = cox_df),
+  pfs_diff_int    = coxph(Surv(pfs_time, pfs_event) ~ score_diff * lct,     data = cox_df),
+  os_diff         = coxph(Surv(os_time, os_event) ~ score_diff,           data = cox_df),
+  os_diff_lct     = coxph(Surv(os_time, os_event) ~ score_diff + lct,     data = cox_df),
+  os_diff_int     = coxph(Surv(os_time, os_event) ~ score_diff * lct,     data = cox_df),
+  pfs_s1          = coxph(Surv(pfs_time, pfs_event) ~ score_s1 + lct,       data = cox_df),
+  pfs_s2          = coxph(Surv(pfs_time, pfs_event) ~ score_s2 + lct,       data = cox_df),
+  os_s1           = coxph(Surv(os_time, os_event) ~ score_s1 + lct,       data = cox_df),
+  os_s2           = coxph(Surv(os_time, os_event) ~ score_s2 + lct,       data = cox_df)
+)
+
+cox_tidy <- dplyr::bind_rows(
+  lapply(names(cox_models), function(nm)
+    broom::tidy(cox_models[[nm]], exponentiate = TRUE, conf.int = TRUE) %>%
+      dplyr::mutate(model = nm)
+  )
+) %>%
+  dplyr::select(model, term, estimate, conf.low, conf.high, p.value) %>%
+  dplyr::mutate(across(c(estimate, conf.low, conf.high), \(x) round(x, 3)),
+                p.value = signif(p.value, 3))
+
+print(cox_tidy)
+
+# ── Forest plot of score_diff models ──────────────────────────────────────────
+forest_df <- cox_tidy %>%
+  dplyr::filter(grepl("score_diff$|score_s1$|score_s2$|lctNLCT|lct_bin", term),
+                !grepl(":", term)) %>%
+  dplyr::mutate(
+    label = paste0(model, ": ", term),
+    label = factor(label, levels = rev(unique(label)))
+  )
+
+p_forest <- ggplot(forest_df, aes(x = estimate, y = label,
+                                   xmin = conf.low, xmax = conf.high,
+                                   color = grepl("int", model))) +
+  geom_vline(xintercept = 1, linetype = "dashed", linewidth = 0.4, color = "grey50") +
+  geom_errorbarh(height = 0.25, linewidth = 0.6) +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = c("FALSE" = "#2166AC", "TRUE" = "#B2182B"),
+                     labels = c("Main effect", "Interaction model"),
+                     name = NULL) +
+  scale_x_log10() +
+  labs(x = "Hazard ratio (95% CI)", y = NULL,
+       title = "Cox regression — subtype scores vs survival") +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "top")
+
+print(p_forest)
+ggsave("figs/surv_cox_forest.pdf", plot = p_forest,
+       width = 7, height = 5, useDingbats = FALSE)
+```
+
+```{r surv_score_optimization, fig.width=9, fig.height=5}
+# ──────────────────────────────────────────────────────────────────────────────
+# EXPLORATORY (nothing saved). Stress-tests the scoring + modeling choices on the
+# S1-vs-S2 prognostic signal:
+#   (1) scorer:  unweighted mean logCPM [current] vs per-gene z vs |t|-weighted z
+#   (2) model:   continuous Cox (per 1 SD) vs mean-split vs median-split log-rank
+#   (3) confound: unadjusted vs + LCT
+# Leads with the single S1-minus-S2 axis (the cleanest contrast). Reuses objects
+# built earlier: logcpm_indep, meta_indep, deg_s1s2, genes_s1, genes_s2, score_df.
+# ──────────────────────────────────────────────────────────────────────────────
+library(survival); library(broom)
+stopifnot(exists("logcpm_indep"), exists("meta_indep"), exists("deg_s1s2"),
+          exists("genes_s1"), exists("genes_s2"), exists("score_df"))
+
+# signed, weighted signature on the shared gene set (S1 = +1, S2 = -1; w = |t|)
+opt_sig <- deg_s1s2 %>%
+  dplyr::filter(gene %in% c(genes_s1, genes_s2),
+                gene %in% rownames(logcpm_indep)) %>%
+  dplyr::transmute(gene,
+                   dir = ifelse(gene %in% genes_s1, 1, -1),
+                   w   = abs(t))
+cat(sprintf("signature genes used: %d (%d S1 / %d S2)\n",
+            nrow(opt_sig), sum(opt_sig$dir > 0), sum(opt_sig$dir < 0)))
+
+X  <- logcpm_indep[opt_sig$gene, , drop = FALSE]   # genes x samples
+Xz <- t(scale(t(X)))                               # per-gene z across samples
+
+# three S1-minus-S2 score variants (all oriented so higher = more S1-like)
+opt_scores <- data.frame(
+  sample = colnames(X),
+  mean   = score_df$score_s1[match(colnames(X), score_df$sample)] -
+           score_df$score_s2[match(colnames(X), score_df$sample)],
+  z      = colMeans(opt_sig$dir * Xz),
+  tw_z   = as.numeric(crossprod(opt_sig$dir * opt_sig$w, Xz)) / sum(opt_sig$w)
+)
+
+opt_surv <- opt_scores %>%
+  dplyr::left_join(
+    meta_indep %>% tibble::rownames_to_column("sample") %>%
+      dplyr::select(sample, lct, pfs_time, pfs_event, os_time, os_event),
+    by = "sample") %>%
+  dplyr::mutate(lct = factor(lct, levels = c("NLCT", "LCT")))
+
+methods   <- c(mean = "Unweighted mean logCPM (current)",
+               z    = "Per-gene z",
+               tw_z = "|t|-weighted z")
+endpoints <- list(PFS = c("pfs_time", "pfs_event"),
+                  OS  = c("os_time", "os_event"))
+
+ep_frame <- function(mc, ep) {
+  te <- endpoints[[ep]]
+  opt_surv %>%
+    dplyr::transmute(time = .data[[te[1]]], event = .data[[te[2]]], lct,
+                     score = as.numeric(scale(.data[[mc]]))) %>%
+    dplyr::filter(!is.na(time), !is.na(event), !is.na(score))
+}
+
+fit_cox <- function(d, adj) {
+  form <- if (adj == "+ LCT") Surv(time, event) ~ score + lct else Surv(time, event) ~ score
+  f <- coxph(form, data = d)
+  broom::tidy(f, exponentiate = TRUE, conf.int = TRUE) %>%
+    dplyr::filter(term == "score") %>%
+    dplyr::transmute(HR = estimate, conf.low, conf.high, p = p.value,
+                     c_index = summary(f)$concordance[1], adj = adj)
+}
+
+# (1)+(3): continuous Cox, every scorer x endpoint x adjustment
+opt_cox <- dplyr::bind_rows(lapply(names(methods), function(mc)
+  dplyr::bind_rows(lapply(names(endpoints), function(ep) {
+    d <- ep_frame(mc, ep)
+    dplyr::bind_rows(fit_cox(d, "unadjusted"), fit_cox(d, "+ LCT")) %>%
+      dplyr::mutate(method = mc, endpoint = ep)
+  }))))
+
+cat("\n=== Continuous Cox (HR per 1 SD of S1-minus-S2 score) ===\n")
+opt_cox %>%
+  dplyr::transmute(method = unname(methods[method]), endpoint, adj,
+                   HR = round(HR, 2),
+                   CI = sprintf("%.2f-%.2f", conf.low, conf.high),
+                   p = signif(p, 3), c_index = round(c_index, 3)) %>%
+  dplyr::arrange(endpoint, method, adj) %>% as_tibble() %>% print(n = Inf)
+
+# save continuous Cox (unadjusted + LCT-adjusted) for the supplementary
+write.csv(opt_cox, "results/surv_continuous_cox_by_scorer.csv", row.names = FALSE)
+
+# (2): dichotomization cost — continuous p vs mean/median split log-rank (unadjusted)
+lr_split <- function(d, fun) {
+  g  <- factor(ifelse(d$score >= fun(d$score), "High", "Low"))
+  sd <- survdiff(Surv(time, event) ~ g, data = d)
+  pchisq(sd$chisq, df = length(sd$n) - 1, lower.tail = FALSE)
+}
+opt_dich <- dplyr::bind_rows(lapply(names(methods), function(mc)
+  dplyr::bind_rows(lapply(names(endpoints), function(ep) {
+    d <- ep_frame(mc, ep)
+    data.frame(method = unname(methods[mc]), endpoint = ep,
+               cox_continuous = signif(fit_cox(d, "unadjusted")$p, 3),
+               logrank_mean   = signif(lr_split(d, mean), 3),
+               logrank_median = signif(lr_split(d, median), 3))
+  }))))
+cat("\n=== Dichotomization cost: continuous Cox p vs split log-rank p (unadjusted) ===\n")
+opt_dich %>% dplyr::arrange(endpoint, method) %>% as_tibble() %>% print(n = Inf)
+
+# figure: forest of continuous-Cox HRs, scorer x adjustment, faceted by endpoint
+opt_cox_plot <- opt_cox %>%
+  dplyr::mutate(method_lab = factor(unname(methods[method]), levels = rev(methods)),
+                adj = factor(adj, levels = c("unadjusted", "+ LCT")),
+                endpoint = factor(endpoint, levels = c("PFS", "OS")))
+
+ggplot(opt_cox_plot, aes(x = HR, y = method_lab, color = adj)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey70") +
+  geom_pointrange(aes(xmin = conf.low, xmax = conf.high),
+                  position = position_dodge(width = 0.55), size = 0.4) +
+  facet_wrap(~ endpoint) +
+  scale_x_log10() +
+  scale_color_manual(values = c("unadjusted" = "#B2182B", "+ LCT" = "#2166AC"),
+                     name = NULL) +
+  labs(x = "HR per 1 SD of S1-minus-S2 score (log scale)", y = NULL,
+       title = "Continuous Cox: subtype score vs outcome by scoring method") +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "top")
+```
+
+```{r surv_score_lct_addedvalue, fig.width=8, fig.height=4.5}
+# ──────────────────────────────────────────────────────────────────────────────
+# EXPLORATORY (nothing saved). Does the CONTINUOUS subtype score add prognostic
+# value ABOVE AND BEYOND the binary LCT label?
+#   (1) LRT:           Cox(~ lct) vs Cox(~ lct + score)  -> p for adding the score
+#   (2) discrimination: c-index + AIC for LCT-only / score-only / both
+#   (3) within-stratum: continuous-score Cox run separately within LCT and NLCT
+# Reuses opt_surv, methods, endpoints, ep_frame from the previous chunk.
+# score is standardized cohort-wide (per 1 SD) inside ep_frame, so HRs stay
+# comparable to the overall analysis even when fit within a stratum.
+# ──────────────────────────────────────────────────────────────────────────────
+library(survival)
+stopifnot(exists("opt_surv"), exists("ep_frame"),
+          exists("methods"), exists("endpoints"))
+
+cstat <- function(f) unname(summary(f)$concordance[1])
+
+# (1)+(2): LCT-only vs score-only vs both, with LRT for adding score to LCT
+addval <- dplyr::bind_rows(lapply(names(endpoints), function(ep) {
+  base  <- ep_frame("mean", ep)                       # lct identical across scorers
+  f_lct0 <- coxph(Surv(time, event) ~ lct, data = base)
+  lct_row <- data.frame(endpoint = ep, scorer = "-", model = "LCT only",
+                        c_index = cstat(f_lct0), AIC = AIC(f_lct0), lrt_p = NA_real_)
+  sc_rows <- dplyr::bind_rows(lapply(names(methods), function(mc) {
+    d      <- ep_frame(mc, ep)
+    f_lct  <- coxph(Surv(time, event) ~ lct,         data = d)
+    f_sc   <- coxph(Surv(time, event) ~ score,       data = d)
+    f_both <- coxph(Surv(time, event) ~ lct + score, data = d)
+    lrt_p  <- pchisq(2 * (f_both$loglik[2] - f_lct$loglik[2]),
+                     df = 1, lower.tail = FALSE)      # adding score to LCT
+    dplyr::bind_rows(
+      data.frame(endpoint = ep, scorer = unname(methods[mc]), model = "score only",
+                 c_index = cstat(f_sc),   AIC = AIC(f_sc),   lrt_p = NA_real_),
+      data.frame(endpoint = ep, scorer = unname(methods[mc]), model = "LCT + score",
+                 c_index = cstat(f_both), AIC = AIC(f_both), lrt_p = lrt_p)
+    )
+  }))
+  dplyr::bind_rows(lct_row, sc_rows)
+}))
+
+cat("=== Added value of continuous score over binary LCT ===\n")
+cat("LRT p = test of adding the score to an LCT-only model; lower AIC = better fit\n\n")
+addval %>%
+  dplyr::transmute(endpoint, scorer, model,
+                   c_index = round(c_index, 3), AIC = round(AIC, 1),
+                   lrt_p = ifelse(is.na(lrt_p), "-", as.character(signif(lrt_p, 3)))) %>%
+  dplyr::arrange(endpoint, scorer, model) %>% as_tibble() %>% print(n = Inf)
+
+# save LCT added-value (LCT-only / score-only / both: c-index, AIC, LRT) for the supplementary
+write.csv(addval, "results/surv_lct_addedvalue.csv", row.names = FALSE)
+
+# (3): within-stratum continuous-score Cox (per scorer x endpoint x LCT stratum)
+within_strat <- dplyr::bind_rows(lapply(names(methods), function(mc)
+  dplyr::bind_rows(lapply(names(endpoints), function(ep) {
+    d <- ep_frame(mc, ep)
+    dplyr::bind_rows(lapply(c("LCT", "NLCT"), function(grp) {
+      ds <- dplyr::filter(d, lct == grp)
+      if (nrow(ds) < 5 || sum(ds$event) < 3)
+        return(data.frame(scorer = unname(methods[mc]), endpoint = ep, stratum = grp,
+                          n = nrow(ds), events = sum(ds$event),
+                          HR = NA_real_, conf.low = NA_real_, conf.high = NA_real_,
+                          p = NA_real_))
+      s <- summary(coxph(Surv(time, event) ~ score, data = ds))
+      data.frame(scorer = unname(methods[mc]), endpoint = ep, stratum = grp,
+                 n = nrow(ds), events = sum(ds$event),
+                 HR = s$conf.int[1, "exp(coef)"], conf.low = s$conf.int[1, "lower .95"],
+                 conf.high = s$conf.int[1, "upper .95"], p = s$coefficients[1, "Pr(>|z|)"])
+    }))
+  }))))
+
+cat("\n=== Within-stratum continuous-score Cox (HR per 1 SD; NA = too few events) ===\n")
+within_strat %>%
+  dplyr::transmute(scorer, endpoint, stratum, n, events,
+                   HR = round(HR, 2),
+                   CI = ifelse(is.na(HR), "-", sprintf("%.2f-%.2f", conf.low, conf.high)),
+                   p  = ifelse(is.na(p), "-", as.character(signif(p, 3)))) %>%
+  dplyr::arrange(scorer, endpoint, stratum) %>% as_tibble() %>% print(n = Inf)
+
+# save within-stratum (LCT / NLCT) continuous-score Cox for the supplementary
+write.csv(within_strat, "results/surv_within_lct_cox.csv", row.names = FALSE)
+
+# figure: within-stratum forest for the mean scorer (primary), faceted by endpoint
+ws_plot <- within_strat %>%
+  dplyr::filter(scorer == unname(methods["mean"]), !is.na(HR)) %>%
+  dplyr::mutate(endpoint = factor(endpoint, levels = c("PFS", "OS")),
+                lab = sprintf("%s  (n=%d, e=%d)", stratum, n, events))
+
+ggplot(ws_plot, aes(x = HR, y = lab, color = stratum)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey70") +
+  geom_pointrange(aes(xmin = conf.low, xmax = conf.high), size = 0.5) +
+  facet_wrap(~ endpoint) +
+  scale_x_log10() +
+  scale_color_manual(values = c("LCT" = "#B2182B", "NLCT" = "#2166AC"), guide = "none") +
+  labs(x = "HR per 1 SD of S1-minus-S2 score (log scale)", y = NULL,
+       title = "Within-stratum prognostic effect of the subtype score (mean scorer)") +
+  theme_classic(base_size = 11)
+```
+
+```{r surv_lct_scatter_outcome, fig.width=5, fig.height=5}
+# ── 2. LCT vs subtype t-scatter colored by PFS event / time ───────────────────
+scatter_out <- t_merged %>%
+  dplyr::left_join(
+    surv_df %>% dplyr::select(sample, pfs_time, pfs_event, os_time, os_event),
+    by = c("gene" = "sample")   # gene column holds gene names, not samples — use separate join below
+  )
+
+# Join survival outcome per-sample onto score_df, then summarise at gene level isn't
+# meaningful — color by PFS event at sample level on the score scatter instead
+score_out <- surv_df %>%
+  dplyr::mutate(
+    pfs_status = factor(ifelse(pfs_event == 1, "Event", "Censored"),
+                        levels = c("Event", "Censored")),
+    os_status  = factor(ifelse(os_event  == 1, "Event", "Censored"),
+                        levels = c("Event", "Censored"))
+  )
+
+p_score_pfs <- ggplot(score_out,
+                      aes(x = score_diff, y = pfs_time,
+                          color = lct, shape = pfs_status)) +
+  geom_point(size = 2, alpha = 0.85, stroke = 0.3) +
+  scale_color_manual(values = lct_cols, name = "LCT") +
+  scale_shape_manual(values = c("Event" = 16, "Censored" = 1), name = "PFS") +
+  geom_smooth(aes(group = lct), method = "lm", se = FALSE,
+              linewidth = 0.7, linetype = "dashed") +
+  labs(x = "Score diff (S1 − S2)", y = "PFS time",
+       title = "Score diff vs PFS — by LCT & event") +
+  theme_classic(base_size = 11)
+
+p_score_os <- ggplot(score_out,
+                     aes(x = score_diff, y = os_time,
+                         color = lct, shape = os_status)) +
+  geom_point(size = 2, alpha = 0.85, stroke = 0.3) +
+  scale_color_manual(values = lct_cols, name = "LCT") +
+  scale_shape_manual(values = c("Event" = 16, "Censored" = 1), name = "OS") +
+  geom_smooth(aes(group = lct), method = "lm", se = FALSE,
+              linewidth = 0.7, linetype = "dashed") +
+  labs(x = "Score diff (S1 − S2)", y = "OS time",
+       title = "Score diff vs OS — by LCT & event") +
+  theme_classic(base_size = 11)
+
+p_score_outcome <- p_score_pfs / p_score_os
+print(p_score_outcome)
+ggsave("figs/surv_score_outcome_scatter.pdf", plot = p_score_outcome,
+       width = 5, height = 8, useDingbats = FALSE)
+```
+
+```{r surv_score_by_lct_violin, fig.width=5, fig.height=7}
+# ── 3. Score distributions by LCT status ─────────────────────────────────────
+score_vln <- surv_df %>%
+  dplyr::select(sample, lct, score_s1, score_s2, score_diff) %>%
+  tidyr::pivot_longer(c(score_s1, score_s2, score_diff),
+                      names_to = "score_type", values_to = "score") %>%
+  dplyr::mutate(
+    score_type = factor(score_type,
+                        levels = c("score_s1", "score_s2", "score_diff"),
+                        labels = c("Subtype 1", "Subtype 2", "S1 − S2")),
+    lct = factor(lct, levels = c("NLCT", "LCT"))
+  )
+
+pval_df <- score_vln %>%
+  dplyr::group_by(score_type) %>%
+  dplyr::summarise(
+    p = wilcox.test(score ~ lct)$p.value,
+    label = sprintf("p = %s", signif(p, 2)),
+    .groups = "drop"
+  )
+
+p_score_vln <- ggplot(score_vln, aes(x = lct, y = score, fill = lct)) +
+  geom_violin(trim = TRUE, alpha = 0.7, color = NA) +
+  geom_boxplot(width = 0.12, outlier.shape = NA, fill = "white", color = "grey30") +
+  geom_jitter(width = 0.07, size = 0.8, alpha = 0.5, color = "grey20") +
+  geom_text(data = pval_df, aes(x = 1.5, y = Inf, label = label),
+            vjust = 1.5, size = 3.2, inherit.aes = FALSE) +
+  scale_fill_manual(values = lct_cols) +
+  facet_wrap(~ score_type, scales = "free_y", ncol = 1) +
+  labs(x = NULL, y = "Score", title = "Subtype score distribution by LCT status") +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "none",
+        strip.background = element_blank(),
+        strip.text = element_text(face = "bold"))
+
+print(p_score_vln)
+ggsave("figs/surv_score_lct_violin.pdf", plot = p_score_vln,
+       width = 3.5, height = 7, useDingbats = FALSE)
+```
+
+```{r surv_voom_z_weighted_km, fig.width=9, fig.height=12}
+# Re-score independent cohort after TMM normalization + voom.
+# Compares unweighted per-gene z scores vs subtype-DEG t-weighted z scores.
+library(edgeR)
+library(limma)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(patchwork)
+library(survival)
+library(broom)
+
+if (!exists("mat_indep")) {
+  mat_indep <- readRDS("~/Rstudio/CTCL/int/surv.mat.rds")
+}
+if (!exists("meta_indep")) {
+  meta_indep <- readRDS("~/Rstudio/CTCL/int/surv.meta.ss.rds")
+}
+if (!exists("deg_s1s2")) {
+  deg_s1s2 <- readRDS("../fig4/results/res_skin_subtypes.rds")
+}
+if (!exists("n_sig")) {
+  n_sig <- 25
+}
+
+meta_voom <- meta_indep[colnames(mat_indep), , drop = FALSE] %>%
+  mutate(lct = factor(lct, levels = c("NLCT", "LCT")))
+
+stopifnot(identical(colnames(mat_indep), rownames(meta_voom)))
+
+dge_voom <- DGEList(counts = mat_indep)
+dge_voom <- calcNormFactors(dge_voom)
+
+# Keep the same simple expression rule as the primary analysis, then run voom.
+logcpm_voom_filter <- edgeR::cpm(dge_voom, log = TRUE)
+keep_voom <- rowSums(logcpm_voom_filter > 1) >= ceiling(0.10 * ncol(logcpm_voom_filter))
+dge_voom <- dge_voom[keep_voom, , keep.lib.sizes = FALSE]
+
+design_voom <- model.matrix(~ 1, data = meta_voom)
+voom_obj <- limma::voom(dge_voom, design = design_voom, plot = FALSE)
+voom_expr <- voom_obj$E
+
+genes_s1_voom <- deg_s1s2 %>%
+  filter(adj.P.Val < 0.05, logFC > 0) %>%
+  slice_max(t, n = n_sig) %>%
+  pull(gene) %>%
+  intersect(rownames(voom_expr))
+
+genes_s2_voom <- deg_s1s2 %>%
+  filter(adj.P.Val < 0.05, logFC < 0) %>%
+  slice_min(t, n = n_sig) %>%
+  pull(gene) %>%
+  intersect(rownames(voom_expr))
+
+cat("voom Subtype_1 signature genes:", length(genes_s1_voom), "\n")
+cat("voom Subtype_2 signature genes:", length(genes_s2_voom), "\n")
+
+z_by_gene <- function(x) {
+  gene_mean <- rowMeans(x, na.rm = TRUE)
+  gene_sd   <- apply(x, 1, sd, na.rm = TRUE)
+  z <- sweep(x, 1, gene_mean, "-")
+  z <- sweep(z, 1, gene_sd, "/")
+  z[!is.finite(z)] <- 0
+  z
+}
+
+weighted_score <- function(z_mat, genes, weights) {
+  w <- abs(weights)
+  w <- w / sum(w)
+  as.numeric(crossprod(w, z_mat[genes, , drop = FALSE]))
+}
+
+voom_z <- z_by_gene(voom_expr)
+t_lookup <- setNames(deg_s1s2$t, deg_s1s2$gene)
+
+score_z <- data.frame(
+  method     = "voom_z",
+  sample     = colnames(voom_z),
+  score_s1   = colMeans(voom_z[genes_s1_voom, , drop = FALSE]),
+  score_s2   = colMeans(voom_z[genes_s2_voom, , drop = FALSE])
+) %>%
+  mutate(score_diff = score_s1 - score_s2)
+
+score_tw <- data.frame(
+  method     = "voom_t_weighted_z",
+  sample     = colnames(voom_z),
+  score_s1   = weighted_score(voom_z, genes_s1_voom, t_lookup[genes_s1_voom]),
+  score_s2   = weighted_score(voom_z, genes_s2_voom, t_lookup[genes_s2_voom])
+) %>%
+  mutate(score_diff = score_s1 - score_s2)
+
+surv_voom_scores <- bind_rows(score_z, score_tw) %>%
+  left_join(
+    meta_voom %>%
+      select(lct, pfs_time, pfs_event, os_time, os_event) %>%
+      rownames_to_column("sample"),
+    by = "sample"
+  ) %>%
+  group_by(method) %>%
+  mutate(
+    Group_S1 = factor(
+      ifelse(score_s1 >= mean(score_s1, na.rm = TRUE), "S1_High", "S1_Low"),
+      levels = c("S1_High", "S1_Low")
+    ),
+    Group_S2 = factor(
+      ifelse(score_s2 >= mean(score_s2, na.rm = TRUE), "S2_High", "S2_Low"),
+      levels = c("S2_High", "S2_Low")
+    ),
+    Group_Diff = factor(
+      ifelse(score_diff >= mean(score_diff, na.rm = TRUE),
+             "Subtype_1_Like", "Subtype_2_Like"),
+      levels = c("Subtype_1_Like", "Subtype_2_Like")
+    )
+  ) %>%
+  ungroup()
+
+cat("voom z-score group counts:\n")
+surv_voom_scores %>%
+  filter(method == "voom_z") %>%
+  select(lct, Group_S1, Group_S2, Group_Diff) %>%
+  { list(
+      S1   = table(.$lct, .$Group_S1),
+      S2   = table(.$lct, .$Group_S2),
+      Diff = table(.$lct, .$Group_Diff)
+    ) } %>%
+  print()
+
+cat("voom t-weighted z-score group counts:\n")
+surv_voom_scores %>%
+  filter(method == "voom_t_weighted_z") %>%
+  select(lct, Group_S1, Group_S2, Group_Diff) %>%
+  { list(
+      S1   = table(.$lct, .$Group_S1),
+      S2   = table(.$lct, .$Group_S2),
+      Diff = table(.$lct, .$Group_Diff)
+    ) } %>%
+  print()
+
+km_theme_voom <- theme_classic(base_size = 10) +
+  theme(
+    legend.position = "top",
+    legend.title    = element_blank(),
+    legend.text     = element_text(size = 8),
+    plot.title      = element_text(face = "bold", size = 9),
+    axis.title      = element_text(size = 9)
+  )
+
+logrank_p_voom <- function(formula, data) {
+  sd <- survdiff(formula, data = data)
+  pchisq(sd$chisq, df = length(sd$n) - 1, lower.tail = FALSE)
+}
+
+make_km_voom <- function(formula, data, title, col_map) {
+  fit  <- survfit(formula, data = data)
+  pval <- logrank_p_voom(formula, data)
+  td <- broom::tidy(fit) %>%
+    mutate(strata = sub("^[^=]+=", "", strata))
+
+  ggplot(td, aes(x = time, y = estimate, color = strata)) +
+    geom_step(linewidth = 0.8) +
+    geom_point(data = td %>% filter(n.censor > 0),
+               aes(x = time, y = estimate, color = strata),
+               shape = 3, size = 2, show.legend = FALSE) +
+    scale_color_manual(values = col_map) +
+    scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
+    scale_x_continuous(expand = expansion(mult = c(0, 0.05))) +
+    annotate("text", x = -Inf, y = -Inf,
+             label = sprintf("p = %s", signif(pval, 2)),
+             hjust = -0.1, vjust = -0.5, size = 3.0) +
+    labs(title = title, x = "Time", y = "Survival probability") +
+    km_theme_voom
+}
+
+cm_s1   <- c("S1_High" = "#B2182B", "S1_Low" = "grey65")
+cm_s2   <- c("S2_High" = "#2166AC", "S2_Low" = "grey65")
+cm_diff <- c("Subtype_1_Like" = "#B2182B", "Subtype_2_Like" = "#2166AC")
+
+build_voom_km_row <- function(df, method_label) {
+  list(
+    pfs_s1   = make_km_voom(Surv(pfs_time, pfs_event) ~ Group_S1, df,
+                            paste0("PFS ", method_label, ": Subtype 1 score"), cm_s1),
+    pfs_s2   = make_km_voom(Surv(pfs_time, pfs_event) ~ Group_S2, df,
+                            paste0("PFS ", method_label, ": Subtype 2 score"), cm_s2),
+    pfs_diff = make_km_voom(Surv(pfs_time, pfs_event) ~ Group_Diff, df,
+                            paste0("PFS ", method_label, ": S1 vs S2"), cm_diff),
+    os_s1    = make_km_voom(Surv(os_time, os_event) ~ Group_S1, df,
+                            paste0("OS ", method_label, ": Subtype 1 score"), cm_s1),
+    os_s2    = make_km_voom(Surv(os_time, os_event) ~ Group_S2, df,
+                            paste0("OS ", method_label, ": Subtype 2 score"), cm_s2),
+    os_diff  = make_km_voom(Surv(os_time, os_event) ~ Group_Diff, df,
+                            paste0("OS ", method_label, ": S1 vs S2"), cm_diff)
+  )
+}
+
+km_z <- surv_voom_scores %>%
+  filter(method == "voom_z") %>%
+  build_voom_km_row("z")
+
+km_tw <- surv_voom_scores %>%
+  filter(method == "voom_t_weighted_z") %>%
+  build_voom_km_row("t-weighted z")
+
+p_voom_km_grid <-
+  (km_z$pfs_s1  | km_z$pfs_s2  | km_z$pfs_diff) /
+  (km_z$os_s1   | km_z$os_s2   | km_z$os_diff)  /
+  (km_tw$pfs_s1 | km_tw$pfs_s2 | km_tw$pfs_diff) /
+  (km_tw$os_s1  | km_tw$os_s2  | km_tw$os_diff)
+
+print(p_voom_km_grid)
+
+dir.create("figs", showWarnings = FALSE, recursive = TRUE)
+ggsave("figs/surv_voom_z_weighted_km_curves.pdf", plot = p_voom_km_grid,
+       width = 9, height = 12, useDingbats = FALSE)
+```
+
+```{r surv_voom_ngenes_sensitivity, fig.width=11, fig.height=8}
+# Sensitivity analysis: vary signature size and summarize prognostic signal.
+library(edgeR)
+library(limma)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(patchwork)
+library(survival)
+
+if (!exists("mat_indep")) {
+  mat_indep <- readRDS("~/Rstudio/CTCL/int/surv.mat.rds")
+}
+if (!exists("meta_indep")) {
+  meta_indep <- readRDS("~/Rstudio/CTCL/int/surv.meta.ss.rds")
+}
+if (!exists("deg_s1s2")) {
+  deg_s1s2 <- readRDS("../fig4/results/res_skin_subtypes.rds")
+}
+
+meta_ng <- meta_indep[colnames(mat_indep), , drop = FALSE] %>%
+  mutate(lct = factor(lct, levels = c("NLCT", "LCT")))
+
+stopifnot(identical(colnames(mat_indep), rownames(meta_ng)))
+
+if (!exists("voom_z")) {
+  dge_ng <- DGEList(counts = mat_indep)
+  dge_ng <- calcNormFactors(dge_ng)
+  logcpm_ng_filter <- edgeR::cpm(dge_ng, log = TRUE)
+  keep_ng <- rowSums(logcpm_ng_filter > 1) >= ceiling(0.10 * ncol(logcpm_ng_filter))
+  dge_ng <- dge_ng[keep_ng, , keep.lib.sizes = FALSE]
+
+  voom_ng <- limma::voom(dge_ng, design = model.matrix(~ 1, data = meta_ng), plot = FALSE)
+  voom_expr_ng <- voom_ng$E
+
+  gene_mean_ng <- rowMeans(voom_expr_ng, na.rm = TRUE)
+  gene_sd_ng <- apply(voom_expr_ng, 1, sd, na.rm = TRUE)
+  voom_z <- sweep(voom_expr_ng, 1, gene_mean_ng, "-")
+  voom_z <- sweep(voom_z, 1, gene_sd_ng, "/")
+  voom_z[!is.finite(voom_z)] <- 0
+}
+
+t_lookup_ng <- setNames(deg_s1s2$t, deg_s1s2$gene)
+n_vals <- c(5, 10, 15, 20, 25, 30, 40, 50, 75, 100)
+
+make_weighted_score_ng <- function(z_mat, genes, weights) {
+  w <- abs(weights)
+  w <- w / sum(w)
+  as.numeric(crossprod(w, z_mat[genes, , drop = FALSE]))
+}
+
+score_for_n <- function(n, method) {
+  genes_s1_n <- deg_s1s2 %>%
+    filter(adj.P.Val < 0.05, logFC > 0) %>%
+    slice_max(t, n = n) %>%
+    pull(gene) %>%
+    intersect(rownames(voom_z))
+
+  genes_s2_n <- deg_s1s2 %>%
+    filter(adj.P.Val < 0.05, logFC < 0) %>%
+    slice_min(t, n = n) %>%
+    pull(gene) %>%
+    intersect(rownames(voom_z))
+
+  if (method == "voom_z") {
+    score_s1_n <- colMeans(voom_z[genes_s1_n, , drop = FALSE])
+    score_s2_n <- colMeans(voom_z[genes_s2_n, , drop = FALSE])
+  } else {
+    score_s1_n <- make_weighted_score_ng(voom_z, genes_s1_n, t_lookup_ng[genes_s1_n])
+    score_s2_n <- make_weighted_score_ng(voom_z, genes_s2_n, t_lookup_ng[genes_s2_n])
+  }
+
+  data.frame(
+    n_genes   = n,
+    method    = method,
+    sample    = colnames(voom_z),
+    score_s1  = score_s1_n,
+    score_s2  = score_s2_n,
+    n_s1_used = length(genes_s1_n),
+    n_s2_used = length(genes_s2_n)
+  ) %>%
+    mutate(score_diff = score_s1 - score_s2)
+}
+
+score_ng <- bind_rows(lapply(n_vals, function(n) {
+  bind_rows(
+    score_for_n(n, "voom_z"),
+    score_for_n(n, "voom_t_weighted_z")
+  )
+})) %>%
+  left_join(
+    meta_ng %>%
+      select(lct, pfs_time, pfs_event, os_time, os_event) %>%
+      rownames_to_column("sample"),
+    by = "sample"
+  )
+
+cat("Genes retained per requested signature size:\n")
+score_ng %>%
+  distinct(method, n_genes, n_s1_used, n_s2_used) %>%
+  arrange(method, n_genes) %>%
+  as_tibble() %>%
+  print(n = Inf)
+
+cox_summary_ng <- function(df, score_var, endpoint) {
+  time_var <- ifelse(endpoint == "PFS", "pfs_time", "os_time")
+  event_var <- ifelse(endpoint == "PFS", "pfs_event", "os_event")
+  dat <- df %>%
+    transmute(
+      time  = .data[[time_var]],
+      event = .data[[event_var]],
+      score = as.numeric(scale(.data[[score_var]]))
+    ) %>%
+    filter(!is.na(time), !is.na(event), !is.na(score))
+
+  fit <- coxph(Surv(time, event) ~ score, data = dat)
+  fit_sum <- summary(fit)
+
+  data.frame(
+    endpoint  = endpoint,
+    metric    = score_var,
+    test      = "Continuous Cox",
+    estimate  = unname(fit_sum$conf.int[1, "exp(coef)"]),
+    conf.low  = unname(fit_sum$conf.int[1, "lower .95"]),
+    conf.high = unname(fit_sum$conf.int[1, "upper .95"]),
+    p.value   = unname(fit_sum$coefficients[1, "Pr(>|z|)"]),
+    c_index   = unname(fit_sum$concordance[1])
+  )
+}
+
+logrank_summary_ng <- function(df, score_var, endpoint) {
+  time_var <- ifelse(endpoint == "PFS", "pfs_time", "os_time")
+  event_var <- ifelse(endpoint == "PFS", "pfs_event", "os_event")
+  dat <- df %>%
+    transmute(
+      time  = .data[[time_var]],
+      event = .data[[event_var]],
+      group = ifelse(.data[[score_var]] >= mean(.data[[score_var]], na.rm = TRUE),
+                     "High", "Low")
+    ) %>%
+    filter(!is.na(time), !is.na(event), !is.na(group)) %>%
+    mutate(group = factor(group, levels = c("High", "Low")))
+
+  sd <- survdiff(Surv(time, event) ~ group, data = dat)
+
+  data.frame(
+    endpoint  = endpoint,
+    metric    = score_var,
+    test      = "Mean-cut logrank",
+    estimate  = NA_real_,
+    conf.low  = NA_real_,
+    conf.high = NA_real_,
+    p.value   = pchisq(sd$chisq, df = length(sd$n) - 1, lower.tail = FALSE),
+    c_index   = NA_real_
+  )
+}
+
+ng_results <- score_ng %>%
+  group_by(method, n_genes) %>%
+  group_modify(~ bind_rows(lapply(c("score_s1", "score_s2", "score_diff"), function(score_var) {
+    bind_rows(
+      cox_summary_ng(.x, score_var, "PFS"),
+      cox_summary_ng(.x, score_var, "OS"),
+      logrank_summary_ng(.x, score_var, "PFS"),
+      logrank_summary_ng(.x, score_var, "OS")
+    )
+  }))) %>%
+  ungroup() %>%
+  mutate(
+    metric = factor(metric,
+                    levels = c("score_s1", "score_s2", "score_diff"),
+                    labels = c("Subtype 1 score", "Subtype 2 score", "S1 - S2")),
+    method = factor(method,
+                    levels = c("voom_z", "voom_t_weighted_z"),
+                    labels = c("voom z", "voom t-weighted z")),
+    endpoint = factor(endpoint, levels = c("PFS", "OS")),
+    test = factor(test, levels = c("Continuous Cox", "Mean-cut logrank")),
+    neg_log10_p = -log10(pmax(p.value, .Machine$double.xmin))
+  )
+
+print(ng_results %>%
+        select(method, n_genes, endpoint, metric, test, p.value, c_index) %>%
+        arrange(method, endpoint, metric, test, n_genes) %>%
+        as_tibble(),
+      n = Inf)
+
+p_ng_p <- ggplot(ng_results,
+                 aes(x = n_genes, y = neg_log10_p,
+                     color = metric, linetype = endpoint)) +
+  geom_hline(yintercept = -log10(0.05), color = "grey55",
+             linetype = "dashed", linewidth = 0.35) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.8) +
+  facet_grid(test ~ method) +
+  scale_x_continuous(breaks = n_vals) +
+  scale_color_manual(values = c("Subtype 1 score" = "#B2182B",
+                                "Subtype 2 score" = "#2166AC",
+                                "S1 - S2" = "grey20")) +
+  labs(x = "Genes per subtype signature",
+       y = "-log10(p)",
+       color = NULL,
+       linetype = NULL,
+       title = "Prognostic signal across signature sizes") +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "top",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+p_ng_c <- ng_results %>%
+  filter(test == "Continuous Cox") %>%
+  ggplot(aes(x = n_genes, y = c_index,
+             color = metric, linetype = endpoint)) +
+  geom_hline(yintercept = 0.5, color = "grey55",
+             linetype = "dashed", linewidth = 0.35) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.8) +
+  facet_wrap(~ method, ncol = 2) +
+  scale_x_continuous(breaks = n_vals) +
+  scale_color_manual(values = c("Subtype 1 score" = "#B2182B",
+                                "Subtype 2 score" = "#2166AC",
+                                "S1 - S2" = "grey20")) +
+  labs(x = "Genes per subtype signature",
+       y = "C-index",
+       color = NULL,
+       linetype = NULL,
+       title = "Continuous Cox discrimination across signature sizes") +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "top",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+p_ng_sensitivity <- p_ng_p / p_ng_c
+print(p_ng_sensitivity)
+
+dir.create("figs", showWarnings = FALSE, recursive = TRUE)
+ggsave("figs/surv_voom_ngenes_sensitivity.pdf", plot = p_ng_sensitivity,
+       width = 11, height = 8, useDingbats = FALSE)
+
+write.csv(ng_results, "figs/surv_voom_ngenes_sensitivity.csv", row.names = FALSE)
+```
+
+```{r surv_gene_expression_os_cox, fig.width=10, fig.height=7}
+# Gene-wise Cox models of OS in the independent cohort.
+# Right-censored samples contribute information until censoring, then leave the
+# risk set automatically through Surv(os_time, os_event).
+library(edgeR)
+library(limma)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(ggrepel)
+library(survival)
+
+if (!exists("mat_indep")) {
+  mat_indep <- readRDS("~/Rstudio/CTCL/int/surv.mat.rds")
+}
+if (!exists("meta_indep")) {
+  meta_indep <- readRDS("~/Rstudio/CTCL/int/surv.meta.ss.rds")
+}
+
+meta_os <- meta_indep[colnames(mat_indep), , drop = FALSE] %>%
+  mutate(lct = factor(lct, levels = c("NLCT", "LCT")))
+
+stopifnot(identical(colnames(mat_indep), rownames(meta_os)))
+
+if (!exists("voom_expr")) {
+  dge_os <- DGEList(counts = mat_indep)
+  dge_os <- calcNormFactors(dge_os)
+  logcpm_os_filter <- edgeR::cpm(dge_os, log = TRUE)
+  keep_os <- rowSums(logcpm_os_filter > 1) >= ceiling(0.10 * ncol(logcpm_os_filter))
+  dge_os <- dge_os[keep_os, , keep.lib.sizes = FALSE]
+  voom_os <- limma::voom(dge_os, design = model.matrix(~ 1, data = meta_os), plot = FALSE)
+  voom_expr_os <- voom_os$E
+} else {
+  voom_expr_os <- voom_expr
+}
+
+os_df_base <- meta_os %>%
+  rownames_to_column("sample") %>%
+  select(sample, os_time, os_event, lct) %>%
+  filter(!is.na(os_time), !is.na(os_event))
+
+voom_expr_os <- voom_expr_os[, os_df_base$sample, drop = FALSE]
+
+cat("OS gene-wise Cox screen:\n")
+cat("Samples:", nrow(os_df_base), "\n")
+cat("OS events:", sum(os_df_base$os_event == 1), "\n")
+cat("Genes tested:", nrow(voom_expr_os), "\n")
+cat("LCT status:\n"); print(table(os_df_base$lct))
+
+fit_gene_os <- function(expr, gene, adjust_lct = FALSE) {
+  dat <- os_df_base %>%
+    mutate(expr_z = as.numeric(scale(expr)))
+
+  if (sd(dat$expr_z, na.rm = TRUE) == 0 || all(is.na(dat$expr_z))) {
+    return(data.frame(
+      gene = gene,
+      model = ifelse(adjust_lct, "Expression + LCT", "Expression only"),
+      logHR = NA_real_,
+      HR = NA_real_,
+      conf.low = NA_real_,
+      conf.high = NA_real_,
+      p.value = NA_real_,
+      c_index = NA_real_
+    ))
+  }
+
+  form <- if (adjust_lct) {
+    Surv(os_time, os_event) ~ expr_z + lct
+  } else {
+    Surv(os_time, os_event) ~ expr_z
+  }
+
+  fit <- tryCatch(
+    coxph(form, data = dat),
+    warning = function(w) suppressWarnings(coxph(form, data = dat)),
+    error = function(e) NULL
+  )
+
+  if (is.null(fit) || !"expr_z" %in% rownames(summary(fit)$coefficients)) {
+    return(data.frame(
+      gene = gene,
+      model = ifelse(adjust_lct, "Expression + LCT", "Expression only"),
+      logHR = NA_real_,
+      HR = NA_real_,
+      conf.low = NA_real_,
+      conf.high = NA_real_,
+      p.value = NA_real_,
+      c_index = NA_real_
+    ))
+  }
+
+  fit_sum <- summary(fit)
+
+  data.frame(
+    gene = gene,
+    model = ifelse(adjust_lct, "Expression + LCT", "Expression only"),
+    logHR = unname(fit_sum$coefficients["expr_z", "coef"]),
+    HR = unname(fit_sum$conf.int["expr_z", "exp(coef)"]),
+    conf.low = unname(fit_sum$conf.int["expr_z", "lower .95"]),
+    conf.high = unname(fit_sum$conf.int["expr_z", "upper .95"]),
+    p.value = unname(fit_sum$coefficients["expr_z", "Pr(>|z|)"]),
+    c_index = unname(fit_sum$concordance[1])
+  )
+}
+
+cox_gene_unadj <- bind_rows(lapply(rownames(voom_expr_os), function(gene) {
+  fit_gene_os(voom_expr_os[gene, ], gene, adjust_lct = FALSE)
+}))
+
+cox_gene_lct <- bind_rows(lapply(rownames(voom_expr_os), function(gene) {
+  fit_gene_os(voom_expr_os[gene, ], gene, adjust_lct = TRUE)
+}))
+
+cox_gene_os <- bind_rows(cox_gene_unadj, cox_gene_lct) %>%
+  group_by(model) %>%
+  mutate(adj.P.Val = p.adjust(p.value, method = "BH")) %>%
+  ungroup() %>%
+  mutate(
+    model = factor(model, levels = c("Expression only", "Expression + LCT")),
+    direction = case_when(
+      is.na(p.value) ~ "Not fit",
+      adj.P.Val < 0.05 & logHR > 0 ~ "Higher expression = worse OS",
+      adj.P.Val < 0.05 & logHR < 0 ~ "Higher expression = better OS",
+      TRUE ~ "NS"
+    ),
+    direction = factor(direction,
+                       levels = c("Higher expression = worse OS",
+                                  "Higher expression = better OS",
+                                  "NS", "Not fit"))
+  )
+
+cat("FDR < 0.05 counts:\n")
+cox_gene_os %>%
+  filter(!is.na(adj.P.Val)) %>%
+  count(model, direction) %>%
+  print(n = Inf)
+
+cat("Top unadjusted OS genes:\n")
+cox_gene_os %>%
+  filter(model == "Expression only") %>%
+  arrange(p.value) %>%
+  select(gene, logHR, HR, conf.low, conf.high, p.value, adj.P.Val, c_index) %>%
+  head(25) %>%
+  print(n = 25)
+
+cat("Top LCT-adjusted OS genes:\n")
+cox_gene_os %>%
+  filter(model == "Expression + LCT") %>%
+  arrange(p.value) %>%
+  select(gene, logHR, HR, conf.low, conf.high, p.value, adj.P.Val, c_index) %>%
+  head(25) %>%
+  print(n = 25)
+
+label_genes_os <- cox_gene_os %>%
+  filter(!is.na(p.value)) %>%
+  group_by(model) %>%
+  slice_min(p.value, n = 12, with_ties = FALSE) %>%
+  ungroup()
+
+cox_gene_cols <- c(
+  "Higher expression = worse OS" = "#B2182B",
+  "Higher expression = better OS" = "#2166AC",
+  "NS" = "grey75",
+  "Not fit" = "grey40"
+)
+
+p_gene_os_volcano <- cox_gene_os %>%
+  filter(!is.na(p.value), is.finite(logHR)) %>%
+  ggplot(aes(x = logHR, y = -log10(p.value), color = direction)) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed",
+             color = "grey55", linewidth = 0.35) +
+  geom_vline(xintercept = 0, color = "grey55", linewidth = 0.35) +
+  geom_point(size = 1.1, alpha = 0.8, stroke = 0) +
+  ggrepel::geom_text_repel(
+    data = label_genes_os,
+    aes(label = gene),
+    size = 2.6,
+    max.overlaps = Inf,
+    box.padding = 0.25,
+    min.segment.length = 0
+  ) +
+  facet_wrap(~ model, ncol = 2) +
+  scale_color_manual(values = cox_gene_cols, drop = FALSE) +
+  labs(
+    title = "Gene-wise Cox models for OS in independent cohort",
+    subtitle = "Expression terms are per-gene z-scored voom values; censored samples handled by Cox risk sets",
+    x = "log hazard ratio per 1 SD expression",
+    y = "-log10(p)",
+    color = NULL
+  ) +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "top")
+
+print(p_gene_os_volcano)
+
+top_forest_os <- cox_gene_os %>%
+  filter(model == "Expression only", !is.na(p.value)) %>%
+  arrange(p.value) %>%
+  slice_head(n = 20) %>%
+  mutate(gene = factor(gene, levels = rev(gene)))
+
+p_gene_os_forest <- ggplot(top_forest_os,
+                           aes(x = HR, y = gene,
+                               xmin = conf.low, xmax = conf.high,
+                               color = logHR > 0)) +
+  geom_vline(xintercept = 1, linetype = "dashed",
+             color = "grey55", linewidth = 0.35) +
+  geom_errorbar(orientation = "y", width = 0.2, linewidth = 0.6) +
+  geom_point(size = 2) +
+  scale_x_log10() +
+  scale_color_manual(values = c("FALSE" = "#2166AC", "TRUE" = "#B2182B"),
+                     labels = c("Better OS", "Worse OS"),
+                     name = NULL) +
+  labs(
+    title = "Top OS-associated genes",
+    subtitle = "Expression-only Cox model",
+    x = "Hazard ratio per 1 SD expression",
+    y = NULL
+  ) +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "top")
+
+print(p_gene_os_forest)
+
+dir.create("figs", showWarnings = FALSE, recursive = TRUE)
+write.csv(cox_gene_os, "figs/surv_gene_expression_os_cox.csv", row.names = FALSE)
+ggsave("figs/surv_gene_expression_os_cox_volcano.pdf", plot = p_gene_os_volcano,
+       width = 10, height = 6.5, useDingbats = FALSE)
+ggsave("figs/surv_gene_expression_os_cox_forest.pdf", plot = p_gene_os_forest,
+       width = 5.5, height = 6.5, useDingbats = FALSE)
+```
+
+```{r surv_tcell_fraction_vs_outcome, fig.width=8, fig.height=7}
+# Marker-based estimate of T-cell abundance in each independent bulk sample.
+# This is a relative marker fraction, not a literal deconvolved cell percentage.
+library(edgeR)
+library(limma)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(patchwork)
+library(survival)
+
+if (!exists("mat_indep")) {
+  mat_indep <- readRDS("~/Rstudio/CTCL/int/surv.mat.rds")
+}
+if (!exists("meta_indep")) {
+  meta_indep <- readRDS("~/Rstudio/CTCL/int/surv.meta.ss.rds")
+}
+
+meta_tcell <- meta_indep[colnames(mat_indep), , drop = FALSE] %>%
+  mutate(lct = factor(lct, levels = c("NLCT", "LCT")))
+
+stopifnot(identical(colnames(mat_indep), rownames(meta_tcell)))
+
+if (!exists("voom_expr")) {
+  dge_tcell <- DGEList(counts = mat_indep)
+  dge_tcell <- calcNormFactors(dge_tcell)
+  logcpm_tcell_filter <- edgeR::cpm(dge_tcell, log = TRUE)
+  keep_tcell <- rowSums(logcpm_tcell_filter > 1) >= ceiling(0.10 * ncol(logcpm_tcell_filter))
+  dge_tcell <- dge_tcell[keep_tcell, , keep.lib.sizes = FALSE]
+  voom_tcell <- limma::voom(dge_tcell, design = model.matrix(~ 1, data = meta_tcell), plot = FALSE)
+  expr_tcell <- voom_tcell$E
+} else {
+  expr_tcell <- voom_expr
+}
+
+lineage_markers <- list(
+  T_cell = c("CD3D", "CD3E", "CD3G", "TRAC", "TRBC1", "TRBC2",
+             "CD2", "CD5", "CD247", "LCK", "LAT"),
+  B_cell = c("MS4A1", "CD79A", "CD79B", "CD19", "BANK1", "CD22"),
+  Myeloid = c("LYZ", "LST1", "AIF1", "CD68", "FCGR3A", "CSF1R"),
+  Keratinocyte = c("KRT5", "KRT14", "KRT1", "KRT10", "KRTDAP", "DSG1"),
+  Fibroblast = c("COL1A1", "COL1A2", "DCN", "LUM", "COL3A1", "PDGFRA"),
+  Endothelial = c("PECAM1", "VWF", "KDR", "ENG", "EMCN", "CLDN5")
+)
+
+lineage_markers_present <- lapply(lineage_markers, intersect, y = rownames(expr_tcell))
+cat("Lineage marker genes retained:\n")
+print(sapply(lineage_markers_present, length))
+
+marker_module_expr <- sapply(names(lineage_markers_present), function(nm) {
+  genes <- lineage_markers_present[[nm]]
+  if (length(genes) == 0) {
+    rep(NA_real_, ncol(expr_tcell))
+  } else {
+    colMeans(2^expr_tcell[genes, , drop = FALSE], na.rm = TRUE)
+  }
+})
+rownames(marker_module_expr) <- colnames(expr_tcell)
+
+tcell_fraction_df <- as.data.frame(marker_module_expr) %>%
+  rownames_to_column("sample") %>%
+  mutate(
+    marker_total = rowSums(across(all_of(names(lineage_markers_present))), na.rm = TRUE),
+    tcell_fraction = T_cell / marker_total,
+    tcell_percent = 100 * tcell_fraction
+  ) %>%
+  left_join(
+    meta_tcell %>%
+      select(lct, pfs_time, pfs_event, os_time, os_event) %>%
+      rownames_to_column("sample"),
+    by = "sample"
+  ) %>%
+  mutate(
+    pfs_status = factor(ifelse(pfs_event == 1, "Event", "Censored"),
+                        levels = c("Event", "Censored")),
+    pfs_status = factor(ifelse(pfs_event == 1, "Event", "Censored"),
+                       levels = c("Event", "Censored"))
+  )
+
+cat("Estimated T-cell marker percent summary:\n")
+tcell_fraction_df %>%
+  group_by(lct) %>%
+  summarise(
+    n = n(),
+    median_tcell_percent = median(tcell_percent, na.rm = TRUE),
+    mean_tcell_percent = mean(tcell_percent, na.rm = TRUE),
+    sd_tcell_percent = sd(tcell_percent, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  print()
+
+cox_tcell <- function(endpoint) {
+  time_var <- ifelse(endpoint == "PFS", "pfs_time", "os_time")
+  event_var <- ifelse(endpoint == "PFS", "pfs_event", "os_event")
+  dat <- tcell_fraction_df %>%
+    transmute(
+      time = .data[[time_var]],
+      event = .data[[event_var]],
+      tcell_percent_z = as.numeric(scale(tcell_percent))
+    ) %>%
+    filter(!is.na(time), !is.na(event), !is.na(tcell_percent_z))
+
+  fit <- coxph(Surv(time, event) ~ tcell_percent_z, data = dat)
+  fit_sum <- summary(fit)
+
+  data.frame(
+    endpoint = endpoint,
+    HR_per_1sd = unname(fit_sum$conf.int[1, "exp(coef)"]),
+    conf.low = unname(fit_sum$conf.int[1, "lower .95"]),
+    conf.high = unname(fit_sum$conf.int[1, "upper .95"]),
+    p.value = unname(fit_sum$coefficients[1, "Pr(>|z|)"]),
+    c_index = unname(fit_sum$concordance[1])
+  )
+}
+
+tcell_cox_results <- bind_rows(cox_tcell("PFS"), cox_tcell("OS"))
+cat("Cox models for estimated T-cell marker percent:\n")
+print(tcell_cox_results)
+
+lct_cols <- c("NLCT" = "#4393C3", "LCT" = "#B2182B")
+
+make_tcell_outcome_plot <- function(y_var, status_var, y_lab, title) {
+  ggplot(tcell_fraction_df,
+         aes(x = tcell_percent, y = .data[[y_var]],
+             color = lct, shape = .data[[status_var]])) +
+    geom_point(size = 2.2, alpha = 0.85, stroke = 0.35) +
+    geom_smooth(
+      aes(x = tcell_percent, y = .data[[y_var]], color = lct, group = lct),
+      method = "lm", se = TRUE, linewidth = 0.7, alpha = 0.15,
+      inherit.aes = FALSE
+    ) +
+    scale_color_manual(values = lct_cols, name = "LCT") +
+    scale_shape_manual(values = c("Event" = 16, "Censored" = 1), name = NULL) +
+    labs(x = "Estimated T-cell marker percent",
+         y = y_lab,
+         title = title) +
+    theme_classic(base_size = 11) +
+    theme(legend.position = "top")
+}
+
+p_tcell_pfs <- make_tcell_outcome_plot(
+  "pfs_time", "pfs_status", "PFS time",
+  "Estimated T-cell abundance vs PFS"
+)
+
+p_tcell_os <- make_tcell_outcome_plot(
+  "pfs_time", "pfs_status", "PFS time",
+  "Estimated T-cell abundance vs OS"
+)
+
+p_tcell_outcome <- p_tcell_pfs / p_tcell_os
+print(p_tcell_outcome)
+
+p_tcell_lct <- ggplot(tcell_fraction_df, aes(x = lct, y = tcell_percent, fill = lct)) +
+  geom_violin(trim = TRUE, alpha = 0.7, color = NA) +
+  geom_boxplot(width = 0.14, outlier.shape = NA, fill = "white", color = "grey30") +
+  geom_jitter(width = 0.08, size = 1, alpha = 0.6, color = "grey20") +
+  scale_fill_manual(values = lct_cols) +
+  labs(x = NULL, y = "Estimated T-cell marker percent",
+       title = "Estimated T-cell abundance by LCT status") +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "none")
+
+print(p_tcell_lct)
+
+dir.create("figs", showWarnings = FALSE, recursive = TRUE)
+write.csv(tcell_fraction_df, "figs/surv_estimated_tcell_fraction.csv", row.names = FALSE)
+write.csv(tcell_cox_results, "figs/surv_estimated_tcell_fraction_cox.csv", row.names = FALSE)
+ggsave("figs/surv_estimated_tcell_fraction_vs_outcome.pdf", plot = p_tcell_outcome,
+       width = 6, height = 8, useDingbats = FALSE)
+ggsave("figs/surv_estimated_tcell_fraction_lct_violin.pdf", plot = p_tcell_lct,
+       width = 3.5, height = 4, useDingbats = FALSE)
+```
+
+```{r surv_marker_imputed_cell_populations, fig.width=11, fig.height=5}
+# Plot marker-imputed relative lineage composition across samples.
+# These are normalized marker-module fractions, not validated deconvolved cell percentages.
+library(edgeR)
+library(limma)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+
+if (!exists("tcell_fraction_df")) {
+  if (!exists("mat_indep")) {
+    mat_indep <- readRDS("~/Rstudio/CTCL/int/surv.mat.rds")
+  }
+  if (!exists("meta_indep")) {
+    meta_indep <- readRDS("~/Rstudio/CTCL/int/surv.meta.ss.rds")
+  }
+
+  meta_tcell <- meta_indep[colnames(mat_indep), , drop = FALSE] %>%
+    mutate(lct = factor(lct, levels = c("NLCT", "LCT")))
+
+  dge_tcell <- DGEList(counts = mat_indep)
+  dge_tcell <- calcNormFactors(dge_tcell)
+  logcpm_tcell_filter <- edgeR::cpm(dge_tcell, log = TRUE)
+  keep_tcell <- rowSums(logcpm_tcell_filter > 1) >= ceiling(0.10 * ncol(logcpm_tcell_filter))
+  dge_tcell <- dge_tcell[keep_tcell, , keep.lib.sizes = FALSE]
+  voom_tcell <- limma::voom(dge_tcell, design = model.matrix(~ 1, data = meta_tcell), plot = FALSE)
+  expr_tcell <- voom_tcell$E
+
+  lineage_markers <- list(
+    T_cell = c("CD3D", "CD3E", "CD3G", "TRAC", "TRBC1", "TRBC2",
+               "CD2", "CD5", "CD247", "LCK", "LAT"),
+    B_cell = c("MS4A1", "CD79A", "CD79B", "CD19", "BANK1", "CD22"),
+    Myeloid = c("LYZ", "LST1", "AIF1", "CD68", "FCGR3A", "CSF1R"),
+    Keratinocyte = c("KRT5", "KRT14", "KRT1", "KRT10", "KRTDAP", "DSG1"),
+    Fibroblast = c("COL1A1", "COL1A2", "DCN", "LUM", "COL3A1", "PDGFRA"),
+    Endothelial = c("PECAM1", "VWF", "KDR", "ENG", "EMCN", "CLDN5")
+  )
+
+  lineage_markers_present <- lapply(lineage_markers, intersect, y = rownames(expr_tcell))
+  marker_module_expr <- sapply(names(lineage_markers_present), function(nm) {
+    genes <- lineage_markers_present[[nm]]
+    if (length(genes) == 0) {
+      rep(NA_real_, ncol(expr_tcell))
+    } else {
+      colMeans(2^expr_tcell[genes, , drop = FALSE], na.rm = TRUE)
+    }
+  })
+  rownames(marker_module_expr) <- colnames(expr_tcell)
+
+  tcell_fraction_df <- as.data.frame(marker_module_expr) %>%
+    rownames_to_column("sample") %>%
+    mutate(
+      marker_total = rowSums(across(all_of(names(lineage_markers_present))), na.rm = TRUE),
+      tcell_fraction = T_cell / marker_total,
+      tcell_percent = 100 * tcell_fraction
+    ) %>%
+    left_join(
+      meta_tcell %>%
+        select(lct, pfs_time, pfs_event, os_time, os_event) %>%
+        rownames_to_column("sample"),
+      by = "sample"
+    )
+}
+
+lineage_cols <- c(
+  "T_cell" = "#B2182B",
+  "B_cell" = "#8073AC",
+  "Myeloid" = "#E08214",
+  "Keratinocyte" = "#D9A441",
+  "Fibroblast" = "#4D9221",
+  "Endothelial" = "#2166AC"
+)
+
+lineage_names <- names(lineage_cols)
+
+marker_composition <- tcell_fraction_df %>%
+  select(sample, lct, all_of(lineage_names)) %>%
+  mutate(marker_total = rowSums(across(all_of(lineage_names)), na.rm = TRUE)) %>%
+  mutate(across(all_of(lineage_names), ~ 100 * .x / marker_total, .names = "{.col}_percent")) %>%
+  select(sample, lct, ends_with("_percent")) %>%
+  pivot_longer(
+    ends_with("_percent"),
+    names_to = "lineage",
+    values_to = "marker_percent"
+  ) %>%
+  mutate(
+    lineage = sub("_percent$", "", lineage),
+    lineage = factor(lineage, levels = lineage_names)
+  )
+
+sample_order_marker <- marker_composition %>%
+  filter(lineage == "T_cell") %>%
+  arrange(lct, desc(marker_percent)) %>%
+  pull(sample)
+
+marker_composition <- marker_composition %>%
+  mutate(sample = factor(sample, levels = sample_order_marker))
+
+cat("Marker-imputed composition summary by LCT:\n")
+marker_composition %>%
+  group_by(lct, lineage) %>%
+  summarise(
+    median_marker_percent = median(marker_percent, na.rm = TRUE),
+    mean_marker_percent = mean(marker_percent, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(lct, desc(median_marker_percent)) %>%
+  print(n = Inf)
+
+p_marker_composition <- ggplot(marker_composition,
+                               aes(x = sample, y = marker_percent, fill = lineage)) +
+  geom_col(width = 0.9, color = NA) +
+  facet_grid(. ~ lct, scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = lineage_cols, name = NULL) +
+  scale_y_continuous(expand = c(0, 0)) +
+  coord_cartesian(ylim = c(0, 100)) +
+  labs(
+    title = "Marker-imputed relative lineage composition by sample",
+    subtitle = "Fractions are normalized marker-module expression, not validated cell percentages",
+    x = NULL,
+    y = "Marker-imputed relative percent"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    legend.position = "top",
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold")
+  )
+
+print(p_marker_composition)
+
+marker_composition_wide <- marker_composition %>%
+  mutate(lineage = paste0(as.character(lineage), "_percent")) %>%
+  pivot_wider(names_from = lineage, values_from = marker_percent)
+
+dir.create("figs", showWarnings = FALSE, recursive = TRUE)
+write.csv(marker_composition_wide,
+          "figs/surv_marker_imputed_cell_populations.csv",
+          row.names = FALSE)
+ggsave("figs/surv_marker_imputed_cell_populations.pdf",
+       plot = p_marker_composition,
+       width = 11, height = 5, useDingbats = FALSE)
+```
+
+```{r surv_marker_imputed_cell_populations_by_pfs, fig.width=11, fig.height=6}
+# Same marker-imputed composition, with samples ordered by PFS time.
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(patchwork)
+
+if (!exists("marker_composition")) {
+  marker_composition_wide <- read.csv("figs/surv_marker_imputed_cell_populations.csv",
+                                      check.names = FALSE)
+  marker_composition <- marker_composition_wide %>%
+    pivot_longer(
+      ends_with("_percent"),
+      names_to = "lineage",
+      values_to = "marker_percent"
+    ) %>%
+    mutate(
+      lineage = sub("_percent$", "", lineage),
+      lineage = factor(lineage,
+                       levels = c("T_cell", "B_cell", "Myeloid",
+                                  "Keratinocyte", "Fibroblast", "Endothelial"))
+    )
+}
+
+if (!exists("tcell_fraction_df")) {
+  tcell_fraction_df <- read.csv("figs/surv_estimated_tcell_fraction.csv",
+                                check.names = FALSE) %>%
+    mutate(lct = factor(lct, levels = c("NLCT", "LCT")))
+}
+
+lineage_cols <- c(
+  "T_cell" = "#B2182B",
+  "B_cell" = "#8073AC",
+  "Myeloid" = "#E08214",
+  "Keratinocyte" = "#D9A441",
+  "Fibroblast" = "#4D9221",
+  "Endothelial" = "#2166AC"
+)
+
+sample_order_pfs <- tcell_fraction_df %>%
+  arrange(pfs_time, desc(pfs_event)) %>%
+  pull(sample)
+
+marker_composition_pfs <- marker_composition %>%
+  left_join(
+    tcell_fraction_df %>%
+      select(sample, lct, pfs_time, pfs_event),
+    by = "sample",
+    suffix = c("", "_meta")
+  ) %>%
+  mutate(
+    lct = coalesce(lct, lct_meta),
+    sample = factor(sample, levels = sample_order_pfs),
+    pfs_status = factor(ifelse(pfs_event == 1, "Event", "Censored"),
+                       levels = c("Event", "Censored"))
+  )
+
+pfs_annotation <- tcell_fraction_df %>%
+  mutate(
+    sample = factor(sample, levels = sample_order_pfs),
+    pfs_status = factor(ifelse(pfs_event == 1, "Event", "Censored"),
+                       levels = c("Event", "Censored"))
+  )
+
+p_marker_pfs_comp <- ggplot(marker_composition_pfs,
+                           aes(x = sample, y = marker_percent, fill = lineage)) +
+  geom_col(width = 0.9, color = NA) +
+  scale_fill_manual(values = lineage_cols, name = NULL) +
+  scale_y_continuous(expand = c(0, 0)) +
+  coord_cartesian(ylim = c(0, 100)) +
+  labs(
+    title = "Marker-imputed relative lineage composition ordered by PFS time",
+    subtitle = "Fractions are normalized marker-module expression, not validated cell percentages",
+    x = NULL,
+    y = "Marker-imputed relative percent"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    legend.position = "top",
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  )
+
+p_marker_pfs_time <- ggplot(pfs_annotation,
+                           aes(x = sample, y = pfs_time,
+                               color = lct, shape = pfs_status)) +
+  geom_point(size = 2, alpha = 0.9, stroke = 0.35) +
+  scale_color_manual(values = c("NLCT" = "#4393C3", "LCT" = "#B2182B"),
+                     name = "LCT") +
+  scale_shape_manual(values = c("Event" = 16, "Censored" = 1), name = "PFS") +
+  labs(x = NULL, y = "PFS time") +
+  theme_classic(base_size = 11) +
+  theme(
+    legend.position = "top",
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  )
+
+p_marker_by_pfs <- p_marker_pfs_time / p_marker_pfs_comp +
+  plot_layout(heights = c(1, 3), guides = "collect") &
+  theme(legend.position = "top")
+
+print(p_marker_by_pfs)
+
+dir.create("figs", showWarnings = FALSE, recursive = TRUE)
+ggsave("figs/surv_marker_imputed_cell_populations_ordered_by_pfs.pdf",
+       plot = p_marker_by_pfs,
+       width = 11, height = 6, useDingbats = FALSE)
+```
+

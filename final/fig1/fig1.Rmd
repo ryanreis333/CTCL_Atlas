@@ -1,0 +1,271 @@
+---
+title: "fig1"
+output: html_document
+date: "2026-04-17"
+---
+
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+library(BPCells)
+library(Seurat)
+library(harmony)
+library(tidyverse)
+library(future)
+
+plan(multisession, workers = 16)
+options(future.globals.maxSize = 8 * 1024^3)  # 8 GB
+
+#plan(sequential)
+```
+
+## Load data
+
+```{r load}
+data_dir <- "../../all_cells_final_data"
+
+counts <- open_matrix_dir(file.path(data_dir, "final.counts.disk.new.int"))
+
+meta <- readRDS(file.path(data_dir, "meta.new.rds/meta.new.rds"))
+
+obj <- CreateSeuratObject(
+  counts   = counts,
+  meta.data = meta
+)
+
+obj <- NormalizeData(obj)
+```
+
+```{r}
+table(obj$GEO.Cohort)
+```
+
+## Load pre-computed UMAP
+
+```{r load_umap}
+umap_coords <- read.csv(
+  file.path(data_dir, "full.umap.new.csv"),
+  row.names = 1
+)
+
+# Subset to cells present in both obj and the UMAP
+shared_cells <- intersect(colnames(obj), rownames(umap_coords))
+cat("Cells in obj:        ", ncol(obj), "\n")
+cat("Cells in UMAP file:  ", nrow(umap_coords), "\n")
+cat("Shared cells:        ", length(shared_cells), "\n")
+
+obj <- obj[, shared_cells]
+
+umap_mat <- as.matrix(umap_coords[shared_cells, ])
+colnames(umap_mat) <- c("UMAP_1", "UMAP_2")
+
+obj[["umap"]] <- CreateDimReducObject(
+  embeddings = umap_mat,
+  key        = "UMAP_",
+  assay      = DefaultAssay(obj)
+)
+saveRDS(obj,     "results/obj.fig1.rds")
+```
+
+```{r}
+obj <- readRDS("results/obj.fig1.rds")
+table(obj$celltype)
+
+```
+
+```{r umap_celltype}
+# shared celltype palette: reproduces Seurat/ggplot default hues, applied explicitly
+# here and in the composition bar so each celltype keeps one color across panels
+celltype_cols <- setNames(scales::hue_pal()(nlevels(factor(obj$celltype))),
+                          levels(factor(obj$celltype)))
+
+DimPlot(obj, group.by = "celltype", label = T, pt.size = 1, alpha = .5, raster = T, raster.dpi = c(1024, 1024), cols = celltype_cols) +
+  NoLegend() + ggtitle(NULL)
+ggsave("figs/umap.all.cells.celltype.pdf", height = 5, width = 5, dpi = 600)
+
+DimPlot(obj, group.by = "celltype", label = F, pt.size = 1.4, alpha = .6, raster = T, raster.dpi = c(4096, 4096), cols = celltype_cols) +
+  theme_void() +
+  theme(plot.title = element_blank(), plot.margin = margin(0, 0, 0, 0),
+        legend.position = "none", aspect.ratio = 1)
+ggsave("figs/umap.all.cells.celltype.png", height = 6, width = 6, dpi = 600, bg = "transparent")
+
+dx_cols <- c(HC = "#59A14F", BID = "#B07AA1", CTCL = "#E15759")  # softened Set1 (Tableau-style) to blend with Seurat default hues
+obj$Dx.simple <- factor(as.character(obj$Dx.simple), levels = c("HC", "BID", "CTCL"))
+
+void_umap <- theme_void() +
+  theme(plot.title = element_blank(), plot.margin = margin(0, 0, 0, 0),
+        legend.position = "none", aspect.ratio = 1)
+
+p1 <- DimPlot(obj, group.by = "orig.ident", label = F, pt.size = 1.4, alpha = .6, raster = T, raster.dpi = c(2048, 2048), shuffle = T) +
+  void_umap
+p2 <- DimPlot(obj, group.by = "GEO.Cohort", label = F, pt.size = 1.4, alpha = .6, raster = T, raster.dpi = c(2048, 2048), shuffle = T) +
+  void_umap
+p3 <- DimPlot(obj, group.by = "Dx.simple", label = F, pt.size = 1.4, alpha = .6, raster = T, raster.dpi = c(2048, 2048), shuffle = T) +
+  scale_color_manual(values = dx_cols) +
+  void_umap
+p4 <- DimPlot(obj, group.by = "cloneSize", label = F, pt.size = 1.4, alpha = .6, raster = T, raster.dpi = c(2048, 2048), shuffle = T) +
+  void_umap
+
+ggsave("figs/umap.all.cells.orig.ident.png", plot = p1, height = 6, width = 6, dpi = 600, bg = "transparent")
+ggsave("figs/umap.all.cells.geo.cohort.png",  plot = p2, height = 6, width = 6, dpi = 600, bg = "transparent")
+ggsave("figs/umap.all.cells.dx.simple.png",   plot = p3, height = 6, width = 6, dpi = 600, bg = "transparent")
+ggsave("figs/umap.all.cells.clonesize.png",   plot = p4, height = 6, width = 6, dpi = 600, bg = "transparent")
+
+grid <- (p1 | p3) / (p2 | p4)
+grid
+#ggsave("figs/umap.all.cells.grid.pdf", plot = grid, height = 10, width = 10, dpi = 600)
+ggsave("figs/umap.all.cells.grid.png", plot = grid, height = 10, width = 10, dpi = 600, bg = "transparent")
+```
+
+```{r deg_dotplot}
+Idents(obj) <- "celltype"
+markers <- FindAllMarkers(obj, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.5,
+                          test.use = "wilcox", verbose = FALSE)
+markers$dif <- markers$pct.1 - markers$pct2
+
+markers <- readRDS("results/markers.celltype.all.rds")
+
+ct_levels <- sort(unique(obj$celltype))
+obj$celltype <- factor(obj$celltype, levels = ct_levels)
+
+top3 <- markers %>%
+  filter(cluster %in% ct_levels, p_val_adj < 0.05) %>%
+  mutate(cluster = factor(cluster, levels = ct_levels)) %>%
+  group_by(cluster) %>%
+  mutate(score = rank(-avg_log2FC) + rank(-dif)) %>%   # combined rank: lower = better on both magnitude & specificity
+  slice_min(score, n = 3, with_ties = FALSE) %>%
+  arrange(cluster) %>%
+  pull(gene) %>%
+  unique()
+
+DotPlot(obj, features = rev(top3), group.by = "celltype", dot.scale = 6) +
+  coord_flip() +
+  RotatedAxis() +
+  labs(x = NULL, y = NULL) +
+  theme(axis.text.x = element_text(size = 8),
+        axis.text.y = element_text(size = 7),
+        legend.text = element_text(size = 7),
+        legend.title = element_text(size = 8))
+ggsave("figs/dotplot.celltype.top3markers.pdf", height = 7, width = 5, dpi = 600)
+```
+
+```{r celltype_proportions}
+prop_df <- obj@meta.data %>%
+  group_by(orig.merge, celltype) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(orig.merge) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+sample_meta <- obj@meta.data %>%
+  select(orig.merge, Tissue) %>%
+  distinct()
+
+tissue_order <- c("blood", "lymph node", "skin")
+
+tcell_prop <- prop_df %>%
+  filter(celltype == "T_Cells") %>%
+  select(orig.merge, tcell_prop = prop)
+
+sample_order <- sample_meta %>%
+  left_join(tcell_prop, by = "orig.merge") %>%
+  mutate(Tissue = factor(Tissue, levels = tissue_order)) %>%
+  arrange(Tissue, tcell_prop) %>%
+  pull(orig.merge)
+
+# stack T_Cells against the x-axis so the T-cell gradient (sample ordering) reads cleanly
+ct_stack_levels <- c(setdiff(sort(unique(prop_df$celltype)), "T_Cells"), "T_Cells")
+
+prop_df <- prop_df %>%
+  left_join(sample_meta, by = "orig.merge") %>%
+  mutate(orig.merge = factor(orig.merge, levels = sample_order),
+         Tissue = factor(Tissue, levels = tissue_order),
+         celltype = factor(celltype, levels = ct_stack_levels))
+
+library(patchwork)
+
+# Tissue palette: fig3 scheme (blood=red, lymph node=green, skin=blue) softened
+# (Tableau-style) to sit with the Seurat default hues
+tissue_cols <- c("blood" = "#E15759", "lymph node" = "#59A14F", "skin" = "#4E79A7")
+
+# labeled Tissue annotation strip, sharing the bar's faceting/ordering
+anno_df <- prop_df %>% distinct(orig.merge, Tissue)
+
+p_anno <- ggplot(anno_df, aes(x = orig.merge, y = 1, fill = Tissue)) +
+  geom_col(width = 1) +
+  facet_grid(~ Tissue, scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = tissue_cols) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(x = NULL, y = NULL) +
+  theme_void() +
+  theme(strip.text       = element_blank(),
+        strip.background  = element_blank(),
+        legend.position   = "none",
+        panel.spacing     = unit(0, "lines"))
+
+p_bar <- ggplot(prop_df, aes(x = orig.merge, y = prop, fill = celltype)) +
+  geom_col(width = 0.9) +   # <1 leaves a gap between samples; no border = no lines between celltypes
+  facet_grid(~ Tissue, scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = celltype_cols) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(x = NULL, y = "Cell type proportion") +
+  theme_classic() +
+  theme(axis.text.x   = element_blank(),
+        axis.ticks.x  = element_blank(),
+        axis.text.y   = element_text(size = 12),
+        strip.text    = element_blank(),
+        strip.background = element_blank(),
+        legend.position  = "none",
+        panel.spacing = unit(0, "lines"))
+
+p_anno / p_bar + plot_layout(heights = c(1, 22))
+ggsave("figs/barplot.celltype.proportions.pdf", height = 4.3, width = 11, dpi = 600)
+```
+
+
+
+```{r save}
+saveRDS(markers, "results/markers.celltype.all.rds")
+saveRDS(obj, "results/obj.fig1.rds")
+```
+
+
+```{r tcr_purity}
+tcr_cells <- meta %>% filter(!is.na(cloneSize))
+pct_tcell <- mean(tcr_cells$celltype == "T_Cells") * 100
+cat(sprintf("%.1f%% of TCR+ cells are labeled T_Cells (%d / %d)\n",
+            pct_tcell, sum(tcr_cells$celltype == "T_Cells"), nrow(tcr_cells)))
+
+pct_hyper <- mean(tcr_cells$cloneSize == "Hyperexpanded (0.1 < X <= 1)") * 100
+cat(sprintf("%.1f%% of TCR+ cells are Hyperexpanded (%d / %d)\n",
+            pct_hyper, sum(tcr_cells$cloneSize == "Hyperexpanded (0.1 < X <= 1)"), nrow(tcr_cells)))
+```
+
+
+```{r tcr_paired_samples}
+# samples (orig.ident) with paired TCR-seq: at least one cell with a called clonotype
+meta <- obj@meta.data
+n_tcr_samples   <- meta %>% filter(!is.na(cloneSize)) %>% distinct(orig.ident) %>% nrow()
+n_total_samples <- meta %>% distinct(orig.ident) %>% nrow()
+cat(sprintf("%d / %d samples (orig.ident) have paired TCR-seq data\n",
+            n_tcr_samples, n_total_samples))
+```
+
+
+```{r}
+obj <- readRDS("results/obj.fig1.rds")
+DimPlot(obj, group.by = "celltype")
+```
+
+
+```{r}
+FeaturePlot(obj, features = "CD27")
+VlnPlot(obj, group.by = "celltype.malig", features = "CD27", pt.size = 0)+NoLegend()
+```
+
+
+
+
+
+
+

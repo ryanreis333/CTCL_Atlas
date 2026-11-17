@@ -1,0 +1,1678 @@
+---
+title: "fig6.tmp — Skin TME exploratory analysis (fresh re-subset + re-process)"
+output: html_document
+date: "2026-05-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = TRUE)
+
+library(Seurat)
+library(BPCells)
+library(Matrix)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(patchwork)
+library(scales)
+library(ggrepel)
+library(conflicted)
+
+# DEG
+library(edgeR)
+library(variancePartition)
+library(BiocParallel)
+library(SummarizedExperiment)
+register(MulticoreParam(16))
+
+# GSEA
+library(fgsea)
+library(msigdbr)
+
+# DA
+library(lmerTest)
+
+# Pathway scoring
+library(GSVA)
+
+conflicts_prefer(
+  dplyr::count, dplyr::filter, dplyr::select, dplyr::lag,
+  dplyr::rename, dplyr::summarise, dplyr::summarize, dplyr::mutate,
+  dplyr::arrange, dplyr::desc, dplyr::first, dplyr::last,
+  dplyr::slice, dplyr::group_by, dplyr::ungroup, dplyr::n,
+  base::intersect, base::setdiff, base::union,
+  base::as.data.frame, base::Reduce, base::cbind, base::rbind,
+  base::pmin, base::pmax, base::table, base::which,
+  variancePartition::eBayes, variancePartition::topTable,
+  lmerTest::lmer,
+  .quiet = TRUE
+)
+
+"%!in%" <- Negate("%in%")
+
+dx_cols      <- c(HC = "#59A14F", BID = "#B07AA1", CTCL = "#E15759")  # softened Set1 (Tableau-style) to blend with Seurat default hues
+subtype_cols <- c(Subtype_1 = "#B2182B", Subtype_2 = "#2166AC")
+lesion_cols  <- c(Patch_Plaque = "#E69F00", Tumor = "#9F86C0", Erythroderma = "#E07A5F")
+```
+
+# Load full object and reprocess
+
+```{r load_full}
+obj <- readRDS("../fig1/results/obj.fig1.rds")
+obj
+table(obj$Tissue, useNA = "ifany")
+table(obj$Dx.simple, useNA = "ifany")
+table(obj$celltype.malig, useNA = "ifany")
+```
+
+# True bulk DEG (all skin cells aggregated per sample)
+
+```{r bulk_pseudobulk_deg}
+# True bulk-style: aggregate ALL skin cells (incl. malignant CTCL) per sample
+skin_all <- subset(obj, Tissue == "skin")
+cat("cells:", ncol(skin_all),
+    " samples:", length(unique(skin_all$orig.merge)), "\n")
+
+counts_raw <- GetAssayData(skin_all, assay = "RNA", layer = "counts")
+meta_all   <- skin_all@meta.data
+
+samp_meta <- meta_all %>%
+  distinct(orig.merge, Dx.simple, GEO.Cohort) %>% as.data.frame()
+rownames(samp_meta) <- samp_meta$orig.merge
+samp_meta$orig.merge <- NULL
+
+samps   <- unique(as.character(meta_all$orig.merge))
+bulk_pb <- do.call(cbind, lapply(samps, function(s) {
+  cc <- rownames(meta_all)[meta_all$orig.merge == s]
+  Matrix::rowSums(counts_raw[, cc, drop = FALSE])
+}))
+colnames(bulk_pb) <- samps
+sm <- samp_meta[samps, , drop = FALSE]
+
+run_dream <- function(pb, meta, form, coef_name) {
+  dge <- DGEList(counts = pb, samples = meta)
+  dge <- dge[filterByExpr(dge, group = meta$Dx.simple), ]
+  dge <- calcNormFactors(dge)
+  vo  <- voomWithDreamWeights(dge, form, meta, BPPARAM = MulticoreParam(16))
+  fit <- dream(vo, form, meta, BPPARAM = MulticoreParam(16))
+  fit <- eBayes(fit)
+  topTable(fit, coef = coef_name, number = Inf, sort.by = "P") %>%
+    tibble::rownames_to_column("gene")
+}
+
+# CTCL vs HC: all cohorts, cohort random intercept
+ctcl_s <- samps[sm[samps, "Dx.simple"] %in% c("HC", "CTCL")]
+m_ctcl <- sm[ctcl_s, , drop = FALSE]
+m_ctcl$Dx.simple <- factor(as.character(m_ctcl$Dx.simple), levels = c("HC", "CTCL"))
+bulk_ctcl <- run_dream(bulk_pb[, ctcl_s], m_ctcl,
+                       ~ Dx.simple + (1|GEO.Cohort), "Dx.simpleCTCL") %>%
+  mutate(contrast = "CTCL_vs_HC")
+
+# BID vs HC: E-MTAB-8142 only
+bid_s  <- samps[sm[samps, "Dx.simple"] %in% c("HC", "BID") &
+                sm[samps, "GEO.Cohort"] == "E-MTAB-8142"]
+m_bid  <- sm[bid_s, , drop = FALSE]
+m_bid$Dx.simple <- factor(as.character(m_bid$Dx.simple), levels = c("HC", "BID"))
+bulk_bid <- run_dream(bulk_pb[, bid_s], m_bid,
+                      ~ Dx.simple, "Dx.simpleBID") %>%
+  mutate(contrast = "BID_vs_HC")
+
+bulk_deg <- bind_rows(bulk_ctcl, bulk_bid)
+cat("CTCL DEGs (adj.P<0.05):", sum(bulk_ctcl$adj.P.Val < 0.05), "\n")
+cat("BID DEGs  (adj.P<0.05):", sum(bulk_bid$adj.P.Val  < 0.05), "\n")
+```
+
+```{r bulk_volcano_ctcl}
+d0 <- bulk_ctcl %>% mutate(neglog10p = -log10(adj.P.Val))
+
+# tighter axis limits; edge points squished onto the border to cut white space
+xlim <- quantile(abs(d0$logFC),   0.999, na.rm = TRUE)
+ylim <- quantile(d0$neglog10p,    0.999, na.rm = TRUE)
+
+lab <- d0 %>% dplyr::filter(adj.P.Val < 0.05) %>%
+  { dplyr::bind_rows(slice_max(., logFC, n = 10), slice_min(., logFC, n = 10)) }
+
+squish_xy <- function(df) df %>%
+  mutate(logFC     = pmax(pmin(logFC, xlim), -xlim),
+         neglog10p = pmin(neglog10p, ylim))
+d   <- squish_xy(d0)
+lab <- squish_xy(lab)
+
+ggplot(d, aes(x = logFC, y = neglog10p)) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey70") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_point(aes(color = logFC), size = 1, alpha = 0.7) +
+  scale_color_gradient2(low = "#2166AC", mid = "grey85", high = "#B2182B",
+                        midpoint = 0, limits = c(-xlim, xlim), oob = scales::squish) +
+  ggrepel::geom_text_repel(data = lab, aes(label = gene), size = 2.5,
+    max.overlaps = Inf, min.segment.length = 0, segment.size = 0.2,
+    segment.color = "grey70") +
+  coord_cartesian(xlim = c(-xlim, xlim), ylim = c(0, ylim),
+                  expand = FALSE, clip = "off") +
+  labs(x = "logFC", y = expression(-log[10]~adj.P), color = "logFC",
+       title = "Bulk  CTCL vs HC") +
+  theme_classic(base_size = 11)
+#ggsave("figs/bulk_volcano_ctcl.pdf", height = 4, width = 5, dpi = 600)
+```
+
+```{r bulk_volcano_bid}
+d <- bulk_bid %>% mutate(neglog10p = -log10(adj.P.Val))
+lim <- quantile(abs(d$logFC), 0.99, na.rm = TRUE)
+lab <- d %>% dplyr::filter(adj.P.Val < 0.05) %>%
+  { dplyr::bind_rows(slice_max(., logFC, n = 10), slice_min(., logFC, n = 10)) }
+
+ggplot(d, aes(x = logFC, y = neglog10p)) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey70") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_point(aes(color = logFC), size = 1, alpha = 0.7) +
+  scale_color_gradient2(low = "#2166AC", mid = "grey85", high = "#B2182B",
+                        midpoint = 0, limits = c(-lim, lim), oob = scales::squish) +
+  ggrepel::geom_text_repel(data = lab, aes(label = gene), size = 2.5,
+    max.overlaps = Inf, min.segment.length = 0, segment.size = 0.2,
+    segment.color = "grey70") +
+  labs(x = "logFC", y = expression(-log[10]~adj.P), color = "logFC",
+       title = "Bulk  BID vs HC") +
+  theme_classic(base_size = 11)
+#ggsave("figs/bulk_volcano_bid.pdf", height = 4.5, width = 4.5, dpi = 600)
+```
+
+```{r bulk_scatter}
+bulk_wide <- bulk_deg %>%
+  select(gene, contrast, logFC, adj.P.Val) %>%
+  tidyr::pivot_wider(names_from = contrast,
+                     values_from = c(logFC, adj.P.Val), names_sep = "_") %>%
+  dplyr::filter(!is.na(logFC_CTCL_vs_HC) & !is.na(logFC_BID_vs_HC)) %>%
+  mutate(sig = case_when(
+    adj.P.Val_CTCL_vs_HC < 0.05 & adj.P.Val_BID_vs_HC < 0.05 ~ "both",
+    adj.P.Val_CTCL_vs_HC < 0.05                              ~ "CTCL only",
+    adj.P.Val_BID_vs_HC  < 0.05                              ~ "BID only",
+    TRUE                                                     ~ "ns"
+  ))
+
+lim <- quantile(abs(c(bulk_wide$logFC_CTCL_vs_HC, bulk_wide$logFC_BID_vs_HC)),
+                0.99, na.rm = TRUE)
+
+ggplot(bulk_wide, aes(x = logFC_CTCL_vs_HC, y = logFC_BID_vs_HC)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "grey80") +
+  geom_point(aes(color = sig), size = 0.8, alpha = 0.4) +
+  scale_color_manual(values = c("CTCL only" = base::unname(dx_cols["CTCL"]),
+                                "BID only"  = base::unname(dx_cols["BID"]),
+                                "both"      = "black",
+                                "ns"        = "grey80")) +
+  coord_equal(xlim = c(-lim, lim), ylim = c(-lim, lim)) +
+  labs(x = "logFC CTCL vs HC", y = "logFC BID vs HC", color = NULL,
+       title = "Bulk DEG") +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "bottom")
+#ggsave("figs/bulk_scatter.pdf", height = 4.5, width = 4.5, dpi = 600)
+```
+
+```{r bulk_ctcl_malig_removed}
+# remove malignant CTCL cells, re-aggregate per sample (TME-only bulk).
+# only CTCL samples are affected; HC samples have no malignant cells.
+nonmalig <- rownames(meta_all)[meta_all$celltype.malig != "CTCL"]
+samps_nm <- unique(as.character(meta_all[nonmalig, "orig.merge"]))
+bulk_pb_nm <- do.call(cbind, lapply(samps_nm, function(s) {
+  cc <- nonmalig[meta_all[nonmalig, "orig.merge"] == s]
+  Matrix::rowSums(counts_raw[, cc, drop = FALSE])
+}))
+colnames(bulk_pb_nm) <- samps_nm
+sm_nm <- samp_meta[samps_nm, , drop = FALSE]
+
+ctcl_s_nm <- samps_nm[sm_nm[samps_nm, "Dx.simple"] %in% c("HC", "CTCL")]
+m_nm <- sm_nm[ctcl_s_nm, , drop = FALSE]
+m_nm$Dx.simple <- factor(as.character(m_nm$Dx.simple), levels = c("HC", "CTCL"))
+bulk_ctcl_nm <- run_dream(bulk_pb_nm[, ctcl_s_nm], m_nm,
+                          ~ Dx.simple + (1|GEO.Cohort), "Dx.simpleCTCL") %>%
+  mutate(contrast = "CTCL_vs_HC")
+cat("CTCL (malig-removed) DEGs (adj.P<0.05):",
+    sum(bulk_ctcl_nm$adj.P.Val < 0.05), "\n")
+```
+
+```{r bulk_malig_removed_scatter, fig.width = 5.5, fig.height = 5}
+# TME-only whole-sample bulk: logFC CTCL-vs-HC (malignant removed) vs BID-vs-HC.
+nm_wide <- inner_join(
+  bulk_ctcl_nm %>% select(gene, logFC_ctcl = logFC, padj_ctcl = adj.P.Val),
+  bulk_bid     %>% select(gene, logFC_bid  = logFC, padj_bid  = adj.P.Val),
+  by = "gene") %>%
+  mutate(sig = case_when(
+    padj_ctcl < 0.05 & padj_bid < 0.05 ~ "both",
+    padj_ctcl < 0.05                   ~ "CTCL only",
+    padj_bid  < 0.05                   ~ "BID only",
+    TRUE                               ~ "ns"))
+
+lim <- quantile(abs(c(nm_wide$logFC_ctcl, nm_wide$logFC_bid)), 0.995, na.rm = TRUE)
+nm_wide <- nm_wide %>%
+  mutate(logFC_ctcl = pmax(pmin(logFC_ctcl, lim), -lim),
+         logFC_bid  = pmax(pmin(logFC_bid,  lim), -lim))
+nm_wide$dif <- nm_wide$logFC_ctcl - nm_wide$logFC_bid
+
+# label select top genes throughout: extremes on each axis end + both diagonals,
+# restricted to genes significant in at least one contrast.
+cand <- nm_wide %>% filter(sig != "ns")
+lab <- bind_rows(
+  slice_max(cand, logFC_ctcl, n = 6), slice_min(cand, logFC_ctcl, n = 6),
+  slice_max(cand, logFC_bid,  n = 6), slice_min(cand, logFC_bid,  n = 6),
+  slice_max(cand, logFC_ctcl + logFC_bid, n = 6), slice_min(cand, logFC_ctcl + logFC_bid, n = 6),
+  slice_max(cand, logFC_ctcl - logFC_bid, n = 6), slice_min(cand, logFC_ctcl - logFC_bid, n = 6)
+) %>% distinct(gene, .keep_all = TRUE)
+
+ggplot(nm_wide, aes(logFC_ctcl, logFC_bid)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "grey80") +
+  geom_point(aes(color = sig), size = 0.8, alpha = 0.4) +
+  ggrepel::geom_text_repel(data = lab, aes(label = gene), color = "black", size = 2.8,
+    max.overlaps = Inf, min.segment.length = 0, segment.size = 0.2, segment.color = "grey60") +
+  scale_color_manual(values = c("CTCL only" = base::unname(dx_cols["CTCL"]),
+                                "BID only"  = base::unname(dx_cols["BID"]),
+                                "both"      = "black",
+                                "ns"        = "grey80")) +
+  coord_cartesian(xlim = c(-lim, lim), ylim = c(-lim, lim), clip = "off") +
+  labs(x = "logFC CTCL vs HC (malignant removed)", y = "logFC BID vs HC", color = NULL,
+       title = "TME-only whole-sample bulk DEG") +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+```{r bulk_malig_removed_gsea, fig.width = 9, fig.height = 5}
+# GSEA on the malignant-removed (TME-only) whole-sample bulk DEG, ranked by t.
+# CTCL = bulk_ctcl_nm (malignant cells removed); BID = bulk_bid (BID samples have
+# no malignant CTCL cells, so its bulk is already TME-only). Hallmark + Reactome.
+if (!exists("pathways")) {
+  msig_tbl <- bind_rows(
+    msigdbr(species = "Homo sapiens", collection = "H"),
+    msigdbr(species = "Homo sapiens", collection = "C2", subcollection = "CP:REACTOME")
+  ) %>% select(gs_name, gene_symbol) %>% distinct()
+  pathways <- split(msig_tbl$gene_symbol, msig_tbl$gs_name)
+}
+
+run_bulk_gsea <- function(res, label) {
+  rk <- res %>% arrange(desc(t)) %>% { setNames(.$t, .$gene) }
+  set.seed(42)
+  fgsea(pathways, rk, nproc = 16) %>% as_tibble() %>% mutate(contrast = label)
+}
+gsea_bulk_nm <- bind_rows(
+  run_bulk_gsea(bulk_ctcl_nm, "CTCL vs HC (malig-removed)"),
+  run_bulk_gsea(bulk_bid,     "BID vs HC"))
+cat("malig-removed bulk GSEA hits (padj<0.05):\n")
+gsea_bulk_nm %>% filter(padj < 0.05) %>% count(contrast) %>% print()
+
+top <- gsea_bulk_nm %>% group_by(contrast) %>%
+  group_modify(~ bind_rows(slice_max(.x, NES, n = 8), slice_min(.x, NES, n = 8))) %>%
+  ungroup() %>% arrange(contrast, NES) %>% mutate(rn = row_number())
+
+ggplot(top, aes(NES, factor(rn), fill = NES)) +
+  geom_col() + geom_vline(xintercept = 0, color = "grey70") +
+  scale_fill_gradient2(low = "#2166AC", mid = "grey85", high = "#B2182B",
+                       midpoint = 0, guide = "none") +
+  scale_y_discrete(labels = function(x) {
+    p <- top$pathway[match(as.integer(x), top$rn)]
+    scales::label_wrap(38)(gsub("_", " ", sub("^(HALLMARK|REACTOME)_", "", p)))
+  }) +
+  facet_wrap(~ contrast, scales = "free_y") +
+  labs(x = "NES", y = NULL,
+       title = "TME-only whole-sample bulk GSEA (Hallmark + Reactome)") +
+  theme_classic(base_size = 10)
+```
+
+```{r bulk_ctcl_whole_vs_tme_scatter}
+cmp_bulk <- bulk_ctcl %>%
+  select(gene, logFC_whole = logFC, padj_whole = adj.P.Val) %>%
+  inner_join(bulk_ctcl_nm %>% select(gene, logFC_tme = logFC,
+                                     padj_tme = adj.P.Val),
+             by = "gene") %>%
+  mutate(sig = case_when(
+    padj_whole < 0.05 & padj_tme < 0.05 ~ "both",
+    padj_whole < 0.05                   ~ "whole only",
+    padj_tme   < 0.05                   ~ "TME only",
+    TRUE                                ~ "ns"
+  ))
+cmp_bulk$dif <- cmp_bulk$logFC_whole - cmp_bulk$logFC_tme
+r_bulk <- cor(cmp_bulk$logFC_whole, cmp_bulk$logFC_tme, use = "complete.obs")
+lim <- quantile(abs(c(cmp_bulk$logFC_whole, cmp_bulk$logFC_tme)),
+                0.99, na.rm = TRUE)
+
+ggplot(cmp_bulk, aes(x = logFC_whole, y = logFC_tme)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "grey80") +
+  geom_point(aes(color = sig), size = 0.8, alpha = 0.4) +
+  annotate("text", x = -lim * 0.9, y = lim * 0.9,
+           label = sprintf("r = %.2f", r_bulk), hjust = 0, size = 3.5) +
+  scale_color_manual(values = c("whole only" = base::unname(dx_cols["CTCL"]),
+                                "TME only"    = "#2166AC",
+                                "both"        = "black",
+                                "ns"          = "grey80")) +
+  coord_equal(xlim = c(-lim, lim), ylim = c(-lim, lim)) +
+  labs(x = "logFC CTCL vs HC (whole sample)",
+       y = "logFC CTCL vs HC (malignant removed)", color = NULL,
+       title = "Bulk CTCL vs HC: whole sample vs TME-only") +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "bottom")
+#ggsave("figs/bulk_ctcl_whole_vs_tme_scatter.pdf", height = 4.5, width = 4.5, dpi = 600)
+```
+
+```{r subset_skin_tme}
+skin <- subset(obj, Tissue == "skin" & celltype.malig != "CTCL")
+skin
+cat("cells:", ncol(skin), " samples:", length(unique(skin$orig.merge)), "\n")
+table(skin$Dx.simple, useNA = "ifany")
+table(skin$celltype, useNA = "ifany")
+```
+
+```{r}
+VlnPlot(skin, group.by = "GEO.Cohort", features = "nFeature_RNA", pt.size = 0)
+VlnPlot(skin, group.by = "GEO.Cohort", features = "nCount_RNA", pt.size = 0, log = T)
+VlnPlot(skin, group.by = "GEO.Cohort", features = "percent.mt", pt.size = 0)
+VlnPlot(skin, group.by = "GEO.Cohort", features = "percent.rb", pt.size = 0)
+VlnPlot(skin, group.by = "GEO.Cohort", features = "cc.total", pt.size = 0)
+```
+
+
+```{r qc_filter}
+MIN_FEATURES <- 500    # genes detected per cell
+MIN_COUNTS   <- 800   # total UMIs per cell
+MAX_PCT_MT   <- 10     # mitochondrial fraction (%)
+MAX_PCT_RB   <- 50     # ribosomal fraction (%)
+MIN_PCT_RB   <- 5     # ribosomal fraction (%)
+MAX_CC       <- 0.25    # cell-cycle score (cc.total); above = cycling
+
+qc <- skin@meta.data
+keep_cells <- qc$nFeature_RNA >= MIN_FEATURES &
+              qc$nCount_RNA   >= MIN_COUNTS &
+              qc$percent.mt   <  MAX_PCT_MT &
+              qc$percent.rb   <  MAX_PCT_RB &
+              qc$percent.rb   >  MIN_PCT_RB &
+              qc$cc.total     <  MAX_CC
+
+cat("pre-QC cells:", ncol(skin), "\n")
+cat("dropped (low features):", sum(qc$nFeature_RNA < MIN_FEATURES), "\n")
+cat("dropped (low counts):  ", sum(qc$nCount_RNA   < MIN_COUNTS),   "\n")
+cat("dropped (high % mt):   ", sum(qc$percent.mt  >= MAX_PCT_MT),   "\n")
+cat("dropped (high % rb):   ", sum(qc$percent.rb  >= MAX_PCT_RB),   "\n")
+cat("dropped (cycling):     ", sum(qc$cc.total    >= MAX_CC),       "\n")
+cat("kept cells:            ", sum(keep_cells), "\n")
+
+skin <- subset(skin, cells = colnames(skin)[keep_cells])
+skin
+cat("post-QC cells:", ncol(skin),
+    " samples:", length(unique(skin$orig.merge)), "\n")
+table(skin$Dx.simple, useNA = "ifany")
+```
+
+
+```{r downsample_per_sample}
+set.seed(42)
+MAX_CELLS_PER_SAMPLE <- 5000
+
+cells_by_sample <- split(colnames(skin), as.character(skin$orig.merge))
+keep_cells <- unlist(lapply(cells_by_sample, function(cc) {
+  if (length(cc) > MAX_CELLS_PER_SAMPLE) sample(cc, MAX_CELLS_PER_SAMPLE) else cc
+}), use.names = FALSE)
+
+cat("pre-downsample cells:", ncol(skin),
+    " samples:", length(cells_by_sample), "\n")
+cat("post-downsample cells:", length(keep_cells), "\n")
+cat("samples capped at", MAX_CELLS_PER_SAMPLE, ":",
+    sum(lengths(cells_by_sample) > MAX_CELLS_PER_SAMPLE), "\n")
+
+skin <- subset(skin, cells = keep_cells)
+skin
+```
+
+
+```{r gene_filter}
+MIN_CELLS  <- 100   # gene must be detected in >= this many cells
+MIN_COUNTS <- 400   # gene must have >= this many total counts across cells
+
+counts_mat <- GetAssayData(skin, assay = "RNA", layer = "counts")
+
+n_cells_per_gene  <- Matrix::rowSums(counts_mat > 0)
+n_counts_per_gene <- Matrix::rowSums(counts_mat)
+
+keep_genes <- n_cells_per_gene >= MIN_CELLS & n_counts_per_gene >= MIN_COUNTS
+
+cat("pre-filter genes:", nrow(skin), "\n")
+cat("dropped (low cells):  ", sum(n_cells_per_gene  < MIN_CELLS), "\n")
+cat("dropped (low counts): ", sum(n_counts_per_gene < MIN_COUNTS), "\n")
+cat("kept genes:           ", sum(keep_genes), "\n")
+
+skin <- subset(skin, features = rownames(skin)[keep_genes])
+skin
+```
+
+
+```{r per_cohort_vfs}
+N_HVG_PER_COHORT <- 2000
+N_VF_RECURRENT   <- 2000
+
+DefaultAssay(skin) <- "RNA"
+skin <- NormalizeData(skin, verbose = FALSE)
+
+cohorts <- sort(unique(as.character(skin$GEO.Cohort)))
+cat("cohorts:", length(cohorts), "\n")
+
+vf_rank_tbl <- bind_rows(lapply(cohorts, function(co) {
+  cells_co <- colnames(skin)[skin$GEO.Cohort == co]
+  sub <- subset(skin, cells = cells_co)
+  sub <- FindVariableFeatures(sub, selection.method = "vst",
+                              nfeatures = N_HVG_PER_COHORT, verbose = FALSE)
+  vfs <- VariableFeatures(sub)
+  tibble(gene = vfs, cohort = co, rank = seq_along(vfs))
+}))
+
+# Drop TCR/BCR before ranking so they cannot be selected
+tcr_bcr_re <- "^TR[ABDG][VDJ]|^TR[AB]C|^IG[HKL][VDJ]|^IGH[ADEGM]|^IGKC|^IGLC"
+vf_rank_tbl <- filter(vf_rank_tbl, !grepl(tcr_bcr_re, gene))
+
+# Combine recurrence and mean rank into one Borda-style composite:
+#   rec_rank: rank of gene by n_cohorts (descending) — 1 = most recurrent
+#   mr_rank : rank of gene by mean within-cohort rank (ascending) — 1 = most variable on average
+#   combined: weighted average of the two ranks; lower = better
+# w_recurrence controls the trade-off (1.0 = recurrence only, 0.0 = mean rank only)
+w_recurrence <- 0.8
+
+recurrence <- vf_rank_tbl |>
+  group_by(gene) |>
+  summarise(n_cohorts = dplyr::n(),
+            mean_rank = mean(rank),
+            .groups   = "drop") |>
+  mutate(rec_rank = rank(-n_cohorts, ties.method = "average"),
+         mr_rank  = rank( mean_rank, ties.method = "average"),
+         combined = w_recurrence * rec_rank + (1 - w_recurrence) * mr_rank) |>
+  arrange(combined)
+
+recurrent_features <- head(recurrence$gene, N_VF_RECURRENT)
+
+cat("unique HVGs pooled across cohorts:", nrow(recurrence), "\n")
+cat("recurrence distribution (n_cohorts) over the full pool:\n")
+print(table(recurrence$n_cohorts))
+cat("recurrence distribution among the selected", N_VF_RECURRENT, "VFs:\n")
+print(table(head(recurrence, N_VF_RECURRENT)$n_cohorts))
+cat("selected", length(recurrent_features), "recurrent VFs (w_recurrence =",
+    w_recurrence, ")\n")
+```
+
+
+```{r reprocess}
+skin[["RNA"]]$counts <- as.sparse(skin[["RNA"]]$counts)
+skin[["RNA"]]$data <- as.sparse(skin[["RNA"]]$data)
+
+VariableFeatures(skin) <- recurrent_features
+
+skin <- ScaleData(skin, features = recurrent_features, verbose = FALSE, vars.to.regress = "nFeature_RNA")
+
+skin <- RunPCA(skin, features = recurrent_features, npcs = 30, approx = T)
+
+DimPlot(skin, reduction = "pca", group.by = "GEO.Cohort")
+DimPlot(skin, reduction = "pca", group.by = "celltype")
+```
+
+
+```{r reprocess}
+skin <- RunHarmony(skin, group.by.vars = c("orig.ident", "GEO.Cohort"),
+                   reduction      = "pca",
+                   dims.use       = 1:30,
+                   reduction.save = "harmony",
+                   verbose        = FALSE)
+ElbowPlot(skin, reduction = "pca", ndims = 30)
+ElbowPlot(skin, reduction = "harmony", ndims = 30)
+
+skin <- RunUMAP(skin, reduction = "harmony", dims = 1:30, verbose = FALSE, return.model = T)
+
+DimPlot(skin, group.by = "orig.merge", shuffle = T)+NoLegend()
+DimPlot(skin, group.by = "celltype", label = T)+NoLegend()
+```
+
+```{r}
+skin <- FindNeighbors(skin, reduction = "harmony", dims = 1:30, verbose = FALSE)
+skin <- FindClusters(skin, resolution = c(0.5,1,1.5), verbose = FALSE)
+
+DimPlot(skin, group.by = "celltype", label = T)+NoLegend()
+DimPlot(skin, group.by = "RNA_snn_res.0.5", label = T)+NoLegend()
+DimPlot(skin, group.by = "RNA_snn_res.1", label = T)+NoLegend()
+DimPlot(skin, group.by = "RNA_snn_res.1.5", label = T)+NoLegend()
+```
+
+```{r}
+FeaturePlot(skin, features = "IGKC")
+```
+
+```{r}
+immune <- subset(skin, RNA_snn_res.1 %in% c("2", "3", "7", "15", "10", "24", "8", "11", "12", "13", "22", "23"))
+stromal <- subset(skin, RNA_snn_res.1 %in% c("0", "25", "21", "9", "20", "5", "19", "14", "6", "18", "4", "1", "16", "17"))
+
+DimPlot(immune, group.by = "RNA_snn_res.1", label = T)
+DimPlot(stromal, group.by = "RNA_snn_res.1", label = T)
+```
+
+```{r reprocess_immune}
+immune <- subset(immune, RNA_snn_res.0.5 != "18")
+immune <- FindVariableFeatures(immune, selection.method = "vst",
+                               nfeatures = 2000, verbose = FALSE)
+immune_vfs <- VariableFeatures(immune)[!grepl(tcr_bcr_re, VariableFeatures(immune))]
+VariableFeatures(immune) <- immune_vfs
+
+immune <- ScaleData(immune, features = immune_vfs, verbose = FALSE,
+                    vars.to.regress = "nFeature_RNA")
+immune <- RunPCA(immune, features = immune_vfs, npcs = 30, approx = T, verbose = FALSE)
+
+immune <- RunHarmony(immune, group.by.vars = c("orig.ident", "GEO.Cohort"),
+                    reduction      = "pca",
+                    dims.use       = 1:30,
+                    reduction.save = "harmony",
+                    verbose        = FALSE)
+ElbowPlot(immune, reduction = "harmony", ndims = 30)
+
+immune <- RunUMAP(immune, reduction = "harmony", dims = 1:20, verbose = FALSE)
+immune <- FindNeighbors(immune, reduction = "harmony", dims = 1:20, verbose = FALSE)
+immune <- FindClusters(immune, resolution = c(0.5, 1, 1.5), verbose = FALSE)
+
+DimPlot(immune, group.by = "orig.merge", shuffle = T)+NoLegend()
+DimPlot(immune, group.by = "celltype", label = T)+NoLegend()
+DimPlot(immune, group.by = "RNA_snn_res.0.5", label = T)+NoLegend()
+DimPlot(immune, group.by = "RNA_snn_res.1", label = T)+NoLegend()
+DimPlot(immune, group.by = "RNA_snn_res.1.5", label = T)+NoLegend()
+```
+
+```{r}
+saveRDS(immune, "immune.rds")
+```
+
+```{r}
+FeaturePlot(immune, features = "TPSB2")
+FeaturePlot(immune, features = "CPA3")
+```
+
+```{r reprocess_stromal}
+"%!in%" <- Negate("%in%")
+stromal <- subset(stromal, RNA_snn_res.1 %!in% c("23", "20"))
+stromal <- FindVariableFeatures(stromal, selection.method = "vst",
+                                nfeatures = 2000, verbose = FALSE)
+stromal_vfs <- VariableFeatures(stromal)[!grepl(tcr_bcr_re, VariableFeatures(stromal))]
+VariableFeatures(stromal) <- stromal_vfs
+
+stromal <- ScaleData(stromal, features = stromal_vfs, verbose = FALSE,
+                     vars.to.regress = "nFeature_RNA")
+stromal <- RunPCA(stromal, features = stromal_vfs, npcs = 30, approx = T, verbose = FALSE)
+
+stromal <- RunHarmony(stromal, group.by.vars = c("orig.ident", "GEO.Cohort"),
+                     reduction      = "pca",
+                     dims.use       = 1:30,
+                     reduction.save = "harmony",
+                     verbose        = FALSE)
+ElbowPlot(stromal, reduction = "harmony", ndims = 30)
+
+stromal <- RunUMAP(stromal, reduction = "harmony", dims = 1:20, verbose = FALSE)
+stromal <- FindNeighbors(stromal, reduction = "harmony", dims = 1:20, verbose = FALSE)
+stromal <- FindClusters(stromal, resolution = c(0.5, 1, 1.5), verbose = FALSE)
+
+DimPlot(stromal, group.by = "orig.merge", shuffle = T)+NoLegend()
+DimPlot(stromal, group.by = "celltype", label = T)+NoLegend()
+DimPlot(stromal, group.by = "RNA_snn_res.0.5", label = T)+NoLegend()
+DimPlot(stromal, group.by = "RNA_snn_res.1", label = T)+NoLegend()
+DimPlot(stromal, group.by = "RNA_snn_res.1.5", label = T)+NoLegend()
+```
+
+```{r}
+saveRDS(stromal, "stromal.rds")
+```
+
+```{r}
+tme.merge <- merge(immune, stromal)
+```
+
+```{r}
+skin.ss <- subset(skin, barcode.unique %in% c(colnames(stromal), colnames(immune)))
+skin.ss <- subset(skin.ss, celltype != "Glandular")
+DimPlot(skin.ss, group.by = "celltype", label = T)+NoLegend()
+```
+
+```{r}
+DimPlot(skin.ss, group.by = "celltype", label = T, raster = T, raster.dpi = c(1024,1024))+NoLegend()
+ggsave("figs.new/umap.skin.celltype.pdf", height = 5, width = 5)
+```
+
+```{r celltype_prop_by_sample}
+prop_df <- skin.ss@meta.data %>%
+  group_by(orig.merge, celltype) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(orig.merge) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+sample_meta <- skin.ss@meta.data %>%
+  select(orig.merge, Dx.simple) %>%
+  distinct()
+
+dx_order <- c("HC", "BID", "CTCL")
+
+tcell_prop <- prop_df %>%
+  filter(celltype == "T_Cells") %>%
+  select(orig.merge, tcell_prop = prop)
+
+sample_order <- sample_meta %>%
+  left_join(tcell_prop, by = "orig.merge") %>%
+  mutate(tcell_prop = tidyr::replace_na(tcell_prop, 0),
+         Dx.simple  = factor(Dx.simple, levels = dx_order)) %>%
+  arrange(Dx.simple, tcell_prop) %>%
+  pull(orig.merge)
+
+prop_df <- prop_df %>%
+  left_join(sample_meta, by = "orig.merge") %>%
+  mutate(orig.merge = factor(orig.merge, levels = sample_order),
+         Dx.simple  = factor(Dx.simple,  levels = dx_order))
+
+ggplot(prop_df, aes(x = orig.merge, y = prop, fill = celltype)) +
+  geom_bar(stat = "identity", width = 1, color = "white", linewidth = 0.15) +
+  facet_grid(~ Dx.simple, scales = "free_x", space = "free_x") +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(x = NULL, y = "Proportion") +
+  theme_classic(base_size = 11) +
+  theme(axis.text.x      = element_blank(),
+        axis.ticks.x     = element_blank(),
+        strip.background = element_blank(),
+        panel.spacing    = unit(0, "lines"))+NoLegend()
+ggsave("figs.new/barplot.skin.celltype.prop.by_sample.pdf",
+       height = 5, width = 11, dpi = 600)
+```
+
+
+# Immune processing
+
+```{r}
+DimPlot(immune, group.by = "celltype", label = T)+NoLegend()
+DimPlot(immune, group.by = "RNA_snn_res.0.5", label = T)+NoLegend()
+DimPlot(immune, group.by = "RNA_snn_res.1", label = T)+NoLegend()
+DimPlot(immune, group.by = "RNA_snn_res.1.5", label = T)+NoLegend()
+```
+
+```{r}
+markers.immune <- FindAllMarkers(immune, group.by = "RNA_snn_res.0.5", min.pct = .1)
+markers.immune$dif <- markers.immune$pct.1 - markers.immune$pct.2
+
+markers.immune.ss <- r2subset_markers(markers.immune, nfeatures = 20)
+
+write.csv(markers.immune, file = "results/markers.immune.csv")
+saveRDS(markers.immune, file = "results/markers.immune.rds")
+```
+
+```{r assign_immune_celltypes}
+markers.immune <- readRDS("results/markers.immune.rds")
+
+# res 0.5 cluster -> celltype, from top markers in markers.immune
+#  0  PASK/CAMK4/TRAT1/IL7R/CD40LG/CD6    CD4 T
+#  1  FCN1/VCAN/IL1B/TREM1/NLRP3/INHBA    Monocyte
+#  2  FOLR2/SELENOP/CD209/APOE/MS4A4A     Macrophage
+#  3  RORA/IL7R/TRAT1/ITK/ZFP36L2         CD4 T
+#  4  MS4A1/CD79A/CD19/CXCR5/BANK1/IGHD   B cells
+#  5  FOXP3/CTLA4/IL2RA/TIGIT/IKZF2/LAYN  Treg
+#  6  GZMK/GZMH/CD8A/CD8B/NKG7/EOMES      CD8 T
+#  7  KLRD1/KLRF1/GNLY/KIR2DL4/TRDC       NK
+#  8  LAMP3/FSCN1/EBI3/SOCS2/PVR          mregDC
+#  9  CD1C/CD1A/CD1B/FCER1A/MNDA          cDC2
+# 10  HSPA1A/DNAJB1/HSP90AA1 (+CD40LG)    CD4 T (stress/HSP)
+# 11  CLEC9A/XCR1/WDFY4                   cDC1
+# 12  CD207/FCGBP                         Langerhans
+# 13  IGHG1/SDC1/IGHA1/IGLL5/IGKC         Plasma cells
+# 14  LILRA4/SCT/PTCRA/LAMP5/CLEC4C       pDC
+# 15  ZNRF1/CRIP2/NCK2/CORO1B (no clear lineage)  CD4 T (low-signature)
+immune_labels <- c(
+  "0"  = "CD4_T",
+  "1"  = "Monocyte",
+  "2"  = "Macrophage",
+  "3"  = "CD4_T",
+  "4"  = "B_Cells",
+  "5"  = "Treg",
+  "6"  = "CD8_T",
+  "7"  = "NK_Cells",
+  "8"  = "mregDC",
+  "9"  = "cDC2",
+  "10" = "CD4_T_HSP",
+  "11" = "cDC1",
+  "12" = "Langerhans",
+  "13" = "Plasma_Cells",
+  "14" = "pDC",
+  "15" = "CD4_T"
+)
+
+immune$celltype.immune <- base::unname(
+  immune_labels[as.character(immune$RNA_snn_res.0.5)]
+)
+
+cat("unmapped clusters:",
+    paste(setdiff(levels(immune$RNA_snn_res.0.5), names(immune_labels)),
+          collapse = ", "), "\n")
+print(table(immune$celltype.immune, useNA = "ifany"))
+
+immune <- subset(immune, celltype.immune != "CD4_T_HSP")
+DimPlot(immune, group.by = "RNA_snn_res.0.5", label = T) +
+  theme_classic(base_size = 11) + NoLegend()
+DimPlot(immune, group.by = "celltype.immune", label = T) +
+  theme_classic(base_size = 11) + NoLegend()
+```
+
+```{r}
+saveRDS(immune, "immune.rds")
+```
+
+# Stromal processing
+
+```{r}
+DimPlot(stromal, group.by = "celltype", label = T)+NoLegend()
+DimPlot(stromal, group.by = "RNA_snn_res.0.5", label = T)+NoLegend()
+DimPlot(stromal, group.by = "RNA_snn_res.1", label = T)+NoLegend()
+DimPlot(stromal, group.by = "RNA_snn_res.1.5", label = T)+NoLegend()
+```
+
+```{r}
+markers.stromal <- FindAllMarkers(stromal, group.by = "RNA_snn_res.0.5", min.pct = .1)
+markers.stromal$dif <- markers.stromal$pct.1 - markers.stromal$pct.2
+
+markers.stromal.ss <- r2subset_markers(markers.stromal, nfeatures = 20)
+
+write.csv(markers.stromal, file = "results/markers.stromal.csv")
+saveRDS(markers.stromal, file = "results/markers.stromal.rds")
+```
+
+```{r}
+tmp <- FindMarkers(stromal, ident.1 = "16", group.by = "RNA_snn_res.0.5")
+```
+
+```{r assign_stromal_celltypes}
+markers.stromal <- readRDS("results/markers.stromal.rds")
+
+# res 0.5 cluster -> celltype, from top markers in markers.stromal
+#  0  SOX17/PLVAP/ACKR1/SELE/SELP/CD93/CLEC14A   Endothelial (venular)
+#  1  KRT1/KRT10/DMKN/LY6D/LGALS7                 Keratinocyte (spinous)
+#  2  COL17A1/KRT15/DST/LAMB3/LAMC2               Keratinocyte (basal)
+#  3  APOD/APOC1/CFD/IGF1/CXCL12/GPC3             Fibroblast (secretory/reticular)
+#  4  COL6A5/APCDD1/ADAMDEC1/CCL19/COL6A6/TNC     Fibroblast (papillary)
+#  5  PI16/MFAP5/PRG4/PCOLCE2/ELN/C1QTNF3         Fibroblast (PI16/adventitial)
+#  6  MYH11/CNN1/ACTA2/ACTG2/LMOD1/RGS5/PLN       Mural (smooth muscle / pericyte)
+#  7  CDSN/LCE3D/SPRR2E/CST6/SLURP1/SLURP2        Keratinocyte (granular)
+#  8  FA2H/TGM1/CA9/NXPH4 (differentiated KC)     Keratinocyte (granular)
+#  9  MMP1/PTGS2/TNFAIP6/SERPINE2/FGF2            Fibroblast (inflammatory)
+# 10  DCT/TYR/TRPM1/SLC24A5/CA14                  Melanocyte
+# 11  LYVE1/PROX1/CCL21/FLT4/MMRN1               Lymphatic endothelial
+# 12  WISP2(CCN5)/IRX1/WNT11/SNED1/BICC1          Fibroblast (reticular)
+# 13  NEK10/ESR1/FAM227B (no clear lineage)       Unknown
+# 14  MRTFB/HLA-DQA2/PKP4/PLCB1 (mixed)           Unknown
+# 15  CD36/FABP4/GPIHBP1/CA4/FCN3                 Endothelial (capillary)
+# 16  TP63/COL7A1/MIR205HG/PTHLH (+CDCA7)         Keratinocyte (basal)
+# 17  IPCEF1/CCSER1/SLCO5A1/SAMD3 (no clear)      Unknown
+# 18  IGHG1/IGHA1/MZB1/IGLC2/DERL3                Plasma cells (immune contam.)
+# 19  TYROBP/FCER1G/C1QB/CD52/CCL4                Myeloid (immune contam.)
+stromal_labels <- c(
+  "0"  = "Vasc_Endo",
+  "1"  = "Keratinocyte_Spinous",
+  "2"  = "Keratinocyte_Basal",
+  "3"  = "Fibroblast_Secretory",
+  "4"  = "Fibroblast_Papillary",
+  "5"  = "Fibroblast_PI16",
+  "6"  = "Mural",
+  "7"  = "Keratinocyte_Granular",
+  "8"  = "Keratinocyte_Granular",
+  "9"  = "Fibroblast_Inflammatory",
+  "10" = "Melanocyte",
+  "11" = "Lymph_Endo",
+  "12" = "Fibroblast_Reticular",
+  "13" = "Unknown",
+  "14" = "Unknown",
+  "15" = "Vasc_Endo",
+  "16" = "Keratinocyte_Basal",
+  "17" = "Unknown",
+  "18" = "Immune",
+  "19" = "Immune"
+)
+
+stromal$celltype.stromal <- base::unname(stromal_labels[as.character(stromal$RNA_snn_res.0.5)])
+
+cat("unmapped clusters:",
+    paste(setdiff(levels(stromal$RNA_snn_res.0.5), names(stromal_labels)),
+          collapse = ", "), "\n")
+print(table(stromal$celltype.stromal, useNA = "ifany"))
+
+stromal <- subset(stromal, celltype.stromal %!in% c("Immune", "Unknown"))
+DimPlot(stromal, group.by = "RNA_snn_res.0.5", label = T) +
+  theme_classic(base_size = 11) + NoLegend()
+DimPlot(stromal, group.by = "celltype.stromal", label = T) +
+  theme_classic(base_size = 11) + NoLegend()
+```
+
+```{r stromal_celltype_simple}
+# collapse all fibroblast/keratinocyte subsets into single labels
+ct <- as.character(stromal$celltype.stromal)
+ct[grepl("^Fibroblast",   ct)] <- "Fibroblast"
+ct[grepl("^Keratinocyte", ct)] <- "Keratinocyte"
+stromal$celltype.stromal.simple <- ct
+print(table(stromal$celltype.stromal.simple, useNA = "ifany"))
+
+DimPlot(stromal, group.by = "celltype.stromal.simple", label = T) +
+  theme_classic(base_size = 11) + NoLegend()
+
+saveRDS(stromal, "stromal.rds")
+```
+
+
+
+# Analysis
+
+```{r load_data}
+immune <- readRDS("immune.rds")
+stromal <- readRDS("stromal.rds")
+```
+
+```{r unified_umap_test}
+# carry the high-quality compartment labels into one shared column
+immune$celltype.unified  <- base::unname(as.character(immune$celltype.immune))
+stromal$celltype.unified <- base::unname(as.character(stromal$celltype.stromal.simple))
+
+# merge the two compartments and reprocess for a single shared embedding
+unified <- merge(immune, y = stromal)
+unified <- JoinLayers(unified, assay = "RNA")
+
+unified <- NormalizeData(unified, verbose = FALSE)
+unified <- FindVariableFeatures(unified, nfeatures = 2000, verbose = FALSE)
+
+tcr_bcr_re <- paste0(
+  "^TR[ABDG][VDJ]",   # TCR: TRA/B/D/G V, D, J, C segments
+  "|^IG[HKL][VDJ]",    # Ig V/D/J: IGHV/D/J, IGKV/J, IGLV/J
+  "|^IGH[ADEGM]"      # Ig heavy constant isotypes: IGHA/D/E/G/M
+)
+
+vf_all  <- VariableFeatures(unified)
+uni_vfs <- vf_all[!grepl(tcr_bcr_re, vf_all)]
+cat("TCR/BCR VFs dropped:", sum(grepl(tcr_bcr_re, vf_all)), "/", length(vf_all), "\n")
+cat(grep(tcr_bcr_re, vf_all, value = TRUE), sep = ", "); cat("\n")
+VariableFeatures(unified) <- uni_vfs
+unified <- ScaleData(unified, features = uni_vfs, verbose = FALSE,
+                     vars.to.regress = "nFeature_RNA")
+unified <- RunPCA(unified, features = uni_vfs, npcs = 30, approx = TRUE,
+                  verbose = FALSE)
+unified <- harmony::RunHarmony(unified, group.by.vars = c("orig.ident", "GEO.Cohort"),
+                      reduction = "pca", dims.use = 1:30,
+                      reduction.save = "harmony", verbose = FALSE)
+unified <- RunUMAP(unified, reduction = "harmony", dims = 1:30, verbose = FALSE)
+saveRDS(unified, "unified.rds")
+```
+
+
+```{r unified_umap_test}
+unified <- readRDS("unified.rds")
+DimPlot(unified, group.by = "celltype.unified", label = TRUE, repel = TRUE,
+        label.size = 4) + NoLegend() + ggtitle(NULL)
+ggsave("figs/tme_unified_umap.pdf", height = 5, width = 5, dpi = 600)
+
+DimPlot(unified, group.by = "celltype.unified", label = F, pt.size = 1.4, alpha = .6, raster = T, raster.dpi = c(2048, 2048)) +
+  theme_void() +
+  theme(plot.title = element_blank(), plot.margin = margin(0, 0, 0, 0),
+        legend.position = "none", aspect.ratio = 1)
+ggsave("figs/umap_unified_celltypes.png", height = 5, width = 5, dpi = 600, bg = "transparent")
+```
+
+```{r}
+unified$Dx.simple <- factor(as.character(unified$Dx.simple), levels = c("HC", "BID", "CTCL"))
+table(unified$Dx.simple)
+
+DimPlot(unified, group.by = "Dx.simple", split.by = "Dx.simple", label = F) +
+  scale_color_manual(values = dx_cols) + NoLegend() + ggtitle(NULL)
+ggsave("figs/tme_unified_umap_by_dx.pdf", height = 5, width = 15, dpi = 600)
+
+DimPlot(unified, group.by = "Dx.simple", split.by = "Dx.simple", pt.size = 2, alpha = .8, label = F, raster = T, raster.dpi = c(2048,2048)) + ggtitle(NULL) +
+  scale_color_manual(values = dx_cols) +
+  theme_void() +
+  theme(plot.title = element_blank(), plot.margin = margin(0, 0, 0, 0),
+        legend.position = "none", aspect.ratio = 1)
+ggsave("figs/tme_unified_umap_by_dx.pdf", height = 3, width = 9, dpi = 600)
+```
+
+```{r unified_dx_prop}
+md <- unified@meta.data %>%
+  select(celltype.unified, Dx.simple) %>%
+  dplyr::filter(Dx.simple %in% c("HC", "BID", "CTCL"))
+
+# downsample so each Dx group contributes an equal number of cells
+set.seed(42)
+n_min <- min(table(md$Dx.simple))
+md_ds <- md %>%
+  group_by(Dx.simple) %>%
+  slice_sample(n = n_min) %>%
+  ungroup()
+
+prop_df <- md_ds %>%
+  count(celltype.unified, Dx.simple, name = "n") %>%
+  mutate(Dx.simple = factor(Dx.simple, levels = c("HC", "BID", "CTCL")))
+
+ggplot(prop_df, aes(x = celltype.unified, y = n, fill = Dx.simple)) +
+  geom_col(position = "fill", width = 0.8) +
+  scale_fill_manual(values = dx_cols, breaks = c("HC", "BID", "CTCL")) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(x = NULL, y = "proportion of cells", fill = NULL) +
+  theme_classic(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+NoLegend()
+ggsave("figs/tme_unified_dx_prop.pdf", height = 3, width = 7, dpi = 600)
+
+write.csv(prop_df, "results/prop_df.csv")
+saveRDS(prop_df, "results/prop_df.rds")
+```
+
+```{r unified_da_dx_propeller}
+# propeller analog: logit-transformed proportions + limma, with GEO.Cohort as a
+# random effect via duplicateCorrelation (Ryan's propeller convention). Same
+# shared HC reference -> BID-vs-HC and CTCL-vs-HC coefficients.
+meta_da <- unified@meta.data %>% filter(Dx.simple %in% c("HC", "BID", "CTCL"))
+
+samp_meta <- meta_da %>%
+  distinct(orig.merge, Dx.simple, GEO.Cohort) %>%
+  mutate(Dx.simple = factor(as.character(Dx.simple), levels = c("HC", "BID", "CTCL")))
+
+props <- speckle::getTransformedProps(
+  clusters  = as.character(meta_da$celltype.unified),
+  sample    = as.character(meta_da$orig.merge),
+  transform = "logit")
+
+tp        <- props$TransformedProps                       # celltype x sample
+samp_meta <- samp_meta[match(colnames(tp), samp_meta$orig.merge), ]
+stopifnot(identical(colnames(tp), samp_meta$orig.merge))
+
+design <- model.matrix(~ Dx.simple, data = samp_meta)     # HC = reference (intercept)
+
+# cohort as a blocking random effect (propeller approximation of (1|GEO.Cohort))
+dc  <- limma::duplicateCorrelation(tp, design, block = samp_meta$GEO.Cohort)
+fit <- limma::lmFit(tp, design, block = samp_meta$GEO.Cohort,
+                    correlation = dc$consensus.correlation)
+fit <- limma::eBayes(fit)
+
+da_prop <- bind_rows(lapply(c("Dx.simpleBID", "Dx.simpleCTCL"), function(co)
+  limma::topTable(fit, coef = co, number = Inf, sort.by = "none") %>%
+    tibble::rownames_to_column("celltype") %>%
+    transmute(celltype,
+              contrast = paste0(sub("^Dx.simple", "", co), "_vs_HC"),
+              estimate = logFC, t = t, p_value = P.Value, adj_p = adj.P.Val))) %>%
+  arrange(contrast, p_value)
+
+cat("consensus intra-cohort correlation:", round(dc$consensus.correlation, 3), "\n\n")
+cat("=== propeller  CTCL vs HC ===\n")
+print(as_tibble(da_prop %>% filter(contrast == "CTCL_vs_HC")), n = Inf)
+cat("\n=== propeller  BID vs HC ===\n")
+print(as_tibble(da_prop %>% filter(contrast == "BID_vs_HC")), n = Inf)
+
+# same CTCL-vs-HC x BID-vs-HC scatter as the main DA panel, Dx-scaled coloring
+da_prop_wide <- da_prop %>%
+  select(celltype, contrast, estimate) %>%
+  tidyr::pivot_wider(names_from = contrast, values_from = estimate) %>%
+  filter(!is.na(CTCL_vs_HC), !is.na(BID_vs_HC)) %>%
+  mutate(dif = CTCL_vs_HC - BID_vs_HC)
+
+pad  <- 0.08
+xr   <- range(da_prop_wide$CTCL_vs_HC); xr <- xr + c(-1, 1) * diff(xr) * pad
+yr   <- range(da_prop_wide$BID_vs_HC);  yr <- yr + c(-1, 1) * diff(yr) * pad
+dlim <- max(abs(da_prop_wide$dif), na.rm = TRUE)
+
+ggplot(da_prop_wide, aes(CTCL_vs_HC, BID_vs_HC)) +
+  geom_hline(yintercept = 0, color = "grey85", linewidth = 0.3) +
+  geom_vline(xintercept = 0, color = "grey85", linewidth = 0.3) +
+  geom_abline(slope = 1, linetype = "dashed", color = "grey80", linewidth = 0.3) +
+  geom_point(aes(color = dif), size = 3.5) +
+  ggrepel::geom_text_repel(aes(label = celltype), color = "grey15", size = 3.5,
+    max.overlaps = Inf, min.segment.length = 0, segment.color = "grey80",
+    box.padding = 0.5) +
+  scale_color_gradient2(low = base::unname(dx_cols["BID"]),
+                        mid = "grey85", high = base::unname(dx_cols["CTCL"]),
+                        midpoint = 0, limits = c(-dlim, dlim),
+                        name = "CTCL - BID\nlogit") +
+  coord_cartesian(xlim = xr, ylim = yr) +
+  labs(x = "CTCL vs HC", y = "BID vs HC") +
+  theme_classic(base_size = 11)
+ggsave("figs/tme_unified_dx_da_scatter_propeller.pdf", height = 4, width = 4.75, dpi = 600)
+
+write.csv(da_prop, "results/da_prop.csv", row.names = FALSE)
+saveRDS(da_prop, "results/da_prop.rds")
+
+da_prop <- readRDS("results/da_prop.rds")
+```
+
+```{r tme_bulk_deg}
+# Whole-sample bulk of the TME (immune + stromal; malignant cells already removed
+# from `unified`). Aggregate ALL cells per sample, then CTCL-vs-HC and BID-vs-HC
+# against a shared HC reference (CTCL all cohorts + (1|GEO.Cohort); BID within
+# E-MTAB-8142 only), matching the celltype-resolved contrast design.
+f   <- factor(unified$orig.merge)
+ind <- Matrix::sparse.model.matrix(~ 0 + f); colnames(ind) <- levels(f)
+tme_bulk_pb <- as.matrix(GetAssayData(unified, "counts", assay = "RNA") %*% ind)
+
+tcr_bcr_re  <- "^TR[ABDG][VDJC]|^IG[HKL][VDJ]|^IGH[ADEGM]|^IGKC|^IGLC"
+tme_bulk_pb <- tme_bulk_pb[!grepl(tcr_bcr_re, rownames(tme_bulk_pb)), ]
+
+sm <- unified@meta.data %>%
+  distinct(orig.merge, Dx.simple, GEO.Cohort) %>% as.data.frame()
+rownames(sm) <- sm$orig.merge
+
+run_bulk_dream <- function(pb, meta, form, coef_name) {
+  dge <- DGEList(counts = pb, samples = meta)
+  dge <- dge[filterByExpr(dge, group = meta$Dx.simple, min.count =5, min.prop =.1), ]
+  dge <- calcNormFactors(dge)
+  vo  <- voomWithDreamWeights(dge, form, meta, BPPARAM = MulticoreParam(16))
+  fit <- eBayes(dream(vo, form, meta, BPPARAM = MulticoreParam(16)))
+  topTable(fit, coef = coef_name, number = Inf, sort.by = "P") %>%
+    tibble::rownames_to_column("gene")
+}
+
+# CTCL vs HC: all cohorts, cohort random intercept
+ctcl_s <- rownames(sm)[sm$Dx.simple %in% c("HC", "CTCL")]
+m_ctcl <- sm[ctcl_s, , drop = FALSE]
+m_ctcl$Dx.simple <- factor(as.character(m_ctcl$Dx.simple), levels = c("HC", "CTCL"))
+tme_bulk_ctcl <- run_bulk_dream(tme_bulk_pb[, ctcl_s], m_ctcl,
+                                ~ Dx.simple + (1 | GEO.Cohort), "Dx.simpleCTCL") %>%
+  mutate(contrast = "CTCL_vs_HC")
+
+# BID vs HC: E-MTAB-8142 only (BID's single cohort -> no cohort random effect)
+bid_s  <- rownames(sm)[sm$Dx.simple %in% c("HC", "BID") & sm$GEO.Cohort == "E-MTAB-8142"]
+m_bid  <- sm[bid_s, , drop = FALSE]
+m_bid$Dx.simple <- factor(as.character(m_bid$Dx.simple), levels = c("HC", "BID"))
+tme_bulk_bid <- run_bulk_dream(tme_bulk_pb[, bid_s], m_bid,
+                               ~ Dx.simple, "Dx.simpleBID") %>%
+  mutate(contrast = "BID_vs_HC")
+
+tme_bulk_deg <- bind_rows(tme_bulk_ctcl, tme_bulk_bid)
+cat("TME bulk CTCL vs HC DEGs (adj.P<0.05):", sum(tme_bulk_ctcl$adj.P.Val < 0.05), "\n")
+cat("TME bulk BID  vs HC DEGs (adj.P<0.05):", sum(tme_bulk_bid$adj.P.Val  < 0.05), "\n")
+
+cat("\n=== top CTCL vs HC ===\n")
+print(as_tibble(tme_bulk_ctcl), n = 20)
+cat("\n=== top BID vs HC ===\n")
+print(as_tibble(tme_bulk_bid), n = 20)
+
+write.csv(tme_bulk_deg, "results/tme_bulk_deg.csv", row.names = FALSE)
+saveRDS(tme_bulk_deg, "results/tme_bulk_deg.rds")
+```
+
+```{r tme_bulk_scatter}
+tme_bulk_deg <- readRDS("results/tme_bulk_deg.rds")
+tme_bulk_wide <- tme_bulk_deg %>%
+  select(gene, contrast, logFC, adj.P.Val) %>%
+  tidyr::pivot_wider(names_from = contrast,
+                     values_from = c(logFC, adj.P.Val), names_sep = "_") %>%
+  dplyr::filter(!is.na(logFC_CTCL_vs_HC) & !is.na(logFC_BID_vs_HC)) %>%
+  mutate(sig = case_when(
+    adj.P.Val_CTCL_vs_HC < 0.05 & adj.P.Val_BID_vs_HC < 0.05 ~ "both",
+    adj.P.Val_CTCL_vs_HC < 0.05                              ~ "CTCL only",
+    adj.P.Val_BID_vs_HC  < 0.05                              ~ "BID only",
+    TRUE                                                     ~ "ns"
+  ))
+
+lim <- quantile(abs(c(tme_bulk_wide$logFC_CTCL_vs_HC, tme_bulk_wide$logFC_BID_vs_HC)),
+                0.9995, na.rm = TRUE)
+
+# label representative genes at every extreme: CTCL axis (+/-), BID axis (+/-),
+# the shared diagonal (up/down), and the divergent anti-diagonal corners
+w   <- tme_bulk_wide %>%
+  mutate(x = logFC_CTCL_vs_HC, y = logFC_BID_vs_HC, s = x + y, d = x - y)
+lab <- bind_rows(
+  slice_max(w, x, n = 20), slice_min(w, x, n = 12),   # CTCL up / down
+  slice_max(w, y, n = 4), slice_min(w, y, n = 6),   # BID up / down
+  slice_max(w, s, n = 4), slice_min(w, s, n = 4),   # shared up / down
+  slice_max(w, d, n = 4), slice_min(w, d, n = 4)    # CTCL-up/BID-down & reverse
+) %>% distinct(gene, .keep_all = TRUE) %>%
+  mutate(x = pmax(pmin(x, lim), -lim), y = pmax(pmin(y, lim), -lim))  # clamp to panel
+
+# squish all points to the panel so off-scale extremes (and their labels) sit on
+# the border instead of being clipped to empty space
+plt <- tme_bulk_wide %>%
+  mutate(logFC_CTCL_vs_HC = pmax(pmin(logFC_CTCL_vs_HC, lim), -lim),
+         logFC_BID_vs_HC  = pmax(pmin(logFC_BID_vs_HC,  lim), -lim))
+
+ggplot(plt, aes(x = logFC_CTCL_vs_HC, y = logFC_BID_vs_HC)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "grey80") +
+  geom_point(aes(color = sig), size = 1, alpha = 0.4) +
+  ggrepel::geom_text_repel(data = lab, aes(x = x, y = y, label = gene),
+    inherit.aes = FALSE, color = "black", size = 2.5, max.overlaps = 10,
+    min.segment.length = 0, segment.size = 0.2, segment.color = "grey70",
+    box.padding = 0.4) +
+  scale_color_manual(values = c("CTCL only" = base::unname(dx_cols["CTCL"]),
+                                "BID only"  = base::unname(dx_cols["BID"]),
+                                "both"      = "black",
+                                "ns"        = "grey80")) +
+  coord_equal(xlim = c(-lim, lim), ylim = c(-lim, lim)) +
+  labs(x = "logFC CTCL vs HC", y = "logFC BID vs HC", color = NULL) +
+  theme_classic(base_size = 11) +
+  theme(legend.position = "bottom")
+ggsave("figs/tme_bulk_scatter.pdf", height = 4.5, width = 4, dpi = 600)
+```
+
+```{r tme_bulk_gsea}
+# GSEA on the TME-only whole-sample bulk DEGs, ranked by t (Hallmark + Reactome).
+if (!exists("pathways")) {
+  msig_tbl <- bind_rows(
+    msigdbr(species = "Homo sapiens", collection = "H"),
+    msigdbr(species = "Homo sapiens", collection = "C2", subcollection = "CP:REACTOME")
+  ) %>% select(gs_name, gene_symbol) %>% distinct()
+  pathways <- split(msig_tbl$gene_symbol, msig_tbl$gs_name)
+}
+
+run_tme_gsea <- function(res) {
+  rk <- res %>% arrange(desc(t)) %>% { setNames(.$t, .$gene) }
+  set.seed(42)
+  fgsea(pathways, rk, nproc = 16) %>% as_tibble()
+}
+
+gsea_tme_ctcl <- run_tme_gsea(tme_bulk_ctcl)
+gsea_tme_bid  <- run_tme_gsea(tme_bulk_bid)
+
+cat("CTCL vs HC GSEA hits (padj<0.05):", sum(gsea_tme_ctcl$padj < 0.05, na.rm = TRUE), "\n")
+cat("BID  vs HC GSEA hits (padj<0.05):", sum(gsea_tme_bid$padj  < 0.05, na.rm = TRUE), "\n")
+
+saveRDS(gsea_tme_ctcl, "results/gsea_tme_ctcl.rds")
+saveRDS(gsea_tme_bid,  "results/gsea_tme_bid.rds")
+# collapse the leadingEdge list-column to a string so write.csv can handle it
+write.csv(gsea_tme_ctcl %>% mutate(leadingEdge = sapply(leadingEdge, paste, collapse = ";")),
+          "results/gsea_tme_ctcl.csv", row.names = FALSE)
+write.csv(gsea_tme_bid %>% mutate(leadingEdge = sapply(leadingEdge, paste, collapse = ";")),
+          "results/gsea_tme_bid.csv", row.names = FALSE)
+
+# plot top up + down CTCL vs HC pathways by padj (most significant in each direction)
+gsea_tme_ctcl <- readRDS("results/gsea_tme_ctcl.rds")
+top <- bind_rows(
+  gsea_tme_ctcl %>% filter(NES > 0) %>% slice_min(padj, n = 5, with_ties = FALSE),
+  gsea_tme_ctcl %>% filter(NES < 0) %>% slice_min(padj, n = 3, with_ties = FALSE)
+) %>% arrange(NES) %>% mutate(pathway = factor(pathway, levels = pathway))
+
+ggplot(top, aes(NES, pathway)) +
+  geom_segment(aes(x = 0, xend = NES, yend = pathway), color = "grey70") +
+  geom_vline(xintercept = 0, color = "grey70") +
+  geom_point(aes(color = NES, size = -log10(padj))) +
+  scale_color_gradient2(low = "#2166AC", mid = "grey85", high = "#B2182B",
+                        midpoint = 0, name = "NES") +
+  scale_size_continuous(range = c(2, 6), name = "-log10(FDR)") +
+  scale_y_discrete(labels = function(x)
+    scales::label_wrap(22)(gsub("_", " ", sub("^(HALLMARK|REACTOME)_", "", x)))) +
+  labs(x = "NES", y = NULL,
+       title = "Top Enriched Pathways: CTCL vs HC") +
+  theme_classic(base_size = 10) +
+  theme(plot.title  = element_text(hjust = 0.5),
+        axis.text.x = element_text(size = 12))
+ggsave("figs/tme_bulk_gsea_ctcl.pdf", height = 4, width = 4.8, dpi = 600)
+```
+
+```{r celltype_pseudobulk_deg}
+# per-celltype pseudobulk (genes x sample-celltype) via sparse indicator
+unified$pb_id <- paste(unified$orig.merge, unified$celltype.unified, sep = "__")
+f   <- factor(unified$pb_id)
+ind <- Matrix::sparse.model.matrix(~ 0 + f); colnames(ind) <- levels(f)
+agg <- as.matrix(GetAssayData(unified, "counts", assay = "RNA") %*% ind)
+
+tcr_bcr_re <- "^TR[ABDG][VDJC]|^IG[HKL][VDJ]|^IGH[ADEGM]|^IGKC|^IGLC"
+agg <- agg[!grepl(tcr_bcr_re, rownames(agg)), ]
+
+pb_meta <- unified@meta.data %>%
+  distinct(pb_id, orig.merge, celltype.unified, Dx.simple, GEO.Cohort) %>%
+  as.data.frame()
+rownames(pb_meta) <- pb_meta$pb_id
+pb_meta$ncell <- as.integer(table(f)[pb_meta$pb_id])
+pb_meta <- pb_meta[colnames(agg), ]
+
+MIN_SAMPLES <- 2; MIN_CELLS <- 10
+
+run_ct <- function(ct, alt, cohort_sub = NULL) {
+  m <- pb_meta %>% filter(celltype.unified == ct,
+                          Dx.simple %in% c("HC", alt), ncell >= MIN_CELLS)
+  if (!is.null(cohort_sub)) m <- filter(m, GEO.Cohort %in% cohort_sub)
+  m$Dx.simple <- factor(as.character(m$Dx.simple), levels = c("HC", alt))
+  if (any(table(m$Dx.simple) < MIN_SAMPLES)) return(NULL)
+  form <- if (n_distinct(m$GEO.Cohort) >= 2) ~ Dx.simple + (1|GEO.Cohort) else ~ Dx.simple
+  dge <- DGEList(agg[, m$pb_id], samples = m)
+  dge <- calcNormFactors(dge[filterByExpr(dge, group = m$Dx.simple), ])
+  vo  <- voomWithDreamWeights(dge, form, m, BPPARAM = MulticoreParam(16))
+  fit <- eBayes(dream(vo, form, m, BPPARAM = MulticoreParam(16)))
+  topTable(fit, coef = paste0("Dx.simple", alt), number = Inf, sort.by = "P") %>%
+    rownames_to_column("gene") %>% mutate(celltype = ct)
+}
+
+cts <- sort(unique(pb_meta$celltype.unified))
+res_ctcl <- bind_rows(lapply(cts, function(ct) tryCatch(run_ct(ct, "CTCL"),
+  error = function(e) { message(ct, " CTCL: ", e$message); NULL }))) %>%
+  mutate(contrast = "CTCL_vs_HC")
+res_bid  <- bind_rows(lapply(cts, function(ct) tryCatch(run_ct(ct, "BID"),
+  error = function(e) { message(ct, " BID: ", e$message); NULL }))) %>%
+  mutate(contrast = "BID_vs_HC")
+
+res_merged <- full_join(
+  res_ctcl %>% select(gene, celltype, logFC_ctcl = logFC, t_ctcl = t, padj_ctcl = adj.P.Val),
+  res_bid  %>% select(gene, celltype, logFC_bid  = logFC, t_bid  = t, padj_bid  = adj.P.Val),
+  by = c("gene", "celltype")) %>%
+  mutate(dif_logFC = logFC_ctcl - logFC_bid, dif_t = t_ctcl - t_bid)
+```
+
+```{r save_celltype_deg}
+write.csv(res_ctcl,   "results/deg_celltype_ctcl_vs_hc.csv", row.names = FALSE)
+write.csv(res_bid,    "results/deg_celltype_bid_vs_hc.csv",  row.names = FALSE)
+write.csv(res_merged, "results/deg_celltype_merged.csv",     row.names = FALSE)
+
+saveRDS(res_ctcl,   "results/deg_celltype_ctcl_vs_hc.rds")
+saveRDS(res_bid,    "results/deg_celltype_bid_vs_hc.rds")
+saveRDS(res_merged, "results/deg_celltype_merged.rds")
+```
+
+```{r celltype_deg_featureplot}
+res_ctcl <- readRDS("results/deg_celltype_ctcl_vs_hc.rds")
+res_bid <- readRDS("results/deg_celltype_bid_vs_hc.rds")
+
+n_sig <- bind_rows(res_ctcl, res_bid) %>% filter(adj.P.Val < 0.05) %>%
+  count(contrast, celltype, name = "n_deg")
+cts <- unique(c(res_ctcl$celltype, res_bid$celltype))
+deg_wide <- tibble(celltype = cts) %>%
+  left_join(tidyr::pivot_wider(n_sig, names_from = contrast, values_from = n_deg),
+            by = "celltype") %>%
+  mutate(across(c(CTCL_vs_HC, BID_vs_HC), ~ tidyr::replace_na(., 0)),
+         total = CTCL_vs_HC + BID_vs_HC)
+
+ct_levels <- sort(unique(as.character(unified$celltype.unified)))
+ct_cols   <- setNames(scales::hue_pal()(length(ct_levels)), ct_levels)
+
+brks <- c(0, 1, 3, 10, 30, 100, 300, 1000)
+lim  <- c(0, max(deg_wide$CTCL_vs_HC, deg_wide$BID_vs_HC))
+pl   <- scales::pseudo_log_trans(base = 10)
+
+ggplot(deg_wide, aes(CTCL_vs_HC, BID_vs_HC)) +
+  geom_abline(slope = 1, linetype = "dashed", color = "grey80", linewidth = 0.4) +
+  geom_point(aes(color = celltype, size = total)) +
+  ggrepel::geom_text_repel(aes(label = celltype, color = celltype), size = 4.5,
+    max.overlaps = Inf, min.segment.length = 0, segment.color = "grey80",
+    box.padding = 0.6, show.legend = FALSE) +
+  scale_color_manual(values = ct_cols, guide = "none") +
+  scale_size_continuous(range = c(2, 6), name = "total sig DEGs") +
+  scale_x_continuous(trans = pl, breaks = brks, limits = lim) +
+  scale_y_continuous(trans = pl, breaks = brks, limits = lim) +
+  coord_equal() +
+  labs(x = "CTCL vs HC  (sig DEGs)", y = "BID vs HC  (sig DEGs)") +
+  theme_classic(base_size = 12) +
+  theme(axis.text = element_text(size = 12)) +
+  NoLegend()
+ggsave("figs/scatter_ndeg_ctcl_vs_bid.pdf", height = 4.5, width = 4.5, dpi = 600)
+```
+
+
+```{r celltype_contrast_correlation}
+res_merged <- readRDS("results/deg_celltype_merged.rds")
+fib   <- filter(res_merged, celltype == "Fibroblast") %>% mutate(adif = abs(dif_t))
+r_fib <- cor(fib$t_ctcl, fib$t_bid, use = "complete.obs")
+lab   <- slice_max(fib, adif, n = 30)
+dlim  <- quantile(fib$adif, 0.999, na.rm = TRUE)
+
+axlim <- quantile(abs(c(fib$t_ctcl, fib$t_bid)), 0.9999, na.rm = TRUE)
+sq    <- function(x) pmax(pmin(x, axlim), -axlim)
+fib   <- mutate(fib, t_ctcl = sq(t_ctcl), t_bid = sq(t_bid))
+lab   <- mutate(lab, t_ctcl = sq(t_ctcl), t_bid = sq(t_bid))
+
+ggplot(fib, aes(t_ctcl, t_bid)) +
+  geom_hline(yintercept = 0, color = "grey85", linewidth = 0.3) +
+  geom_vline(xintercept = 0, color = "grey85", linewidth = 0.3) +
+  geom_abline(slope = 1, linetype = "dashed", color = "grey80", linewidth = 0.3) +
+  geom_point(aes(color = dif_t), shape = 16, alpha = 0.8) +
+  scale_color_gradient2(low = "#2166AC", mid = "grey85", high = "#B2182B",
+                        midpoint = 0, limits = c(-dlim, dlim),
+                        oob = scales::squish, guide = "none") +
+  ggrepel::geom_text_repel(data = lab, aes(label = gene), color = "black", size = 3,
+    max.overlaps = Inf, min.segment.length = 0, segment.color = "grey20",
+    segment.size = 0.2) +
+  annotate("text", x = -Inf, y = Inf, label = sprintf("r = %.2f", r_fib),
+           hjust = -0.15, vjust = 1.5, size = 4) +
+  coord_fixed(xlim = c(-axlim, axlim), ylim = c(-axlim, axlim), expand = FALSE) +
+  labs(x = "CTCL vs HC  (gene t-stat)", y = "BID vs HC  (gene t-stat)",
+       title = "") +
+  theme_classic(base_size = 12)+ggtitle(NULL)
+ggsave("figs/fibroblast_ctcl_vs_bid_scatter.pdf", height = 4.5, width = 4.5, dpi = 600)
+```
+
+```{r fibroblast_volcano}
+v  <- res_ctcl %>% filter(celltype == "Fibroblast") %>%
+  mutate(neglog10p = -log10(adj.P.Val))
+xl <- quantile(abs(v$logFC), 0.9995, na.rm = TRUE)
+yl <- quantile(v$neglog10p, 0.9995, na.rm = TRUE)
+v  <- mutate(v, logFC = pmax(pmin(logFC, xl), -xl), neglog10p = pmin(neglog10p, yl))
+
+sig <- v %>% filter(adj.P.Val < 0.05)
+lab <- bind_rows(
+  slice_max(sig, logFC, n = 6), slice_min(sig, logFC, n = 6),
+  slice_min(filter(sig, logFC > 0), adj.P.Val, n = 6),
+  slice_min(filter(sig, logFC < 0), adj.P.Val, n = 6)
+) %>% distinct(gene, .keep_all = TRUE)
+
+ggplot(v, aes(logFC, neglog10p, color = logFC)) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey80") +
+  geom_point(shape = 16, size = 2, alpha = 0.8) +
+  scale_color_gradient2(low = "#2166AC", mid = "grey85", high = "#B2182B",
+                        midpoint = 0, limits = c(-xl, xl),
+                        oob = scales::squish, guide = "none") +
+  ggrepel::geom_text_repel(data = lab, aes(label = gene), color = "black", size = 3,
+    max.overlaps = 10, min.segment.length = 0, segment.size = 0.2,
+    segment.color = "grey20") +
+  coord_cartesian(xlim = c(-xl, xl), ylim = c(0, yl), expand = FALSE, clip = "off") +
+  labs(x = "log2FC  (CTCL vs HC)", y = expression(-log[10]~adj.P),
+       title = "") +
+  theme_classic(base_size = 12)
+ggsave("figs/fibroblast_volcano_ctcl.pdf", height = 4.5, width = 4.5, dpi = 600)
+```
+
+```{r fibroblast_gsea}
+msig_tbl <- bind_rows(
+  msigdbr(species = "Homo sapiens", collection = "H"),
+  msigdbr(species = "Homo sapiens", collection = "C2", subcollection = "CP:REACTOME")
+) %>% select(gs_name, gene_symbol) %>% distinct()
+pathways <- split(msig_tbl$gene_symbol, msig_tbl$gs_name)
+
+rk <- res_ctcl %>% filter(celltype == "Fibroblast") %>%
+  arrange(desc(t)) %>% { setNames(.$t, .$gene) }
+
+set.seed(42)
+gsea_fib <- fgsea(pathways, rk, nproc = 16) %>% as_tibble()
+
+top <- bind_rows(slice_max(gsea_fib, NES, n = 6),
+                 slice_min(gsea_fib, NES, n = 2)) %>%
+  arrange(NES) %>%
+  mutate(pathway = factor(pathway, levels = pathway))
+
+ggplot(top, aes(NES, pathway)) +
+  geom_segment(aes(x = 0, xend = NES, yend = pathway), color = "grey70") +
+  geom_vline(xintercept = 0, color = "grey70") +
+  geom_point(aes(color = NES, size = -log10(padj))) +
+  scale_color_gradient2(low = "#2166AC", mid = "grey85", high = "#B2182B",
+                        midpoint = 0, name = "NES") +
+  scale_size_continuous(range = c(2, 6), name = "-log10(FDR)") +
+  scale_y_discrete(labels = function(x)
+    scales::label_wrap(24)(gsub("_", " ", sub("^(HALLMARK|REACTOME)_", "", x)))) +
+  labs(x = "NES", y = NULL, title = "Fibroblasts: CTCL vs HC") +
+  theme_classic(base_size = 10) +
+  theme(plot.title  = element_text(hjust = 0.5),
+        axis.text.x = element_text(size = 12))
+ggsave("figs/gsea_fibroblast_ctcl.pdf", height = 4.5, width = 5, dpi = 600)
+```
+
+
+
+```{r celltype_contrast_scatter_facets, fig.width = 18, fig.height = 5}
+# per-celltype CTCL-vs-HC vs BID-vs-HC gene t-stat scatters, lm line + r, 2 rows
+res_merged <- readRDS("results/deg_celltype_merged.rds")
+sc <- res_merged %>% filter(!is.na(t_ctcl), !is.na(t_bid))
+cor_df <- sc %>% group_by(celltype) %>%
+  summarise(r = cor(t_ctcl, t_bid), .groups = "drop")
+
+ggplot(sc, aes(t_ctcl, t_bid)) +
+  geom_hline(yintercept = 0, color = "grey90", linewidth = 0.2) +
+  geom_vline(xintercept = 0, color = "grey90", linewidth = 0.2) +
+  geom_point(size = 0.3, alpha = 0.3, color = "grey40") +
+  geom_smooth(method = "lm", formula = y ~ x, se = FALSE,
+              color = "#B2182B", linewidth = 0.6) +
+  geom_text(data = cor_df, aes(x = -Inf, y = Inf, label = sprintf("r = %.2f", r)),
+            hjust = -0.1, vjust = 1.4, size = 3, inherit.aes = FALSE) +
+  facet_wrap(~ celltype, nrow = 2, scales = "free") +
+  labs(x = "CTCL vs HC  (gene t-stat)", y = "BID vs HC  (gene t-stat)") +
+  theme_classic(base_size = 9)
+```
+
+```{r gsea_pan_celltype}
+run_gsea_ct <- function(res) {
+  bind_rows(lapply(sort(unique(res$celltype)), function(ct) {
+    rk <- res %>% filter(celltype == ct, !is.na(t)) %>%
+      arrange(desc(t)) %>% { setNames(.$t, .$gene) }
+    if (length(rk) < 10) return(NULL)
+    fgsea(pathways, rk, nproc = 16) %>% as_tibble() %>% mutate(celltype = ct)
+  }))
+}
+
+set.seed(42)
+gsea_pan_ctcl <- run_gsea_ct(res_ctcl)
+gsea_pan_bid  <- run_gsea_ct(res_bid)
+
+bind_rows(gsea_pan_ctcl %>% mutate(contrast = "CTCL_vs_HC"),
+          gsea_pan_bid  %>% mutate(contrast = "BID_vs_HC")) %>%
+  filter(padj < 0.05) %>% count(contrast, celltype) %>%
+  tidyr::pivot_wider(names_from = contrast, values_from = n, values_fill = 0) %>%
+  as_tibble() %>% print(n = Inf)
+
+data.table::fwrite(gsea_pan_ctcl, "results/gsea_pan_ctcl.csv")
+data.table::fwrite(gsea_pan_bid,  "results/gsea_pan_bid.csv")
+
+saveRDS(gsea_pan_ctcl, "results/gsea_pan_ctcl.rds")
+saveRDS(gsea_pan_bid, "results/gsea_pan_bid.rds")
+```
+
+```{r gsea_pan_dotplot}
+pan_rank <- gsea_pan_ctcl %>%
+  group_by(pathway) %>%
+  summarise(n_sig = sum(padj < 0.05, na.rm = TRUE),
+            mean_nes = mean(NES, na.rm = TRUE), .groups = "drop") %>%
+  filter(n_sig >= 2)
+
+pw_order <- bind_rows(slice_max(pan_rank, mean_nes, n = 8),
+                      slice_min(pan_rank, mean_nes, n = 4)) %>%
+  arrange(mean_nes) %>% pull(pathway)
+
+dp   <- gsea_pan_ctcl %>% filter(pathway %in% pw_order) %>%
+  mutate(pathway = factor(pathway, levels = pw_order))
+nlim <- quantile(abs(dp$NES), 0.99, na.rm = TRUE)
+
+ggplot(dp, aes(celltype, pathway)) +
+  geom_point(aes(size = -log10(padj), color = NES)) +
+  scale_color_gradient2(low = "#2166AC", mid = "grey85", high = "#B2182B",
+                        midpoint = 0, limits = c(-nlim, nlim), oob = scales::squish) +
+  scale_size_continuous(range = c(0.3, 5), name = "-log10 padj") +
+  scale_y_discrete(labels = function(x)
+    scales::label_wrap(25)(gsub("_", " ", sub("^(HALLMARK|REACTOME)_", "", x)))) +
+  labs(x = NULL, y = NULL, title = "CTCL vs HC GSEA: top pan-TME pathways") +
+  theme_classic(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+ggsave("figs/gsea_pan_ctcl_dotplot.pdf", height = 8, width = 6.5, dpi = 600)
+```
+
+<!-- ===== CTCL-specific multicellular programs (CTCL-minus-BID interaction) ===== -->
+<!-- The composition-robust "middle": built on within-celltype pseudobulk DEG       -->
+<!-- (saved per-celltype GSEA), scored in the CTCL-vs-BID interaction space by       -->
+<!-- BREADTH (# celltypes deploying it, CTCL-specifically) x SPECIFICITY (NES_CTCL   -->
+<!-- minus NES_BID). A program is CTCL-defining if broad AND divergent from BID.     -->
+
+```{r ctcl_specific_program_matrix}
+# per-celltype x pathway NES for both contrasts (saved earlier)
+gctcl <- readRDS("results/gsea_pan_ctcl.rds") %>% select(pathway, celltype, NES, padj)
+gbid  <- readRDS("results/gsea_pan_bid.rds")  %>% select(pathway, celltype, NES, padj)
+
+m <- full_join(gctcl %>% rename(NES_ctcl = NES, padj_ctcl = padj),
+               gbid  %>% rename(NES_bid  = NES, padj_bid  = padj),
+               by = c("pathway", "celltype")) %>%
+  mutate(NES_ctcl  = tidyr::replace_na(NES_ctcl, 0),
+         NES_bid   = tidyr::replace_na(NES_bid, 0),
+         padj_ctcl = tidyr::replace_na(padj_ctcl, 1),
+         padj_bid  = tidyr::replace_na(padj_bid, 1),
+         dNES = NES_ctcl - NES_bid)                       # + = stronger in CTCL
+
+# program dominant CTCL direction (over its CTCL-significant celltypes)
+dir_tbl <- m %>% filter(padj_ctcl < 0.05) %>% group_by(pathway) %>%
+  summarise(dir = sign(sum(NES_ctcl)), .groups = "drop") %>% filter(dir != 0)
+
+# a celltype "deploys" the program CTCL-specifically if it is CTCL-sig, concordant
+# with the program direction, AND more CTCL than BID in that direction
+m2 <- m %>% inner_join(dir_tbl, by = "pathway") %>%
+  mutate(deploy = padj_ctcl < 0.05 & sign(NES_ctcl) == dir & sign(dNES) == dir)
+
+# program-level breadth + composite specificity score (n_sig >= 2 retained)
+# score = sum over deploying celltypes of (-log10 padj_ctcl) * |dNES|
+prog <- m2 %>% group_by(pathway, dir) %>%
+  summarise(breadth   = sum(deploy),
+            score     = sum((-log10(pmax(padj_ctcl, 1e-300)) * abs(dNES))[deploy]),
+            mean_dNES = ifelse(any(deploy), mean(dNES[deploy]), NA_real_),
+            .groups = "drop") %>%
+  filter(breadth >= 2) %>% arrange(desc(score))
+
+cat("top CTCL-specific multicellular programs (breadth >= 2, by composite score):\n")
+prog %>% mutate(score = round(score, 1), mean_dNES = round(mean_dNES, 2)) %>%
+  as_tibble() %>% print(n = 20)
+```
+
+```{r ctcl_specific_program_plots, fig.width = 11, fig.height = 6}
+top_prog <- prog %>% slice_max(score, n = 14) %>%
+  arrange(dir, mean_dNES) %>% mutate(pathway = factor(pathway, levels = pathway))
+clean <- function(x) scales::label_wrap(34)(gsub("_", " ", sub("^(HALLMARK|REACTOME)_", "", x)))
+
+# A: ranking — breadth x specificity, bar of mean CTCL-minus-BID NES, labeled w/ breadth
+pRank <- ggplot(top_prog, aes(mean_dNES, pathway, fill = mean_dNES)) +
+  geom_col() + geom_vline(xintercept = 0, color = "grey70") +
+  geom_text(aes(label = paste0(breadth, " cts"),
+                hjust = ifelse(mean_dNES > 0, -0.15, 1.15)), size = 2.8) +
+  scale_fill_gradient2(low = "#2166AC", mid = "grey85", high = "#B2182B",
+                       midpoint = 0, guide = "none") +
+  scale_y_discrete(labels = clean) +
+  coord_cartesian(clip = "off") +
+  labs(x = "mean NES  (CTCL − BID, deploying celltypes)", y = NULL,
+       title = "CTCL-specific multicellular programs (vs BID)") +
+  theme_classic(base_size = 10)
+
+# B: celltype x program matrix of the interaction (fill = dNES, size = CTCL signif)
+hp <- m2 %>% filter(pathway %in% levels(top_prog$pathway)) %>%
+  mutate(pathway = factor(pathway, levels = levels(top_prog$pathway)))
+dlim <- quantile(abs(hp$dNES), 0.99, na.rm = TRUE)
+pMat <- ggplot(hp, aes(celltype, pathway)) +
+  geom_point(aes(fill = dNES, size = -log10(padj_ctcl)), shape = 21, color = "grey60") +
+  scale_fill_gradient2(low = "#2166AC", mid = "grey90", high = "#B2182B",
+                       midpoint = 0, limits = c(-dlim, dlim), oob = scales::squish,
+                       name = "NES\nCTCL−BID") +
+  scale_size_continuous(range = c(0.3, 5), name = "-log10\npadj CTCL") +
+  scale_y_discrete(labels = clean) +
+  labs(x = NULL, y = NULL,
+       title = "Where CTCL-specific programs are deployed (celltype × program)") +
+  theme_classic(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+pRank | pMat
+```
+
+
+
+#testing
+```{r}
+samp <- unified@meta.data %>% distinct(orig.merge, Dx.simple, GEO.Cohort)
+
+cat("samples per Dx.simple x cohort:\n")
+print(addmargins(table(samp$Dx.simple, samp$GEO.Cohort, useNA = "ifany")))
+
+cat("\ntotal samples per Dx.simple:\n")
+print(table(samp$Dx.simple, useNA = "ifany"))
+
+cat("\ntotal samples per cohort:\n")
+print(table(samp$GEO.Cohort, useNA = "ifany"))
+```
+
+```{r da_ctcl_vs_hc}
+# CLR DA helper: celltype abundance CTCL vs HC, cohort-adjusted
+da_clr_dx <- function(meta) {
+  pl <- meta %>%
+    count(orig.merge, Dx.simple, GEO.Cohort, celltype.unified) %>%
+    tidyr::complete(tidyr::nesting(orig.merge, Dx.simple, GEO.Cohort),
+                    celltype.unified, fill = list(n = 0)) %>%
+    group_by(orig.merge) %>%
+    mutate(clr = log(n + 0.5) - mean(log(n + 0.5))) %>% ungroup() %>%
+    mutate(Dx.simple = factor(as.character(Dx.simple), levels = c("HC", "CTCL")))
+  lapply(split(pl, pl$celltype.unified), function(df) {
+    if (any(table(df$Dx.simple) < 3)) return(NULL)
+    form <- if (dplyr::n_distinct(df$GEO.Cohort) >= 2) clr ~ Dx.simple + GEO.Cohort
+            else clr ~ Dx.simple
+    tryCatch({
+      cf <- as.data.frame(coef(summary(lm(form, data = df))))
+      cf$term <- rownames(cf); cf$celltype <- as.character(df$celltype.unified[1]); cf
+    }, error = function(e) NULL)
+  }) %>% bind_rows() %>%
+    filter(grepl("^Dx.simple", term)) %>%
+    transmute(celltype, estimate = Estimate, SE = `Std. Error`,
+              t = `t value`, p_value = `Pr(>|t|)`) %>%
+    mutate(adj_p = p.adjust(p_value, "BH")) %>% arrange(p_value)
+}
+
+meta_ch <- unified@meta.data %>% filter(Dx.simple %in% c("HC", "CTCL"))
+
+da_all <- da_clr_dx(meta_ch)
+cat("=== all cohorts ===\n"); print(as_tibble(da_all), n = Inf)
+
+# cohorts containing BOTH HC and CTCL
+coh_both_dx <- meta_ch %>% distinct(GEO.Cohort, Dx.simple) %>%
+  count(GEO.Cohort) %>% filter(n == 2) %>% pull(GEO.Cohort)
+
+da_both <- meta_ch %>% filter(GEO.Cohort %in% coh_both_dx) %>% da_clr_dx()
+cat("\n=== cohorts with both HC+CTCL:", paste(coh_both_dx, collapse = ", "), "===\n")
+print(as_tibble(da_both), n = Inf)
+
+# does it hold? estimate concordance, all vs restricted
+cmp <- inner_join(da_all  %>% select(celltype, est_all  = estimate, padj_all  = adj_p),
+                  da_both %>% select(celltype, est_both = estimate, padj_both = adj_p),
+                  by = "celltype")
+lim <- max(abs(c(cmp$est_all, cmp$est_both)), na.rm = TRUE)
+
+ggplot(cmp, aes(est_all, est_both)) +
+  geom_hline(yintercept = 0, color = "grey85", linewidth = 0.3) +
+  geom_vline(xintercept = 0, color = "grey85", linewidth = 0.3) +
+  geom_abline(slope = 1, linetype = "dashed", color = "grey80", linewidth = 0.3) +
+  geom_point(size = 1.5) +
+  ggrepel::geom_text_repel(aes(label = celltype), size = 3,
+    max.overlaps = Inf, min.segment.length = 0, segment.color = "grey70") +
+  coord_fixed(xlim = c(-lim, lim), ylim = c(-lim, lim)) +
+  labs(x = "CLR effect (all cohorts)", y = "CLR effect (HC+CTCL cohorts only)",
+       title = "CTCL vs HC DA: all vs restricted") +
+  theme_classic(base_size = 11)
+```
+
+```{r bulk_ctcl_gsea}
+# GSEA on the true whole-sample bulk CTCL vs HC DEG (bulk_ctcl, ranked by t)
+if (!exists("pathways")) {
+  msig_tbl <- bind_rows(
+    msigdbr(species = "Homo sapiens", collection = "H"),
+    msigdbr(species = "Homo sapiens", collection = "C2", subcollection = "CP:REACTOME")
+  ) %>% select(gs_name, gene_symbol) %>% distinct()
+  pathways <- split(msig_tbl$gene_symbol, msig_tbl$gs_name)
+}
+
+# recompute true whole-sample bulk CTCL vs HC DEG if not already in memory
+if (!exists("bulk_ctcl")) {
+  if (!exists("obj")) obj <- readRDS("../fig1/results/obj.fig1.rds")
+  skin_all <- subset(obj, Tissue == "skin")
+  cnt <- GetAssayData(skin_all, assay = "RNA", layer = "counts")
+  fb  <- factor(skin_all$orig.merge)
+  ind <- Matrix::sparse.model.matrix(~ 0 + fb); colnames(ind) <- levels(fb)
+  pb  <- as.matrix(cnt %*% ind)
+  sm  <- skin_all@meta.data %>% distinct(orig.merge, Dx.simple, GEO.Cohort) %>%
+    as.data.frame(); rownames(sm) <- sm$orig.merge; sm <- sm[colnames(pb), ]
+  cs  <- colnames(pb)[sm$Dx.simple %in% c("HC", "CTCL")]
+  mc  <- sm[cs, ]; mc$Dx.simple <- factor(as.character(mc$Dx.simple), levels = c("HC", "CTCL"))
+  dge <- DGEList(pb[, cs], samples = mc)
+  dge <- calcNormFactors(dge[filterByExpr(dge, group = mc$Dx.simple), ])
+  vo  <- voomWithDreamWeights(dge, ~ Dx.simple + (1|GEO.Cohort), mc, BPPARAM = MulticoreParam(16))
+  fit <- eBayes(dream(vo, ~ Dx.simple + (1|GEO.Cohort), mc, BPPARAM = MulticoreParam(16)))
+  bulk_ctcl <- topTable(fit, coef = "Dx.simpleCTCL", number = Inf, sort.by = "P") %>%
+    rownames_to_column("gene")
+}
+
+rk <- bulk_ctcl %>% arrange(desc(t)) %>% { setNames(.$t, .$gene) }
+set.seed(42)
+gsea_bulk_ctcl <- fgsea(pathways, rk, nproc = 16) %>% as_tibble()
+
+top <- bind_rows(slice_max(gsea_bulk_ctcl, NES, n = 8),
+                 slice_min(gsea_bulk_ctcl, NES, n = 8)) %>%
+  arrange(NES) %>% mutate(pathway = factor(pathway, levels = pathway))
+
+ggplot(top, aes(NES, pathway, fill = NES)) +
+  geom_col() + geom_vline(xintercept = 0, color = "grey70") +
+  scale_fill_gradient2(low = "#2166AC", mid = "grey85", high = "#B2182B",
+                       midpoint = 0, guide = "none") +
+  scale_y_discrete(labels = function(x)
+    scales::label_wrap(40)(gsub("_", " ", sub("^(HALLMARK|REACTOME)_", "", x)))) +
+  labs(x = "NES", y = NULL,
+       title = "True-bulk CTCL vs HC (Hallmark + Reactome)") +
+  theme_classic(base_size = 10)
+```
+
+
+

@@ -1,7 +1,26 @@
-.Rproj.user
+# R / RStudio
+.Rproj.user/
 .Rhistory
 .RData
 .Ruserdata
-.Rproj.user/
-.Rproj.user/
-.Rprofile
+Rplots.pdf
+*.html
+
+# renv library (restored from renv.lock)
+renv/library/
+renv/local/
+renv/staging/
+
+# large Seurat objects (not distributed; see README)
+final/fig1/results/obj.fig1.rds
+final/fig1/full.obj.rds
+final/fig3/results/fig3_t.cells.rds
+final/fig5/immune.rds
+final/fig5/stromal.rds
+final/fig5/unified.rds
+all_cells_final_data/
+
+# misc
+.DS_Store
+omnipathr-log/
+tmp*.csv

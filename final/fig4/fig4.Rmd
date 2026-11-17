@@ -1,0 +1,1667 @@
+---
+title: "fig4"
+output: html_document
+date: "2026-04-15"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(Seurat)
+library(BPCells)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(Matrix)
+library(parallel)
+library(ashr)
+library(ComplexHeatmap)
+library(circlize)
+library(RColorBrewer)
+library(tibble)
+library(R2Pseudosc)
+library(BiocParallel)
+library(SummarizedExperiment)
+library(edgeR)
+library(variancePartition)
+library(harmony)
+library(R2easyviz)
+library(patchwork)
+library(fgsea)
+library(msigdbr)
+library(ConsensusClusterPlus)
+library(ggplotify)
+library(gridExtra)
+```
+
+```{r load}
+obj <- readRDS("../fig1/results/obj.fig1.rds")
+
+t.cells <- subset(obj, celltype == "T_Cells")
+
+table(t.cells$orig.ident)
+hist(table(t.cells$orig.ident), breaks = 100)
+hist(table(t.cells$orig.merge), breaks = 100)
+```
+
+
+```{r}
+set.seed(42)
+
+tmp <- subset(t.cells, celltype.malig == "T_Cells")
+tmp <- R2easyviz::r2sample_seurat(tmp, group_var = "orig.merge", n = 5000, barcode_column = "barcode.unique")
+
+LayerData(tmp, assay = "RNA", layer = "counts") <- as(LayerData(tmp, assay = "RNA", layer = "counts"), "dgCMatrix")
+tmp <- NormalizeData(tmp)
+
+tmp <- FindVariableFeatures(tmp, nfeatures = 2000)
+tcr_bcr <- grep("^TR[ABDG][VDJ]|^TR[AB]C|^IG[HKL][VDJ]|^IGH[ADEGM]|^IGKC|^IGLC",
+                VariableFeatures(tmp), value = TRUE)
+VariableFeatures(tmp) <- setdiff(VariableFeatures(tmp), tcr_bcr)
+tmp <- ScaleData(tmp)
+tmp <- RunPCA(tmp, npcs = 30)
+tmp <- RunHarmony(tmp, group.by.vars = "orig.merge", reduction = "pca", reduction.save = "harmony")
+tmp <- RunUMAP(tmp, reduction = "harmony", dims = 1:15)
+
+DimPlot(tmp, group.by = "orig.merge", shuffle = T)+NoLegend()
+
+tmp <- FindNeighbors(tmp, reduction = "harmony", dims = 1:15)
+tmp <- FindClusters(tmp, resolution = c(0.1,0.5,1))
+```
+
+```{r}
+DimPlot(tmp, group.by = "orig.merge", shuffle = T)+NoLegend()
+DimPlot(tmp, group.by = "RNA_snn_res.0.1", label = T)+NoLegend()
+DimPlot(tmp, group.by = "RNA_snn_res.0.5", label = T)+NoLegend()
+DimPlot(tmp, group.by = "RNA_snn_res.1", label = T, repel = T)
+FeaturePlot(tmp, features = "CD3E")
+FeaturePlot(tmp, features = "CD4")
+FeaturePlot(tmp, features = "FOXP3")
+FeaturePlot(tmp, features = "CD8A")
+FeaturePlot(tmp, features = "TRDC")
+FeaturePlot(tmp, features = "FCGR3A")
+FeaturePlot(tmp, features = "STMN1")
+```
+
+
+```{r}
+markers.tmp <- FindAllMarkers(tmp, group.by = "RNA_snn_res.0.5", min.pct = .1, only.pos = T, logfc.threshold = .5)
+markers.tmp$dif <- markers.tmp$pct.1 - markers.tmp$pct.2
+
+markers.tmp.ss <- r2subset_markers(markers.tmp, nfeatures = 10)
+```
+
+```{r}
+DimPlot(tmp, group.by = "RNA_snn_res.0.5", label = T, cells.highlight = tmp$barcode.unique[tmp$RNA_snn_res.0.5 %in% c("0","1","3","4","8","9","11","12")])+NoLegend()
+cd4 <- subset(tmp, RNA_snn_res.0.5 %in% c("0","1","3","4","8","9","11","12"))
+```
+
+
+```{r cd4_strict_filter}
+excl_markers <- c("CD8A", "CD8B", "TRDC", "FOXP3", "NCAM1", "KLRD1")
+excl_present <- intersect(excl_markers, rownames(cd4))
+expr_excl    <- FetchData(cd4, vars = excl_present, layer = "data")
+exclude      <- rowSums(expr_excl > 0) > 0
+
+cd4.ss <- cd4[, !exclude]
+
+ncol(cd4)
+ncol(cd4.ss)
+
+cd4.keep <- cd4.ss$barcode.unique
+ctcl.keep <- t.cells$barcode.unique[t.cells$celltype.malig == "CTCL"]
+
+cd4.barcodes.keep.all <- c(cd4.keep, ctcl.keep)
+saveRDS(cd4.barcodes.keep.all, "results/cd4.barcodes.keep.all.rds")
+```
+
+
+
+```{r}
+#devtools::install_github("ryanreis333/R2Pseudosc")
+library(R2Pseudosc)
+register(MulticoreParam(16))
+
+cd4.barcodes.keep.all <- readRDS("results/cd4.barcodes.keep.all.rds")
+```
+
+```{r pseudobulk_aggregate}
+cd4.pb <- subset(t.cells, barcode.unique %in% cd4.barcodes.keep.all)
+LayerData(cd4.pb, assay = "RNA", layer = "counts") <- as(LayerData(cd4.pb, assay = "RNA", layer = "counts"), "dgCMatrix")
+
+se <- R2Pseudobulk(
+  seurat_obj = cd4.pb,
+  group_by   = c("orig.merge", "celltype.malig"),
+  assay      = "RNA",
+  layer      = "counts",
+  min_cells  = 10,
+  extra_cols = c("GEO.Cohort", "Patient.ID", "malig.pheno",
+                 "Sample.Type.simple", "Dx.simple", "Tissue")
+)
+
+se
+colData(se)
+
+saveRDS(se, "results/bulk.se.rds")
+```
+
+
+```{r pca_qc}
+se <- readRDS("results/bulk.se.rds")
+meta_se <- as.data.frame(colData(se))
+
+dge_qc  <- DGEList(counts = assay(se, "counts"))
+dge_qc  <- calcNormFactors(dge_qc)
+logcpm  <- edgeR::cpm(dge_qc, log = TRUE, prior.count = 1)
+
+E_bc <- limma::removeBatchEffect(logcpm, batch = meta_se$GEO.Cohort,
+                                  design = model.matrix(~ celltype.malig + Tissue, data = meta_se))
+
+pca_res <- prcomp(t(E_bc), scale. = FALSE)
+pct_var <- round(100 * pca_res$sdev^2 / sum(pca_res$sdev^2), 1)
+
+pca_df <- as.data.frame(pca_res$x[, 1:2]) %>%
+  mutate(GEO.Cohort     = meta_se$GEO.Cohort,
+         Tissue         = meta_se$Tissue,
+         celltype.malig = meta_se$celltype.malig,
+         Sample.Type    = meta_se$Sample.Type.simple)
+
+plot_pca <- function(df, color_var, label) {
+  ggplot(df, aes(PC1, PC2, color = .data[[color_var]])) +
+    geom_point(shape = 16, size = 2, alpha = 0.8) +
+    labs(x = paste0("PC1 (", pct_var[1], "%)"),
+         y = paste0("PC2 (", pct_var[2], "%)"),
+         color = label, title = label) +
+    theme_classic(base_size = 16) +
+    theme(plot.title   = element_text(hjust = 0.5, size = 16),
+          aspect.ratio = 1)
+}
+
+# canonical colors used across the analysis
+tissue_cols <- c("blood" = "#E15759", "lymph node" = "#59A14F", "skin" = "#4E79A7")
+malig_cols  <- c("CTCL" = "#F8766D", "T_Cells" = "#00BFC4")
+
+p1 <- plot_pca(pca_df, "GEO.Cohort",    "Cohort")      + guides(color = "none")
+p2 <- plot_pca(pca_df, "Tissue",         "Tissue")     + scale_color_manual(values = tissue_cols)
+p3 <- plot_pca(pca_df, "celltype.malig", "Malignancy") + scale_color_manual(values = malig_cols)
+p4 <- plot_pca(pca_df, "Sample.Type",    "Lesion Type")
+
+p_combined <- (p1 | p2) / (p3 | p4) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "right")
+p_combined
+
+#ggsave("figs/pca_qc.pdf", p_combined, width = 10, height = 8)
+
+p_combined.ss <- p2 / p3 +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "right")
+p_combined.ss
+
+ggsave("figs/pca_qc.ss.pdf", p_combined.ss, width = 6, height = 8)
+```
+
+
+```{r pseudobulk_filter}
+keep_samples <- colData(se)$Tissue %in% c("blood", "skin") &
+                !colData(se)$malig.pheno %in% c("GDT", "CD8")
+se <- se[, keep_samples]
+
+table(colData(se)$celltype.malig)
+table(colData(se)$Tissue)
+table(colData(se)$malig.pheno)
+```
+
+```{r dream}
+meta <- as.data.frame(colData(se))
+meta$celltype.malig <- factor(meta$celltype.malig, levels = c("T_Cells", "CTCL"))
+
+dge <- DGEList(counts = assay(se, "counts"))
+dge <- calcNormFactors(dge)
+
+tcr_bcr <- grep("^TR[ABDG][VDJ]|^TR[AB]C|^IG[HKL][VDJ]|^IGH[ADEGM]|^IGKC|^IGLC",
+                rownames(dge), value = TRUE)
+dge <- dge[!rownames(dge) %in% tcr_bcr, ]
+
+keep <- filterByExpr(dge, group = meta$celltype.malig, min.count = 1, min.total.count = 5, min.prop = 0.1)
+dge  <- dge[keep, ]
+message(sprintf("Genes retained after filtering: %d", sum(keep)))
+
+form <- ~ celltype.malig + Tissue + (1|Patient.ID) + (1|GEO.Cohort)
+vobj <- voomWithDreamWeights(dge, form, meta, BPPARAM = MulticoreParam(16))
+
+form_vp <- ~ (1|celltype.malig) + (1|Tissue) + (1|Patient.ID) + (1|GEO.Cohort) + (1|Sample.Type.simple)
+varPart  <- fitExtractVarPartModel(vobj, form_vp, meta, BPPARAM = MulticoreParam(16))
+
+varPart <- read.csv("results/varPart.csv", row.names = 1)
+plotVarPart(sortCols(varPart)) + scale_x_discrete(limits = rev) + coord_flip()
+ggsave("figs/varplot.pdf", height = 6, width = 4)
+
+write.csv(varPart, "results/varPart.csv")
+```
+
+```{r fit}
+fit  <- dream(vobj, form, meta, BPPARAM = MulticoreParam(16))
+fit  <- eBayes(fit)
+
+res_df <- topTable(fit, coef = "celltype.maligCTCL", number = Inf) %>%
+  rownames_to_column("gene") %>%
+  mutate(sig = adj.P.Val < 0.05) %>%
+  arrange(adj.P.Val)
+
+saveRDS(res_df, "results/res_df_cd4.rds")
+write.csv(res_df, "results/res_df_cd4.csv")
+```
+
+```{r volcano, fig.height=4, fig.width=5}
+res_df <- readRDS("results/res_df_cd4.rds")
+lfc_limit <- quantile(abs(res_df$logFC), 0.99)
+
+label_genes <- bind_rows(
+  res_df %>% arrange(desc(t)) %>% slice_head(n = 10),
+  res_df %>% arrange(t)       %>% slice_head(n = 10)
+)
+
+p_volc <- ggplot(res_df, aes(x = logFC, y = -log10(adj.P.Val), color = logFC)) +
+  geom_point(shape = 16, size = 1, alpha = 1) +
+  ggrepel::geom_text_repel(
+    data          = label_genes,
+    aes(label     = gene),
+    size          = 3.5,
+    color         = "black",
+    max.overlaps  = 20,
+    segment.size  = 0.3,
+    segment.color = "grey50",
+    box.padding   = 0.3,
+    show.legend   = FALSE
+  ) +
+  scale_color_gradient2(
+    low      = "steelblue",
+    mid      = "grey80",
+    high     = "firebrick",
+    midpoint = 0,
+    limits   = c(-lfc_limit, lfc_limit),
+    oob      = scales::squish,
+    name     = "log2FC"
+  ) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", linewidth = 0.4) +
+  labs(x = "log2FC", y = "-log10(padj)") +
+  theme_classic(base_size = 14)
+
+p_volc
+ggsave("figs/volcano_dream.pdf", p_volc, width = 5, height = 4)
+```
+
+```{r boxplots}
+res_df <- readRDS("results/res_df_cd4.rds")
+top_genes_box <- c(
+  res_df %>% arrange(desc(t)) %>% slice_head(n = 3) %>% pull(gene),
+  res_df %>% arrange(t)       %>% slice_head(n = 3) %>% pull(gene)
+)
+
+top_genes_box <- c("MFSD10", "SUN1", "TOX", "GZMK", "AIF1", "CD7")
+box_df <- as.data.frame(t(vobj$E[top_genes_box, ])) %>%
+  rownames_to_column("sample") %>%
+  pivot_longer(-sample, names_to = "gene", values_to = "expr") %>%
+  mutate(celltype = meta$celltype.malig[match(sample, rownames(meta))],
+         gene = factor(gene, levels = top_genes_box))
+
+box_plots <- lapply(top_genes_box, function(g) {
+  ggplot(box_df[box_df$gene == g, ], aes(x = celltype, y = expr, fill = celltype)) +
+    geom_boxplot(outlier.shape = NA, width = 0.6) +
+    geom_jitter(width = 0.2, size = 0.8, alpha = 0.6) +
+    scale_fill_manual(values = c("T_Cells" = "#00BFC4", "CTCL" = "#F8766D")) +
+    labs(title = g, x = NULL, y = "log-CPM") +
+    theme_classic(base_size = 11) +
+    theme(legend.position = "none")
+})
+
+p_boxes <- wrap_plots(box_plots, nrow = 2, ncol = 3)
+p_boxes
+ggsave("figs/boxplots_top_deg.pdf", p_boxes, width = 9, height = 6)
+```
+
+```{r boxplots_dream_adjusted}
+# dream-corrected log-CPM: strip the nuisance terms the DEG model conditions on
+# (Tissue fixed effect + Patient.ID/GEO.Cohort random effects) while keeping the
+# malignancy effect + intercept, so within-group scatter is residual only and the
+# T_Cells-vs-CTCL separation matches the estimated logFC/t. residuals(fit, vobj)
+# already removes the fixed nuisance terms AND the random-effect BLUPs; we then add
+# back just the intercept + celltype.maligCTCL contribution.
+keep_cols <- c("(Intercept)", "celltype.maligCTCL")
+kept_fit  <- fit$coefficients[top_genes_box, keep_cols] %*% t(fit$design[, keep_cols])
+adj_E     <- residuals(fit, vobj)[top_genes_box, ] + kept_fit   # genes x samples
+
+box_df_adj <- as.data.frame(t(adj_E)) %>%
+  rownames_to_column("sample") %>%
+  pivot_longer(-sample, names_to = "gene", values_to = "expr") %>%
+  mutate(celltype = meta$celltype.malig[match(sample, rownames(meta))],
+         gene = factor(gene, levels = top_genes_box))
+
+box_plots_adj <- lapply(top_genes_box, function(g) {
+  ggplot(box_df_adj[box_df_adj$gene == g, ], aes(x = celltype, y = expr, fill = celltype)) +
+    geom_boxplot(outlier.shape = NA, width = 0.6) +
+    geom_jitter(width = 0.2, size = 0.8, alpha = 0.6) +
+    scale_fill_manual(values = c("T_Cells" = "#00BFC4", "CTCL" = "#F8766D")) +
+    labs(title = g, x = NULL, y = "adj. log-CPM (dream)") +
+    theme_classic(base_size = 11) +
+    theme(legend.position = "none")
+})
+
+p_boxes_adj <- wrap_plots(box_plots_adj, nrow = 2, ncol = 3)
+p_boxes_adj
+ggsave("figs/boxplots_top_deg_dream_adjusted.pdf", p_boxes_adj, width = 9, height = 6)
+```
+
+```{r gsea}
+# Hallmark gene sets. NES > 0 = enriched in CTCL (coef celltype.maligCTCL).
+pathway_list <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+# one value per gene (most extreme on dupes), drop NAs, then sort
+ranks <- res_df %>%
+  filter(!is.na(t), !is.na(gene)) %>%
+  group_by(gene) %>%
+  summarise(t = t[which.max(abs(t))], .groups = "drop") %>%
+  deframe()
+ranks <- sort(ranks, decreasing = TRUE)
+
+# eps = 0 for exact small p-values so padj/dot-size ordering is meaningful
+set.seed(42)
+gsea_res <- fgsea(pathways = pathway_list, stats = ranks,
+                  minSize = 15, maxSize = 500, eps = 0, nproc = 16) %>%
+  mutate(
+    sig           = padj < 0.05,
+    pathway_label = gsub("^HALLMARK_", "", pathway),
+    pathway_label = gsub("_", " ", pathway_label),
+    pathway_label = stringr::str_wrap(pathway_label, width = 20)
+  )
+
+# top 10 up + top 10 down among significant pathways
+top_paths <- gsea_res %>% dplyr::filter(sig) %>%
+  dplyr::slice_max(NES, n = 10) %>%
+  dplyr::bind_rows(gsea_res %>% dplyr::filter(sig) %>% dplyr::slice_min(NES, n = 10))
+
+nes_lim <- quantile(abs(gsea_res$NES), 0.99, na.rm = TRUE)
+
+p_gsea <- top_paths %>%
+  as_tibble() %>%
+  dplyr::arrange(dplyr::desc(NES)) %>%
+  ggplot(aes(x = NES, y = reorder(pathway_label, NES),
+             size = -log10(padj), color = NES)) +
+  geom_point(shape = 16) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.4) +
+  scale_color_gradient2(
+    low      = "steelblue",
+    mid      = "grey80",
+    high     = "firebrick",
+    midpoint = 0,
+    limits   = c(-nes_lim, nes_lim),
+    oob      = scales::squish,
+    name     = "NES"
+  ) +
+  scale_size_continuous(range = c(1.5, 5), name = "-log10(FDR)") +
+  labs(x = "NES  (→ enriched in CTCL)", y = NULL) +
+  theme_classic(base_size = 16) +
+  theme(axis.text.y = element_text(size = 12, lineheight = 0.8))
+
+p_gsea
+ggsave("figs/gsea_dotplot.pdf", p_gsea, width = 6.5, height = 6)
+
+saveRDS(gsea_res, "results/gsea_res_cd4.rds")
+```
+
+```{r functional_enrichment}
+library(decoupleR)
+
+stat_mat <- matrix(
+  res_df$t,
+  ncol     = 1,
+  dimnames = list(res_df$gene, "CTCL_vs_T_Cells")
+)
+
+# PROGENy: 14 cancer-relevant signaling pathways
+progeny_net <- get_progeny(organism = "human", top = 500)
+
+progeny_res <- run_wmean(
+  mat     = stat_mat,
+  net     = progeny_net,
+  .source = "source",
+  .target = "target",
+  .mor    = "weight",
+  times   = 1000,
+  minsize = 5
+) %>%
+  filter(statistic == "norm_wmean") %>%
+  arrange(score)
+
+p_progeny <- ggplot(progeny_res, aes(x = score, y = reorder(source, score), fill = score)) +
+  geom_col(width = 0.7) +
+  scale_fill_gradient2(
+    low      = "steelblue",
+    mid      = "grey80",
+    high     = "firebrick",
+    midpoint = 0,
+    name     = "Activity"
+  ) +
+  labs(x = "PROGENy score", y = NULL) +
+  theme_classic(base_size = 16) +
+  theme(axis.text.y = element_text(size = 12, lineheight = 0.8))
+
+p_progeny
+ggsave("figs/progeny_pathways.pdf", p_progeny, width = 6, height = 5.5)
+
+# TF activity with CollecTRI
+collectri_net <- get_collectri(organism = "human", split_complexes = FALSE)
+
+tf_res <- run_ulm(
+  mat     = stat_mat,
+  net     = collectri_net,
+  .source = "source",
+  .target = "target",
+  .mor    = "mor",
+  minsize = 5
+) %>%
+  filter(statistic == "ulm") %>%
+  mutate(fdr = p.adjust(p_value, method = "BH"),
+         sig = p_value < 0.05) %>%
+  arrange(score)
+
+tf_top <- bind_rows(
+  tf_res %>% filter(sig) %>% slice_max(score, n = 5),
+  tf_res %>% filter(sig) %>% slice_min(score, n = 5)
+) %>%
+  distinct(source, .keep_all = TRUE)
+
+score_lim <- quantile(abs(tf_top$score), 0.99, na.rm = TRUE)
+
+p_tf <- ggplot(tf_top, aes(x = score, y = reorder(source, score),
+                            size = -log10(fdr), color = score)) +
+  geom_point(shape = 16) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.4) +
+  scale_color_gradient2(
+    low      = "steelblue",
+    mid      = "grey80",
+    high     = "firebrick",
+    midpoint = 0,
+    limits   = c(-score_lim, score_lim),
+    oob      = scales::squish,
+    name     = "Activity"
+  ) +
+  scale_size_continuous(range = c(1.5, 5), name = "-log10(FDR)") +
+  labs(x = "TF activity score", y = NULL) +
+  theme_classic(base_size = 16) +
+  theme(axis.text.y = element_text(size = 12, lineheight = 0.8))
+
+p_tf
+ggsave("figs/tf_activity.pdf", p_tf, width = 6, height = 5.5)
+
+saveRDS(list(progeny = progeny_res, tf = tf_res), "results/functional_enrichment.rds")
+```
+
+```{r trail_footprint}
+trail_genes <- progeny_net %>%
+  filter(source == "Trail") %>%
+  inner_join(res_df, by = c("target" = "gene")) %>%
+  mutate(contribution = weight * t) %>%
+  arrange(contribution)
+
+lfc_lim_trail <- quantile(abs(trail_genes$logFC), 0.99, na.rm = TRUE)
+
+p_trail <- ggplot(trail_genes, aes(x = logFC, y = reorder(target, logFC),
+                                    color = logFC, size = abs(weight))) +
+  geom_point(shape = 16) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.4) +
+  scale_color_gradient2(
+    low      = "steelblue",
+    mid      = "grey80",
+    high     = "firebrick",
+    midpoint = 0,
+    limits   = c(-lfc_lim_trail, lfc_lim_trail),
+    oob      = scales::squish,
+    name     = "log2FC"
+  ) +
+  scale_size_continuous(range = c(1, 5), name = "PROGENy\nweight") +
+  labs(x = "log2FC (CTCL vs T cells)", y = NULL,
+       title = "Trail pathway footprint") +
+  theme_classic(base_size = 11) +
+  theme(axis.text.y  = element_text(size = 8),
+        plot.title   = element_text(hjust = 0.5))
+
+p_trail
+ggsave("figs/trail_footprint.pdf", p_trail,
+       height = 0.2 * nrow(trail_genes) + 1.5, width = 6)
+```
+
+```{r trail_boxplots}
+trail_genes_select <- c(
+  trail_genes %>% slice_max(contribution, n = 3) %>% pull(target),
+  trail_genes %>% slice_min(contribution, n = 3) %>% pull(target)
+)
+
+
+trail_box_df <- as.data.frame(t(vobj$E[trail_genes_select, ])) %>%
+  rownames_to_column("sample") %>%
+  pivot_longer(-sample, names_to = "gene", values_to = "expr") %>%
+  mutate(
+    celltype = meta$celltype.malig[match(sample, rownames(meta))],
+    gene     = factor(gene, levels = trail_genes_select)
+  )
+
+trail_box_plots <- lapply(trail_genes_select, function(g) {
+  ggplot(trail_box_df[trail_box_df$gene == g, ],
+         aes(x = celltype, y = expr, fill = celltype)) +
+    geom_boxplot(outlier.shape = NA, width = 0.6) +
+    geom_jitter(width = 0.2, size = 0.8, alpha = 0.6) +
+    scale_fill_manual(values = c("CTCL" = "#F8766D", "T_Cells" = "#00BFC4")) +
+    labs(title = g, x = NULL, y = "log-CPM") +
+    theme_classic(base_size = 11) +
+    theme(legend.position = "none")
+})
+
+p_trail_boxes <- wrap_plots(trail_box_plots, nrow = 2, ncol = 3)
+p_trail_boxes
+ggsave("figs/boxplots_trail_genes.pdf", p_trail_boxes, width = 8, height = 6)
+```
+
+```{r pca_ctcl}
+se_all   <- readRDS("results/bulk.se.rds")
+se_malig <- se_all[, colData(se_all)$celltype.malig == "CTCL"]
+meta_malig <- as.data.frame(colData(se_malig))
+
+dge_malig  <- DGEList(counts = assay(se_malig, "counts"))
+dge_malig  <- calcNormFactors(dge_malig)
+logcpm_malig <- edgeR::cpm(dge_malig, log = TRUE, prior.count = 1)
+
+E_bc_malig <- limma::removeBatchEffect(logcpm_malig, batch = meta_malig$GEO.Cohort,
+                                        design = model.matrix(~ Tissue, data = meta_malig))
+
+pca_malig   <- prcomp(t(E_bc_malig), scale. = FALSE)
+pct_malig   <- round(100 * pca_malig$sdev^2 / sum(pca_malig$sdev^2), 1)
+
+pca_malig_df <- as.data.frame(pca_malig$x[, 1:2]) %>%
+  mutate(GEO.Cohort  = meta_malig$GEO.Cohort,
+         Tissue      = meta_malig$Tissue,
+         celltype.malig = meta_malig$celltype.malig,
+         Sample.Type = meta_malig$Sample.Type.simple)
+
+plot_pca_malig <- function(df, color_var, show_axis = FALSE) {
+  ggplot(df, aes(PC1, PC2, color = .data[[color_var]])) +
+    geom_point(shape = 16, size = 2, alpha = 0.8) +
+    labs(
+      x     = if (show_axis) paste0("PC1 (", pct_malig[1], "%)") else NULL,
+      y     = if (show_axis) paste0("PC2 (", pct_malig[2], "%)") else NULL,
+      color = color_var,
+      title = color_var
+    ) +
+    theme_classic(base_size = 11) +
+    theme(
+      plot.title = element_text(hjust = 0.5),
+      axis.text  = if (!show_axis) element_blank() else element_text(),
+      axis.ticks = if (!show_axis) element_blank() else element_line()
+    )
+}
+
+m1 <- plot_pca_malig(pca_malig_df, "GEO.Cohort")  + NoLegend()
+m2 <- plot_pca_malig(pca_malig_df, "Tissue")       + scale_color_manual(values = tissue_cols) + NoLegend()
+m3 <- plot_pca_malig(pca_malig_df, "celltype.malig", show_axis = TRUE) + scale_color_manual(values = malig_cols) + NoLegend()
+m4 <- plot_pca_malig(pca_malig_df, "Sample.Type")  + NoLegend()
+
+m_combined <- (m1 | m2) / (m3 | m4)
+m_combined
+ggsave("figs/pca_ctcl.pdf", m_combined, width = 7, height = 6)
+
+
+m_combined.ss <- m2 / m3 +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "right")
+m_combined.ss
+
+ggsave("figs/pca_ctcl.ss.pdf", m_combined.ss, width = 4.5, height = 6)
+```
+
+```{r consensus_cluster}
+gene_var   <- apply(E_bc_malig, 1, var)
+top1k      <- names(sort(gene_var, decreasing = TRUE))[1:1000]
+mat_cc     <- t(scale(t(E_bc_malig[top1k, ])))
+
+set.seed(42)
+cc_res <- ConsensusClusterPlus(
+  mat_cc,
+  maxK       = 9,
+  reps       = 1000,
+  pItem      = 0.8,
+  pFeature   = 1,
+  clusterAlg = "hc",
+  distance   = "pearson",
+  innerLinkage = "average",
+  finalLinkage = "average",
+  plot       = "pdf",
+  title      = "figs/consensus_cluster"
+)
+
+icl <- calcICL(cc_res, plot = "pdf", title = "figs/consensus_cluster_icl")
+```
+
+```{r consensus_heatmaps}
+cc_color <- colorRampPalette(c("white", "#08306B"))(100)
+
+hm_grobs <- lapply(2:9, function(k) {
+  cm   <- cc_res[[k]]$consensusMatrix
+  tree <- cc_res[[k]]$consensusTree
+  ph <- pheatmap::pheatmap(
+    cm,
+    color            = cc_color,
+    cluster_rows     = tree,
+    cluster_cols     = tree,
+    show_rownames    = FALSE,
+    show_colnames    = FALSE,
+    main             = paste0("k = ", k),
+    legend_breaks    = seq(0, 1, by = 0.2),
+    breaks           = seq(0, 1, length.out = 101),
+    border_color     = NA,
+    silent           = TRUE
+  )
+  ggplotify::as.grob(ph)
+})
+
+g_cc <- gridExtra::arrangeGrob(grobs = hm_grobs, nrow = 2, ncol = 4)
+grid::grid.draw(g_cc)
+ggsave("figs/consensus_heatmaps.pdf", g_cc, width = 16, height = 8)
+```
+
+```{r subtype_labels}
+subtype_df <- data.frame(
+  sample  = colnames(mat_cc),
+  k4      = cutree(cc_res[[4]]$consensusTree, k = 4)
+) %>%
+  mutate(subtype = paste0("Subtype_", k4))
+
+table(subtype_df$subtype)
+
+meta_malig <- meta_malig %>%
+  rownames_to_column("sample") %>%
+  left_join(subtype_df, by = "sample") %>%
+  column_to_rownames("sample")
+
+pca_malig_df$subtype <- meta_malig[rownames(pca_malig_df), "subtype"]
+
+ggplot(pca_malig_df, aes(PC1, PC2, color = subtype)) +
+  geom_point(size = 2.5, alpha = 0.85) +
+  labs(x = paste0("PC1 (", pct_malig[1], "%)"),
+       y = paste0("PC2 (", pct_malig[2], "%)"),
+       color = "Subtype") +
+  theme_classic(base_size = 11)
+
+ggsave("figs/pca_ctcl_subtypes.pdf", width = 5, height = 4)
+```
+
+```{r subtype_dream}
+colData(se_malig)$subtype <- subtype_df$subtype[match(colnames(se_malig), subtype_df$sample)]
+
+table(colData(se_malig)$Tissue)
+table(colData(se_malig)$subtype)
+
+se_skin <- se_malig[, grepl("skin", colData(se_malig)$Tissue, ignore.case = TRUE) &
+                       !is.na(colData(se_malig)$subtype) &
+                       !colData(se_malig)$malig.pheno %in% c("CD8", "GDT")]
+
+table(colData(se_malig)[grepl("skin", colData(se_malig)$Tissue, ignore.case=TRUE),                                    
+                           c("malig.pheno", "subtype")])
+
+skin_counts <- sort(table(colData(se_skin)$subtype), decreasing = TRUE)
+message("Subtype counts in skin:"); print(skin_counts)
+top2 <- names(skin_counts)[1:2]
+
+se_skin2 <- se_skin[, colData(se_skin)$subtype %in% top2]
+meta_skin <- as.data.frame(colData(se_skin2))
+meta_skin$subtype <- factor(meta_skin$subtype, levels = c("Subtype_2", "Subtype_1"))
+
+dge_skin <- DGEList(counts = assay(se_skin2, "counts"))
+dge_skin <- calcNormFactors(dge_skin)
+dge_skin <- dge_skin[!rownames(dge_skin) %in% tcr_bcr, ]
+
+keep_skin <- filterByExpr(dge_skin, group = meta_skin$subtype, min.count = 1, min.total.count = 5, min.prop = 0.1)
+dge_skin  <- dge_skin[keep_skin, ]
+message(sprintf("Genes retained: %d", sum(keep_skin)))
+
+form_skin <- ~ subtype + (1|Patient.ID) + (1|GEO.Cohort)
+vobj_skin <- voomWithDreamWeights(dge_skin, form_skin, meta_skin, BPPARAM = MulticoreParam(16))
+fit_skin  <- dream(vobj_skin, form_skin, meta_skin, BPPARAM = MulticoreParam(16))
+fit_skin  <- eBayes(fit_skin)
+
+res_skin <- topTable(fit_skin, coef = "subtypeSubtype_1", number = Inf) %>%
+  rownames_to_column("gene") %>%
+  mutate(sig = adj.P.Val < 0.05) %>%
+  arrange(adj.P.Val)
+
+message(sprintf("Significant DEGs: %d", sum(res_skin$sig)))
+
+saveRDS(res_skin, "results/res_skin_subtypes.rds")
+res_skin <- readRDS("results/res_skin_subtypes.rds")
+table(res_skin$sig)
+```
+
+
+```{r subtype_dream}
+res_skin <- readRDS("results/res_skin_subtypes.rds")
+lfc_lim <- quantile(abs(res_skin$logFC), 0.99)
+
+label_genes <- bind_rows(
+  res_skin %>% arrange(desc(t)) %>% slice_head(n = 10),
+  res_skin %>% arrange(t)       %>% slice_head(n = 10)
+)
+
+p_volc_sub <- ggplot(res_skin, aes(x = logFC, y = -log10(adj.P.Val), color = logFC)) +
+  geom_point(shape = 16, size = 1, alpha = 1) +
+  ggrepel::geom_text_repel(
+    data          = label_genes,
+    aes(label     = gene),
+    size          = 3.5,
+    color         = "black",
+    max.overlaps  = 20,
+    segment.size  = 0.3,
+    segment.color = "grey50",
+    box.padding   = 0.3,
+    show.legend   = FALSE
+  ) +
+  scale_color_gradient2(
+    low      = "steelblue",
+    mid      = "grey80",
+    high     = "firebrick",
+    midpoint = 0,
+    limits   = c(-lfc_lim, lfc_lim),
+    oob      = scales::squish,
+    name     = "log2FC"
+  ) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", linewidth = 0.4) +
+  labs(x = "log2FC", y = "-log10(padj)") +
+  theme_classic(base_size = 14)
+
+p_volc_sub
+#ggsave("figs/volcano_skin_subtypes.pdf", p_volc_sub, width = 5, height = 4)
+```
+
+```{r subtype_boxplots}
+# adjust n_top or set genes_select manually to override
+n_top        <- 3
+genes_select <- NULL  # e.g. c("GENE1", "GENE2", "GENE3")
+
+if (is.null(genes_select)) {
+  top_s1 <- res_skin %>% filter(sig, logFC > 0) %>% slice_max(logFC, n = n_top) %>% pull(gene)
+  top_s2 <- res_skin %>% filter(sig, logFC < 0) %>% slice_min(logFC, n = n_top) %>% pull(gene)
+  genes_select <- c(top_s1, top_s2)
+}
+
+subtype_colors <- c("Subtype_1" = "#B2182B", "Subtype_2" = "#2166AC")
+
+box_df_sub <- as.data.frame(t(vobj_skin$E[genes_select, ])) %>%
+  rownames_to_column("sample") %>%
+  pivot_longer(-sample, names_to = "gene", values_to = "expr") %>%
+  mutate(subtype = meta_skin$subtype[match(sample, rownames(meta_skin))],
+         subtype = factor(subtype, levels = c("Subtype_1", "Subtype_2")),
+         gene    = factor(gene, levels = genes_select))
+
+box_plots_sub <- lapply(genes_select, function(g) {
+  ggplot(box_df_sub[box_df_sub$gene == g, ], aes(x = subtype, y = expr, fill = subtype)) +
+    geom_boxplot(outlier.shape = NA, width = 0.6) +
+    geom_jitter(width = 0.2, size = 0.8, alpha = 0.6) +
+    scale_fill_manual(values = subtype_colors) +
+    labs(title = g, x = NULL, y = "log-CPM") +
+    theme_classic(base_size = 11) +
+    theme(legend.position = "none")
+})
+
+p_boxes_sub <- wrap_plots(box_plots_sub, nrow = 2, ncol = n_top)
+p_boxes_sub
+ggsave("figs/boxplots_subtype_genes.pdf", p_boxes_sub, width = 7, height = 5)
+```
+
+```{r subtype_functional_enrichment}
+res_skin <- readRDS("results/res_skin_subtypes.rds")
+stat_mat_skin <- matrix(
+  res_skin$t,
+  ncol     = 1,
+  dimnames = list(res_skin$gene, "Subtype_1_vs_Subtype_2")
+)
+
+# Hallmark GSEA
+pathway_list_skin <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+set.seed(42)
+gsea_skin <- fgsea(pathways = pathway_list_skin, stats = setNames(res_skin$t, res_skin$gene),
+                   minSize = 15, maxSize = 500, nproc = 16) %>%
+  mutate(
+    sig           = padj < 0.05,
+    pathway_label = gsub("^HALLMARK_", "", pathway),
+    pathway_label = gsub("_", " ", pathway_label),
+    pathway_label = stringr::str_to_title(pathway_label)
+  )
+
+nes_lim_skin <- quantile(abs(gsea_skin$NES), 0.99, na.rm = TRUE)
+
+p_gsea_skin <- gsea_skin %>%
+  filter(sig) %>%
+  ggplot(aes(x = NES, y = reorder(pathway_label, NES),
+             size = -log10(padj), color = NES)) +
+  geom_point(shape = 16) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.4) +
+  scale_color_gradient2(
+    low = "steelblue", mid = "grey80", high = "firebrick",
+    midpoint = 0, limits = c(-nes_lim_skin, nes_lim_skin),
+    oob = scales::squish, name = "NES"
+  ) +
+  scale_size_continuous(range = c(1.5, 5), name = "-log10(FDR)") +
+  labs(x = "NES", y = NULL) +
+  theme_classic(base_size = 11) +
+  theme(axis.text.y = element_text(size = 8))
+
+p_gsea_skin
+ggsave("figs/gsea_skin_subtypes.pdf", p_gsea_skin, width = 5, height = 5)
+```
+
+
+```{r subtype_functional_enrichment}
+# PROGENy
+progeny_skin <- run_wmean(
+  mat     = stat_mat_skin,
+  net     = progeny_net,
+  .source = "source",
+  .target = "target",
+  .mor    = "weight",
+  times   = 1000,
+  minsize = 5
+) %>%
+  filter(statistic == "norm_wmean") %>%
+  arrange(score)
+
+p_progeny_skin <- ggplot(progeny_skin, aes(x = score, y = reorder(source, score), fill = score)) +
+  geom_col(width = 0.7) +
+  scale_fill_gradient2(
+    low = "steelblue", mid = "grey80", high = "firebrick",
+    midpoint = 0, name = "Activity"
+  ) +
+  labs(x = "PROGENy score", y = NULL) +
+  theme_classic(base_size = 11)
+
+p_progeny_skin
+ggsave("figs/progeny_skin_subtypes.pdf", p_progeny_skin, height = 4, width = 5)
+
+# TF activity
+tf_skin <- run_ulm(
+  mat     = stat_mat_skin,
+  net     = collectri_net,
+  .source = "source",
+  .target = "target",
+  .mor    = "mor",
+  minsize = 5
+) %>%
+  filter(statistic == "ulm") %>%
+  mutate(fdr = p.adjust(p_value, method = "BH"),
+         sig = p_value < 0.05) %>%
+  arrange(score)
+
+tf_top_skin <- bind_rows(
+  tf_skin %>% filter(sig) %>% slice_max(score, n = 10),
+  tf_skin %>% filter(sig) %>% slice_min(score, n = 10)
+) %>%
+  distinct(source, .keep_all = TRUE)
+
+score_lim_skin <- quantile(abs(tf_top_skin$score), 0.99, na.rm = TRUE)
+
+p_tf_skin <- ggplot(tf_top_skin, aes(x = score, y = reorder(source, score),
+                                      size = -log10(fdr), color = score)) +
+  geom_point(shape = 16) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.4) +
+  scale_color_gradient2(
+    low = "steelblue", mid = "grey80", high = "firebrick",
+    midpoint = 0, limits = c(-score_lim_skin, score_lim_skin),
+    oob = scales::squish, name = "Activity"
+  ) +
+  scale_size_continuous(range = c(1.5, 5), name = "-log10(FDR)") +
+  labs(x = "TF activity score", y = NULL) +
+  theme_classic(base_size = 11) +
+  theme(axis.text.y = element_text(size = 8))
+
+p_tf_skin
+ggsave("figs/tf_skin_subtypes.pdf", p_tf_skin,
+       height = 5, width = 4.5)
+
+saveRDS(list(gsea = gsea_skin, progeny = progeny_skin, tf = tf_skin),
+        "results/functional_enrichment_skin.rds")
+```
+
+```{r save_results}
+saveRDS(subtype_df,  "results/subtype_df.rds")       # sample → subtype assignments
+saveRDS(meta_malig,  "results/meta_malig.rds")        # CTCL pseudobulk metadata with subtype labels
+saveRDS(meta_skin,   "results/meta_skin.rds")         # skin-only metadata used for subtype dream
+saveRDS(vobj_skin,   "results/vobj_skin.rds")         # voom-normalized expression for skin subtypes
+saveRDS(fit_skin,    "results/fit_skin.rds")          # dream fit for subtype DEG
+```
+
+
+<!-- ============================================================ -->
+<!-- TEST: MF-only and SS-only CD4 CTCL vs normal CD4 T cells     -->
+<!-- ============================================================ -->
+<!-- Reuses the CD4-filtered pseudobulk `se` (blood/skin, non-CD8/GDT clone) -->
+<!-- from the pseudobulk_filter chunk, plus `obj` from above. `se` carries    -->
+<!-- only Dx.simple (BID/CTCL/HC), so map the finer Dx (MF/SS) on by sample.  -->
+
+```{r cd4_subtype_setup}
+# read in the objects these chunks depend on
+obj <- readRDS("../fig1/results/obj.fig1.rds")
+se  <- readRDS("results/bulk.se.rds")
+
+# reproduce the CD4-filtered pseudobulk (same as the pseudobulk_filter chunk)
+se <- se[, colData(se)$Tissue %in% c("blood", "skin") &
+            !colData(se)$malig.pheno %in% c("GDT", "CD8")]
+
+# per-sample MF/SS label (se only carries Dx.simple), mapped from obj
+dx_map <- obj@meta.data %>% distinct(orig.merge, Dx)
+colData(se)$Dx <- dx_map$Dx[match(colData(se)$orig.merge, dx_map$orig.merge)]
+
+# same dream pipeline as the CD4 `dream` + `fit` chunks, run on a Dx subset
+run_cd4_subtype_dream <- function(se_sub) {
+  meta <- as.data.frame(colData(se_sub))
+  meta$celltype.malig <- factor(meta$celltype.malig, levels = c("T_Cells", "CTCL"))
+
+  dge <- DGEList(counts = assay(se_sub, "counts"))
+  dge <- calcNormFactors(dge)
+  tcr_bcr <- grep("^TR[ABDG][VDJ]|^TR[AB]C|^IG[HKL][VDJ]|^IGH[ADEGM]|^IGKC|^IGLC",
+                  rownames(dge), value = TRUE)
+  dge <- dge[!rownames(dge) %in% tcr_bcr, ]
+
+  keep <- filterByExpr(dge, group = meta$celltype.malig,
+                       min.count = 1, min.total.count = 5, min.prop = 0.1)
+  dge  <- dge[keep, ]
+  message(sprintf("Genes retained after filtering: %d", sum(keep)))
+
+  form <- ~ celltype.malig + Tissue + (1|Patient.ID) + (1|GEO.Cohort)
+  vobj <- voomWithDreamWeights(dge, form, meta, BPPARAM = MulticoreParam(16))
+  fit  <- dream(vobj, form, meta, BPPARAM = MulticoreParam(16))
+  fit  <- eBayes(fit)
+
+  topTable(fit, coef = "celltype.maligCTCL", number = Inf) %>%
+    rownames_to_column("gene") %>%
+    mutate(sig = adj.P.Val < 0.05) %>%
+    arrange(adj.P.Val)
+}
+
+volcano_subtype <- function(res, title) {
+  lfc_lim <- quantile(abs(res$logFC), 0.99, na.rm = TRUE)
+  ggplot(res, aes(x = logFC, y = -log10(P.Value), color = logFC)) +
+    geom_point(size = 0.7, alpha = 0.6) +
+    scale_color_gradient2(low = "steelblue", mid = "grey80", high = "firebrick",
+                          midpoint = 0, limits = c(-lfc_lim, lfc_lim),
+                          oob = scales::squish, name = "log2FC") +
+    labs(x = "log2FC (CTCL vs normal CD4 T)", y = "-log10(P)", title = title) +
+    theme_classic(base_size = 12)
+}
+```
+
+```{r cd4_mf_deg, fig.height=4, fig.width=5}
+se_mf <- se[, colData(se)$Dx %in% "MF"]
+print(table(colData(se_mf)$celltype.malig, colData(se_mf)$Tissue))
+
+res_mf <- run_cd4_subtype_dream(se_mf)
+message(sprintf("MF significant DEGs (FDR < 0.05): %d", sum(res_mf$sig)))
+head(res_mf, 30)
+volcano_subtype(res_mf, "MF: CTCL vs normal CD4 T")
+```
+
+```{r cd4_ss_deg, fig.height=4, fig.width=5}
+se_ss <- se[, colData(se)$Dx %in% "SS"]
+print(table(colData(se_ss)$celltype.malig, colData(se_ss)$Tissue))
+
+res_ss <- run_cd4_subtype_dream(se_ss)
+message(sprintf("SS significant DEGs (FDR < 0.05): %d", sum(res_ss$sig)))
+head(res_ss, 30)
+volcano_subtype(res_ss, "SS: CTCL vs normal CD4 T")
+```
+
+```{r cd4_mf_ss_tstat_scatter, fig.height=4.5, fig.width=5}
+# merge the moderated t statistics from each subtype on shared genes
+t_merge <- inner_join(
+  res_mf %>% select(gene, t_MF = t),
+  res_ss %>% select(gene, t_SS = t),
+  by = "gene"
+) %>%
+  mutate(dif = t_MF - t_SS) %>%
+  mutate(sum = t_MF + t_SS)
+
+cor_val <- cor(t_merge$t_MF, t_merge$t_SS)
+
+lfc_lim <- quantile(abs(t_merge$dif), 0.99, na.rm = TRUE)
+
+ggplot(t_merge, aes(x = t_SS, y = t_MF)) +
+  geom_point(aes(color = dif), size = 0.7, alpha = 0.5) +
+  geom_smooth(method = "lm", se = FALSE, color = "black", linewidth = 0.6) +
+  scale_color_gradient2(low = "steelblue", mid = "grey80", high = "firebrick",
+                        midpoint = 0, limits = c(-lfc_lim, lfc_lim),
+                        oob = scales::squish, name = "MF - SS t") +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 1.4,
+           label = sprintf("r = %.2f", cor_val), size = 4.5) +
+  labs(x = "SS t statistic", y = "MF t statistic",
+       title = "CTCL vs normal CD4 T: MF vs SS") +
+  theme_classic(base_size = 12)
+```
+
+
+<!-- ============================================================ -->
+<!-- TEST: MF Tumor vs MF Patch/Plaque (within CTCL cells)       -->
+<!-- ============================================================ -->
+<!-- Clean within-MF progression axis: restrict to MF patients only so the   -->
+<!-- lesion contrast isn't confounded by SS/erythroderma. Both are skin, so   -->
+<!-- no Tissue term. Dx (MF) mapped from obj since se carries only Dx.simple. -->
+
+```{r mf_lesion_setup}
+obj    <- readRDS("../fig1/results/obj.fig1.rds")
+se_all <- readRDS("results/bulk.se.rds")
+
+dx_map <- obj@meta.data %>% distinct(orig.merge, Dx)
+colData(se_all)$Dx <- dx_map$Dx[match(colData(se_all)$orig.merge, dx_map$orig.merge)]
+
+se_mfl <- se_all[, colData(se_all)$celltype.malig == "CTCL" &
+                    colData(se_all)$Dx == "MF" &
+                    colData(se_all)$Sample.Type.simple %in% c("Patch_Plaque", "Tumor")]
+
+meta_mfl <- as.data.frame(colData(se_mfl))
+meta_mfl$lesion <- factor(meta_mfl$Sample.Type.simple, levels = c("Patch_Plaque", "Tumor"))
+print(table(meta_mfl$lesion))          # both skin -> no Tissue term
+
+dge_mfl <- DGEList(counts = assay(se_mfl, "counts"))
+dge_mfl <- calcNormFactors(dge_mfl)
+tcr_bcr <- grep("^TR[ABDG][VDJ]|^TR[AB]C|^IG[HKL][VDJ]|^IGH[ADEGM]|^IGKC|^IGLC",
+                rownames(dge_mfl), value = TRUE)
+dge_mfl <- dge_mfl[!rownames(dge_mfl) %in% tcr_bcr, ]
+
+keep <- filterByExpr(dge_mfl, group = meta_mfl$lesion,
+                     min.count = 1, min.total.count = 5, min.prop = 0.1)
+dge_mfl <- dge_mfl[keep, ]
+message(sprintf("Genes retained after filtering: %d", sum(keep)))
+
+form_mfl <- ~ lesion + (1|Patient.ID) + (1|GEO.Cohort)
+vobj_mfl <- voomWithDreamWeights(dge_mfl, form_mfl, meta_mfl, BPPARAM = MulticoreParam(16))
+fit_mfl  <- dream(vobj_mfl, form_mfl, meta_mfl, BPPARAM = MulticoreParam(16))
+fit_mfl  <- eBayes(fit_mfl)
+```
+
+```{r mf_lesion_results, fig.height=4, fig.width=5}
+# coef lesionTumor: positive logFC = up in MF tumor vs MF patch/plaque
+res_mf_tumpp <- topTable(fit_mfl, coef = "lesionTumor", number = Inf) %>%
+  rownames_to_column("gene") %>%
+  mutate(sig = adj.P.Val < 0.05) %>%
+  arrange(adj.P.Val)
+
+message(sprintf("MF Tumor vs MF PP significant DEGs (FDR < 0.05): %d", sum(res_mf_tumpp$sig)))
+head(res_mf_tumpp, 30)
+
+lfc_lim <- quantile(abs(res_mf_tumpp$logFC), 0.99, na.rm = TRUE)
+ggplot(res_mf_tumpp, aes(x = logFC, y = -log10(P.Value), color = logFC)) +
+  geom_point(size = 0.7, alpha = 0.6) +
+  scale_color_gradient2(low = "steelblue", mid = "grey80", high = "firebrick",
+                        midpoint = 0, limits = c(-lfc_lim, lfc_lim),
+                        oob = scales::squish, name = "log2FC") +
+  labs(x = "log2FC (MF Tumor vs MF Patch/Plaque)", y = "-log10(P)",
+       title = "MF: Tumor vs Patch/Plaque") +
+  theme_classic(base_size = 12)
+```
+
+
+<!-- ============================================================ -->
+<!-- TEST: stage-dependent malignancy (interaction / diff-in-diff) -->
+<!-- ============================================================ -->
+<!-- Instead of comparing malignant cells directly across stage (confounded, -->
+<!-- underpowered), ask how the WITHIN-SAMPLE CTCL-vs-benign-CD4 signature    -->
+<!-- differs between MF Tumor and MF Patch/Plaque. Each malignant arm is      -->
+<!-- anchored to its own local normal reference, cancelling sample/tissue/    -->
+<!-- cohort background that hits both compartments equally. The interaction   -->
+<!-- coef is the stage-dependent, background-subtracted malignancy program.   -->
+
+```{r mf_interaction_setup}
+obj    <- readRDS("../fig1/results/obj.fig1.rds")
+se_all <- readRDS("results/bulk.se.rds")
+
+dx_map <- obj@meta.data %>% distinct(orig.merge, Dx)
+colData(se_all)$Dx <- dx_map$Dx[match(colData(se_all)$orig.merge, dx_map$orig.merge)]
+
+se_int <- se_all[, colData(se_all)$Dx == "MF" &
+                    !colData(se_all)$malig.pheno %in% c("GDT", "CD8") &
+                    colData(se_all)$Sample.Type.simple %in% c("Patch_Plaque", "Tumor")]
+
+meta_int <- as.data.frame(colData(se_int))
+# cell-means grouping: {norm,mal} x {PP,Tum} -> 4 groups
+meta_int$arm   <- ifelse(meta_int$celltype.malig == "CTCL", "mal", "norm")
+meta_int$les   <- ifelse(meta_int$Sample.Type.simple == "Tumor", "Tum", "PP")
+meta_int$group <- factor(paste0(meta_int$arm, meta_int$les),
+                         levels = c("normPP", "malPP", "normTum", "malTum"))
+print(table(meta_int$group))
+
+dge_int <- DGEList(counts = assay(se_int, "counts"))
+dge_int <- calcNormFactors(dge_int)
+tcr_bcr <- grep("^TR[ABDG][VDJ]|^TR[AB]C|^IG[HKL][VDJ]|^IGH[ADEGM]|^IGKC|^IGLC",
+                rownames(dge_int), value = TRUE)
+dge_int <- dge_int[!rownames(dge_int) %in% tcr_bcr, ]
+
+keep <- filterByExpr(dge_int, group = meta_int$group,
+                     min.count = 1, min.total.count = 5, min.prop = 0.1)
+dge_int <- dge_int[keep, ]
+message(sprintf("Genes retained after filtering: %d", sum(keep)))
+
+# all skin -> no Tissue term
+form_int <- ~ 0 + group + (1|Patient.ID) + (1|GEO.Cohort)
+vobj_int <- voomWithDreamWeights(dge_int, form_int, meta_int, BPPARAM = MulticoreParam(16))
+
+L_int <- makeContrastsDream(form_int, meta_int, contrasts = c(
+  CTCLvsNorm_PP  = "groupmalPP  - groupnormPP",
+  CTCLvsNorm_Tum = "groupmalTum - groupnormTum",
+  Interaction    = "(groupmalTum - groupnormTum) - (groupmalPP - groupnormPP)"))
+
+fit_int <- dream(vobj_int, form_int, meta_int, L = L_int, BPPARAM = MulticoreParam(16))
+fit_int <- eBayes(fit_int)
+```
+
+```{r mf_interaction_results, fig.height=4, fig.width=5}
+get_res <- function(fit, coef) {
+  topTable(fit, coef = coef, number = Inf) %>%
+    rownames_to_column("gene") %>%
+    mutate(sig = adj.P.Val < 0.05) %>%
+    arrange(adj.P.Val)
+}
+
+# stage-dependent malignancy signature: how CTCL-vs-normal differs Tumor vs PP
+res_int <- get_res(fit_int, "Interaction")
+message(sprintf("Stage-dependent malignancy DEGs (interaction, FDR < 0.05): %d",
+                sum(res_int$sig)))
+head(res_int, 30)
+
+lfc_lim <- quantile(abs(res_int$logFC), 0.99, na.rm = TRUE)
+ggplot(res_int, aes(x = logFC, y = -log10(P.Value), color = logFC)) +
+  geom_point(size = 0.7, alpha = 0.6) +
+  scale_color_gradient2(low = "steelblue", mid = "grey80", high = "firebrick",
+                        midpoint = 0, limits = c(-lfc_lim, lfc_lim),
+                        oob = scales::squish, name = "interaction\nlog2FC") +
+  labs(x = "interaction log2FC  [(CTCL-norm)|Tum - (CTCL-norm)|PP]", y = "-log10(P)",
+       title = "MF: stage-dependent malignancy program") +
+  theme_classic(base_size = 12)
+```
+
+```{r mf_interaction_scatter, fig.height=4.5, fig.width=5}
+# within-lesion CTCL-vs-normal signatures, on shared genes
+res_pp  <- get_res(fit_int, "CTCLvsNorm_PP")
+res_tum <- get_res(fit_int, "CTCLvsNorm_Tum")
+
+sig_merge <- inner_join(
+  res_pp  %>% select(gene, lfc_PP  = logFC),
+  res_tum %>% select(gene, lfc_Tum = logFC),
+  by = "gene"
+) %>%
+  left_join(res_int %>% select(gene, int_lfc = logFC, int_sig = sig), by = "gene")
+
+cor_p <- cor(sig_merge$lfc_PP, sig_merge$lfc_Tum)
+cor_s <- cor(sig_merge$lfc_PP, sig_merge$lfc_Tum, method = "spearman")
+lim   <- quantile(abs(sig_merge$int_lfc), 0.99, na.rm = TRUE)
+
+ggplot(sig_merge, aes(x = lfc_PP, y = lfc_Tum)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey60") +
+  geom_point(aes(color = int_lfc), size = 0.7, alpha = 0.5) +
+  geom_smooth(method = "lm", se = FALSE, color = "black", linewidth = 0.6) +
+  scale_color_gradient2(low = "steelblue", mid = "grey80", high = "firebrick",
+                        midpoint = 0, limits = c(-lim, lim),
+                        oob = scales::squish, name = "interaction\nlog2FC") +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 1.4,
+           label = sprintf("r = %.2f  (rho = %.2f)", cor_p, cor_s), size = 4) +
+  coord_fixed() +
+  labs(x = "CTCL vs normal CD4  (Patch/Plaque)",
+       y = "CTCL vs normal CD4  (Tumor)",
+       title = "MF malignancy signature: PP vs Tumor") +
+  theme_classic(base_size = 12)
+```
+
+
+<!-- ============================================================ -->
+<!-- TEST: CTCL MF vs SS, direct (malignant cells only)          -->
+<!-- ============================================================ -->
+<!-- Direct malignant-cell contrast, no benign anchor. NOTE: MF/SS is heavily -->
+<!-- confounded with Tissue (MF~skin, SS~blood) and cohort, so this conflates -->
+<!-- malignant-intrinsic differences with the skin-vs-blood/background axis   -->
+<!-- even after adjusting for Tissue + (1|GEO.Cohort). See prose for caveats. -->
+
+```{r ctcl_mf_ss_direct}
+obj    <- readRDS("../fig1/results/obj.fig1.rds")
+se_all <- readRDS("results/bulk.se.rds")
+
+dx_map <- obj@meta.data %>% distinct(orig.merge, Dx)
+colData(se_all)$Dx <- dx_map$Dx[match(colData(se_all)$orig.merge, dx_map$orig.merge)]
+
+se_ds <- se_all[, colData(se_all)$celltype.malig == "CTCL" &
+                   !colData(se_all)$malig.pheno %in% c("GDT", "CD8") &
+                   colData(se_all)$Dx %in% c("MF", "SS") &
+                   colData(se_all)$Tissue %in% c("blood", "skin")]
+
+meta_ds <- as.data.frame(colData(se_ds))
+meta_ds$Dx <- factor(meta_ds$Dx, levels = c("MF", "SS"))   # coef DxSS = up in SS vs MF
+print(table(meta_ds$Dx, meta_ds$Tissue))
+
+dge_ds <- DGEList(counts = assay(se_ds, "counts"))
+dge_ds <- calcNormFactors(dge_ds)
+tcr_bcr <- grep("^TR[ABDG][VDJ]|^TR[AB]C|^IG[HKL][VDJ]|^IGH[ADEGM]|^IGKC|^IGLC",
+                rownames(dge_ds), value = TRUE)
+dge_ds <- dge_ds[!rownames(dge_ds) %in% tcr_bcr, ]
+
+keep <- filterByExpr(dge_ds, group = meta_ds$Dx,
+                     min.count = 1, min.total.count = 5, min.prop = 0.1)
+dge_ds <- dge_ds[keep, ]
+message(sprintf("Genes retained after filtering: %d", sum(keep)))
+
+# adjust for Tissue (partly absorbs the skin/blood confound) + cohort/patient
+form_ds <- ~ Dx + Tissue + (1|Patient.ID) + (1|GEO.Cohort)
+vobj_ds <- voomWithDreamWeights(dge_ds, form_ds, meta_ds, BPPARAM = MulticoreParam(16))
+fit_ds  <- dream(vobj_ds, form_ds, meta_ds, BPPARAM = MulticoreParam(16))
+fit_ds  <- eBayes(fit_ds)
+
+res_mf_ss_direct <- topTable(fit_ds, coef = "DxSS", number = Inf) %>%
+  rownames_to_column("gene") %>%
+  mutate(sig = adj.P.Val < 0.05) %>%
+  arrange(adj.P.Val)
+
+message(sprintf("Direct MF-vs-SS malignant DEGs (FDR < 0.05): %d", sum(res_mf_ss_direct$sig)))
+head(res_mf_ss_direct, 30)
+```
+
+```{r ctcl_mf_ss_direct_volcano, fig.height=4, fig.width=5}
+lfc_lim <- quantile(abs(res_mf_ss_direct$logFC), 0.99, na.rm = TRUE)
+ggplot(res_mf_ss_direct, aes(x = logFC, y = -log10(P.Value), color = logFC)) +
+  geom_point(size = 0.7, alpha = 0.6) +
+  scale_color_gradient2(low = "steelblue", mid = "grey80", high = "firebrick",
+                        midpoint = 0, limits = c(-lfc_lim, lfc_lim),
+                        oob = scales::squish, name = "log2FC") +
+  labs(x = "log2FC (SS vs MF, malignant CD4)", y = "-log10(P)",
+       title = "CTCL MF vs SS (direct)") +
+  theme_classic(base_size = 12)
+```
+
+
+<!-- ============================================================ -->
+<!-- Paired malignant-minus-benign change matrix + robust signed WGCNA -->
+<!-- ============================================================ -->
+<!-- Fully self-contained: reads only results/bulk.se.rds (+ subtype_df for one -->
+<!-- module-trait annotation). For every SAMPLE carrying BOTH a malignant (CTCL) -->
+<!-- and a matched benign (T_Cells) CD4 pseudobulk column, form the within-sample -->
+<!-- log-CPM change (delta = malignant - benign). Each sample's own benign CD4    -->
+<!-- cancels its patient/tissue/cohort background, so the delta matrix is the      -->
+<!-- per-sample malignant-reprogramming signal. Robust signed WGCNA (bicor +       -->
+<!-- signed network/TOM) then groups genes that co-move in the SAME direction      -->
+<!-- across samples into malignancy-change modules.                                -->
+
+```{r cd4_paired_delta_wgcna, fig.height=5, fig.width=9}
+# --- deps: WGCNA pulls dynamicTreeCut/fastcluster/impute/preprocessCore ---
+if (!requireNamespace("WGCNA", quietly = TRUE))
+  BiocManager::install("WGCNA", update = FALSE, ask = FALSE)
+library(WGCNA)
+WGCNA::enableWGCNAThreads(nThreads = 16)
+# WGCNA masks cor/dplyr verbs; pin the ones we call by name
+conflicted::conflicts_prefer(dplyr::select, dplyr::filter, dplyr::count,
+                             base::setdiff, .quiet = TRUE)
+set.seed(42)
+
+# ---- 1. rebuild the CD4 pseudobulk subset (same filter as pseudobulk_filter) ----
+se <- readRDS("results/bulk.se.rds")
+se <- se[, colData(se)$Tissue %in% c("blood", "skin") &
+            !colData(se)$malig.pheno %in% c("GDT", "CD8")]
+cd <- as.data.frame(colData(se))
+
+# ---- 2. samples with BOTH a malignant (CTCL) and matched benign (T_Cells) column ----
+paired_ids <- cd %>%
+  dplyr::count(orig.merge, celltype.malig) %>%
+  tidyr::pivot_wider(names_from = celltype.malig, values_from = n, values_fill = 0) %>%
+  dplyr::filter(CTCL > 0, T_Cells > 0) %>%
+  dplyr::pull(orig.merge)
+message(sprintf("paired samples (malignant + matched benign CD4): %d", length(paired_ids)))
+
+se_p <- se[, cd$orig.merge %in% paired_ids]
+cd_p <- as.data.frame(colData(se_p))
+
+# ---- 3. normalize on the paired subset, drop TCR/BCR, expression-filter ----
+dge <- DGEList(counts = assay(se_p, "counts"))
+dge <- calcNormFactors(dge)
+tcr_bcr <- grep("^TR[ABDG][VDJ]|^TR[AB]C|^IG[HKL][VDJ]|^IGH[ADEGM]|^IGKC|^IGLC",
+                rownames(dge), value = TRUE)
+dge <- dge[!rownames(dge) %in% tcr_bcr, ]
+keep <- filterByExpr(dge, group = cd_p$celltype.malig,
+                     min.count = 1, min.total.count = 5, min.prop = 0.1)
+dge  <- dge[keep, ]
+logcpm <- edgeR::cpm(dge, log = TRUE, prior.count = 1)
+message(sprintf("genes after expression filter: %d", nrow(logcpm)))
+
+# ---- 4. paired delta = malignant - benign per sample (genes x samples) ----
+mal_cols <- setNames(paste0(paired_ids, "__CTCL"),    paired_ids)
+ben_cols <- setNames(paste0(paired_ids, "__T_Cells"), paired_ids)
+stopifnot(all(mal_cols %in% colnames(logcpm)), all(ben_cols %in% colnames(logcpm)))
+delta <- logcpm[, mal_cols] - logcpm[, ben_cols]
+colnames(delta) <- paired_ids
+
+# keep the most variable change-genes (robust MAD) to focus WGCNA on real co-variation
+n_top     <- 6000
+mad_delta <- apply(delta, 1, mad)
+top_genes <- names(sort(mad_delta, decreasing = TRUE))[seq_len(min(n_top, nrow(delta)))]
+datExpr   <- t(delta[top_genes, ])          # rows = samples, cols = change-genes
+message(sprintf("WGCNA input: %d samples x %d change-genes", nrow(datExpr), ncol(datExpr)))
+
+gsg <- goodSamplesGenes(datExpr, verbose = 0)
+if (!gsg$allOK) datExpr <- datExpr[gsg$goodSamples, gsg$goodGenes]
+
+# ---- 5. soft-threshold selection for a SIGNED network ----
+powers <- c(1:10, seq(12, 30, 2))
+sft <- pickSoftThreshold(datExpr, powerVector = powers, networkType = "signed",
+                         corFnc = "bicor", corOptions = list(use = "p", maxPOutliers = 0.05),
+                         RsquaredCut = 0.85, verbose = 0)
+# WGCNA signed-network default by sample size (FAQ table). The paired-delta
+# matrix has weak scale-free topology, so pickSoftThreshold only clears
+# R^2 >= 0.85 at a power (24) where connectivity has already collapsed
+# (max.k < 1) -> every gene falls into grey and module merging fails. Trust the
+# estimate only when it is at/below this default; otherwise use the default.
+default_power <- if (nrow(datExpr) < 20) 18 else if (nrow(datExpr) < 30) 16 else
+                 if (nrow(datExpr) < 40) 14 else 12
+power <- sft$powerEstimate
+if (is.na(power) || power > default_power) power <- default_power
+message(sprintf("chosen soft power: %d", power))
+
+par(mfrow = c(1, 2))
+r2 <- -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2]
+plot(sft$fitIndices[, 1], r2, type = "n", xlab = "soft power",
+     ylab = "scale-free R^2", main = "scale-free topology fit")
+text(sft$fitIndices[, 1], r2, labels = powers, col = "firebrick")
+abline(h = 0.85, col = "grey60", lty = 2); abline(v = power, col = "steelblue", lty = 3)
+plot(sft$fitIndices[, 1], sft$fitIndices[, 5], type = "n", xlab = "soft power",
+     ylab = "mean connectivity", main = "mean connectivity")
+text(sft$fitIndices[, 1], sft$fitIndices[, 5], labels = powers, col = "firebrick")
+par(mfrow = c(1, 1))
+
+# ---- 6. robust signed WGCNA: bicor + signed network/TOM ----
+net <- blockwiseModules(
+  datExpr, power = power,
+  networkType = "signed", TOMType = "signed",
+  corType = "bicor", maxPOutliers = 0.05,
+  deepSplit = 2, minModuleSize = 30, mergeCutHeight = 0.25,
+  pamRespectsDendro = FALSE, reassignThreshold = 0,
+  numericLabels = TRUE, maxBlockSize = ncol(datExpr) + 1,
+  nThreads = 16, saveTOMs = FALSE, verbose = 0)
+
+module_colors <- labels2colors(net$colors)
+names(module_colors) <- colnames(datExpr)
+message(sprintf("modules found (excl. grey): %d",
+                length(setdiff(unique(module_colors), "grey"))))
+print(sort(table(module_colors), decreasing = TRUE))
+
+plotDendroAndColors(net$dendrograms[[1]], module_colors[net$blockGenes[[1]]],
+                    "module", dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05,
+                    main = "malignant-change co-expression modules")
+
+# ---- 7. module eigengenes vs sample traits (module = malignant-change program) ----
+samp_meta <- cd_p %>%
+  dplyr::distinct(orig.merge, Tissue, Sample.Type.simple, Dx.simple)
+subtype_df <- readRDS("results/subtype_df.rds")
+samp_meta$subtype <- subtype_df$subtype[match(paste0(samp_meta$orig.merge, "__CTCL"),
+                                              subtype_df$sample)]
+rownames(samp_meta) <- samp_meta$orig.merge
+samp_meta <- samp_meta[rownames(datExpr), ]
+
+traits <- data.frame(
+  skin        = as.integer(samp_meta$Tissue == "skin"),
+  tumor_vs_pp = dplyr::case_when(samp_meta$Sample.Type.simple == "Tumor" ~ 1L,
+                                 samp_meta$Sample.Type.simple == "Patch_Plaque" ~ 0L,
+                                 TRUE ~ NA_integer_),
+  subtype_S2  = dplyr::case_when(samp_meta$subtype == "Subtype_2" ~ 1L,
+                                 samp_meta$subtype == "Subtype_1" ~ 0L,
+                                 TRUE ~ NA_integer_),
+  row.names   = rownames(datExpr))
+
+MEs <- orderMEs(net$MEs)
+me_lab <- paste0("ME", labels2colors(as.integer(sub("^ME", "", colnames(MEs)))))
+colnames(MEs) <- me_lab
+
+# binary traits -> Pearson (point-biserial); bicor is for continuous variables
+mt_cor <- stats::cor(MEs, traits, use = "pairwise.complete.obs")
+mt_p   <- corPvalueStudent(mt_cor, nSamples = nrow(datExpr))
+
+mt_df <- as.data.frame(mt_cor) %>%
+  tibble::rownames_to_column("module") %>%
+  tidyr::pivot_longer(-module, names_to = "trait", values_to = "cor") %>%
+  dplyr::left_join(
+    as.data.frame(mt_p) %>% tibble::rownames_to_column("module") %>%
+      tidyr::pivot_longer(-module, names_to = "trait", values_to = "p"),
+    by = c("module", "trait")) %>%
+  dplyr::filter(module != "MEgrey") %>%
+  dplyr::mutate(star = dplyr::case_when(p < 0.001 ~ "***", p < 0.01 ~ "**",
+                                        p < 0.05 ~ "*", TRUE ~ ""),
+                label = sprintf("%.2f%s", cor, star))
+
+cor_lim <- max(abs(mt_df$cor), na.rm = TRUE)
+if (!is.finite(cor_lim)) cor_lim <- 1
+p_mt <- ggplot(mt_df, aes(trait, module, fill = cor)) +
+  geom_tile(color = "white", linewidth = 0.4) +
+  geom_text(aes(label = label), size = 3) +
+  scale_fill_gradient2(low = "steelblue", mid = "grey90", high = "firebrick",
+                       midpoint = 0, limits = c(-cor_lim, cor_lim),
+                       oob = scales::squish, name = "bicor") +
+  labs(x = NULL, y = NULL, title = "module eigengene vs trait") +
+  theme_classic(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(p_mt)
+
+# ---- 8. hub (top-kME) change-genes per module ----
+kME <- signedKME(datExpr, MEs, corFnc = "bicor", corOptions = "maxPOutliers = 0.05")
+hub_genes <- lapply(setdiff(colnames(MEs), "MEgrey"), function(me) {
+  mod  <- sub("^ME", "", me)
+  gset <- names(module_colors)[module_colors == mod]
+  ord  <- gset[order(kME[gset, paste0("kME", mod)], decreasing = TRUE)]
+  data.frame(module = mod, gene = head(ord, 12),
+             kME = round(kME[head(ord, 12), paste0("kME", mod)], 3))
+}) %>% dplyr::bind_rows()
+print(tibble::as_tibble(hub_genes), n = nrow(hub_genes))
+```
+
+
+<!-- ============================================================ -->
+<!-- Per-patient NMF -> recurrent malignant meta-programs         -->
+<!-- ============================================================ -->
+<!-- Alternative to the pseudobulk co-expression WGCNA above, designed to dodge -->
+<!-- its failure modes. Programs are learned by NMF WITHIN each patient's        -->
+<!-- malignant CD4 cells (so cohort/tissue batch can't drive them), then the     -->
+<!-- per-patient programs are clustered by top-gene overlap into META-PROGRAMS   -->
+<!-- that recur across patients (Gavish/Tirosh 2023). A meta-program = a         -->
+<!-- coordinated malignant transcriptional program reproducibly deployed by many -->
+<!-- independent patients. Fully self-contained: reads only the fig1 object      -->
+<!-- (+ subtype_df for one trait). Chunk 1 builds the meta-programs; chunk 2      -->
+<!-- scores cells and relates them to tissue/subtype/stage.                      -->
+
+```{r malig_nmf_metaprograms}
+library(RcppML)
+library(UCell)
+conflicted::conflicts_prefer(dplyr::select, dplyr::filter, base::setdiff, .quiet = TRUE)
+set.seed(42)
+
+# ---- tunables ----
+min_cells   <- 100     # min malignant cells for a patient to contribute programs
+cap_cells   <- 2000    # per-patient cell cap (subsample larger samples)
+n_hvg       <- 3000    # overdispersed genes fed to NMF
+ranks       <- 4:9     # NMF factorization ranks per patient
+top_n       <- 50      # top genes defining each program
+min_overlap <- 10      # shared top genes (of 50) to link two programs
+min_samples <- 5       # a meta-program must recur in >= this many patients
+
+# ---- 1. malignant CD4 cells (same population as the pseudobulk analysis) ----
+obj <- readRDS("../fig1/results/obj.fig1.rds")
+mal <- subset(obj, subset = celltype == "T_Cells" & celltype.malig == "CTCL" &
+                Tissue %in% c("blood", "skin") & !malig.pheno %in% c("GDT", "CD8"))
+
+# keep patients with enough cells, then cap per-patient cell count
+n_by_s   <- table(mal$orig.merge)
+ok_samps <- names(n_by_s)[n_by_s >= min_cells]
+cells_by_s <- split(colnames(mal), mal$orig.merge)[ok_samps]
+keep_cells <- unlist(lapply(cells_by_s, function(cc)
+  if (length(cc) > cap_cells) sample(cc, cap_cells) else cc), use.names = FALSE)
+mal_ss <- subset(mal, cells = keep_cells)
+mal_ss <- NormalizeData(mal_ss, verbose = FALSE)
+message(sprintf("patients: %d | malignant cells used: %d", length(ok_samps), ncol(mal_ss)))
+
+# ---- 2. overdispersed genes (drop TCR/BCR + mito technical drivers) ----
+mal_ss  <- FindVariableFeatures(mal_ss, nfeatures = n_hvg, verbose = FALSE)
+tcr_bcr <- grep("^TR[ABDG][VDJ]|^TR[AB]C|^IG[HKL][VDJ]|^IGH[ADEGM]|^IGKC|^IGLC",
+                VariableFeatures(mal_ss), value = TRUE)
+hvg  <- setdiff(VariableFeatures(mal_ss), c(tcr_bcr, grep("^MT-", VariableFeatures(mal_ss), value = TRUE)))
+expr <- as(LayerData(mal_ss, assay = "RNA", layer = "data")[hvg, ], "dgCMatrix")  # genes x cells
+cell_sample <- as.character(mal_ss$orig.merge)
+names(cell_sample) <- colnames(mal_ss)
+
+# ---- 3. per-patient NMF; keep top-gene programs, de-duplicate across ranks ----
+options(RcppML.threads = 1)          # single-thread NMF; parallelize across patients instead
+run_patient_nmf <- function(s) {
+  cols <- names(cell_sample)[cell_sample == s]
+  A <- as.matrix(expr[, cols, drop = FALSE])
+  A <- A - rowMeans(A)               # per-gene centering: keep positive deviations only
+  A[A < 0] <- 0
+  A <- A[rowSums(A) > 0, , drop = FALSE]
+  if (nrow(A) < top_n || ncol(A) < 30) return(NULL)
+  progs <- list()
+  for (r in ranks) {
+    W <- RcppML::nmf(A, k = r, seed = 42, verbose = FALSE)$w
+    rownames(W) <- rownames(A)
+    for (f in seq_len(ncol(W)))
+      progs[[length(progs) + 1]] <- names(sort(W[, f], decreasing = TRUE))[seq_len(top_n)]
+  }
+  # within-patient de-dup: greedily drop near-identical programs across ranks
+  keep <- logical(length(progs))
+  for (i in seq_along(progs)) {
+    dup <- FALSE
+    for (j in which(keep))
+      if (length(intersect(progs[[i]], progs[[j]])) >= 35) { dup <- TRUE; break }
+    keep[i] <- !dup
+  }
+  progs[keep]
+}
+
+prog_lists <- parallel::mclapply(ok_samps, run_patient_nmf, mc.cores = 16)
+names(prog_lists) <- ok_samps
+prog_lists  <- prog_lists[!vapply(prog_lists, is.null, logical(1))]
+
+programs    <- unlist(prog_lists, recursive = FALSE, use.names = FALSE)
+prog_sample <- rep(names(prog_lists), lengths(prog_lists))
+message(sprintf("robust per-patient programs: %d (from %d patients)",
+                length(programs), length(prog_lists)))
+
+# ---- 4. cluster programs into recurrent meta-programs (greedy founder) ----
+build_metaprograms <- function(programs, prog_sample, min_overlap, min_samples, sig_size = top_n) {
+  all_genes <- unique(unlist(programs))
+  M  <- vapply(programs, function(g) as.integer(all_genes %in% g), integer(length(all_genes)))
+  ov <- crossprod(M)                       # programs x programs: shared top genes
+  active <- rep(TRUE, length(programs)); mps <- list()
+  repeat {
+    idx <- which(active); if (length(idx) < min_samples) break
+    # founder = program reaching the most DISTINCT other patients at the overlap cutoff
+    nb <- vapply(idx, function(i) {
+      j <- idx[ov[i, idx] >= min_overlap & prog_sample[idx] != prog_sample[i]]
+      length(unique(prog_sample[j]))
+    }, integer(1))
+    if (max(nb) + 1 < min_samples) break
+    founder <- idx[which.max(nb)]
+    cand <- idx[idx != founder & ov[founder, idx] >= min_overlap]
+    members <- founder                     # one best-overlap program per contributing patient
+    for (s in unique(prog_sample[cand])) {
+      cs <- cand[prog_sample[cand] == s]
+      members <- c(members, cs[which.max(ov[founder, cs])])
+    }
+    tab <- sort(table(unlist(programs[members])), decreasing = TRUE)  # recurrence-ranked signature
+    mps[[length(mps) + 1]] <- list(
+      genes      = names(tab)[seq_len(min(sig_size, length(tab)))],
+      n_samples  = length(unique(prog_sample[members])),
+      n_programs = length(members))
+    active[members] <- FALSE
+  }
+  mps
+}
+
+mps <- build_metaprograms(programs, prog_sample, min_overlap, min_samples)
+mp_sigs <- lapply(mps, `[[`, "genes")
+names(mp_sigs) <- sprintf("MP%02d", seq_along(mp_sigs))
+
+mp_summary <- data.frame(
+  meta_program = names(mp_sigs),
+  n_patients   = vapply(mps, `[[`, integer(1), "n_samples"),
+  n_programs   = vapply(mps, `[[`, integer(1), "n_programs"),
+  top_genes    = vapply(mp_sigs, function(g) paste(head(g, 12), collapse = ", "), character(1)))
+message(sprintf("meta-programs recurring in >= %d patients: %d", min_samples, length(mp_sigs)))
+print(tibble::as_tibble(mp_summary), n = nrow(mp_summary), width = Inf)
+```
+
+```{r malig_metaprogram_traits, fig.height=5, fig.width=7}
+# ---- 5. score every malignant cell for each meta-program (UCell, rank-based) ----
+mal_ss <- AddModuleScore_UCell(mal_ss, features = mp_sigs, name = "", ncores = 16)
+
+score_by_sample <- data.frame(
+  orig.merge = mal_ss$orig.merge,
+  mal_ss@meta.data[, names(mp_sigs), drop = FALSE]) %>%
+  dplyr::group_by(orig.merge) %>%
+  dplyr::summarise(dplyr::across(dplyr::everything(), mean), .groups = "drop") %>%
+  tibble::column_to_rownames("orig.merge")
+
+# ---- 6. per-sample traits (same encoding as the WGCNA module-trait map) ----
+smeta <- mal_ss@meta.data %>%
+  dplyr::distinct(orig.merge, Tissue, Sample.Type.simple)
+subtype_df <- readRDS("results/subtype_df.rds")
+smeta$subtype <- subtype_df$subtype[match(paste0(smeta$orig.merge, "__CTCL"), subtype_df$sample)]
+rownames(smeta) <- smeta$orig.merge
+smeta <- smeta[rownames(score_by_sample), ]
+
+traits <- data.frame(
+  skin        = as.integer(smeta$Tissue == "skin"),
+  tumor_vs_pp = dplyr::case_when(smeta$Sample.Type.simple == "Tumor" ~ 1L,
+                                 smeta$Sample.Type.simple == "Patch_Plaque" ~ 0L,
+                                 TRUE ~ NA_integer_),
+  subtype_S2  = dplyr::case_when(smeta$subtype == "Subtype_2" ~ 1L,
+                                 smeta$subtype == "Subtype_1" ~ 0L,
+                                 TRUE ~ NA_integer_),
+  row.names   = rownames(score_by_sample))
+
+mt_cor <- stats::cor(as.matrix(score_by_sample), as.matrix(traits), use = "pairwise.complete.obs")
+# two-sided p from the correlation t-statistic (n = sample count, approx over NA traits)
+mt_p   <- 2 * pt(-abs(mt_cor * sqrt((nrow(traits) - 2) / (1 - mt_cor^2))), df = nrow(traits) - 2)
+
+mt_df <- as.data.frame(mt_cor) %>%
+  tibble::rownames_to_column("meta_program") %>%
+  tidyr::pivot_longer(-meta_program, names_to = "trait", values_to = "cor") %>%
+  dplyr::left_join(
+    as.data.frame(mt_p) %>% tibble::rownames_to_column("meta_program") %>%
+      tidyr::pivot_longer(-meta_program, names_to = "trait", values_to = "p"),
+    by = c("meta_program", "trait")) %>%
+  dplyr::mutate(star = dplyr::case_when(p < 0.001 ~ "***", p < 0.01 ~ "**",
+                                        p < 0.05 ~ "*", TRUE ~ ""),
+                label = sprintf("%.2f%s", cor, star))
+
+cor_lim <- max(abs(mt_df$cor), na.rm = TRUE); if (!is.finite(cor_lim)) cor_lim <- 1
+p_mp <- ggplot(mt_df, aes(trait, meta_program, fill = cor)) +
+  geom_tile(color = "white", linewidth = 0.4) +
+  geom_text(aes(label = label), size = 3) +
+  scale_fill_gradient2(low = "steelblue", mid = "grey90", high = "firebrick",
+                       midpoint = 0, limits = c(-cor_lim, cor_lim),
+                       oob = scales::squish, name = "Pearson r") +
+  labs(x = NULL, y = NULL, title = "malignant meta-program vs trait") +
+  theme_classic(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(p_mp)
+
+# ---- 7. meta-program signatures (top recurrence-ranked genes) ----
+mp_genes <- lapply(names(mp_sigs), function(m)
+  data.frame(meta_program = m, rank = seq_len(min(15, length(mp_sigs[[m]]))),
+             gene = head(mp_sigs[[m]], 15))) %>% dplyr::bind_rows()
+print(tibble::as_tibble(mp_genes), n = nrow(mp_genes))
+```
+
+
+
+
