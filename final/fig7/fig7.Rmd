@@ -695,8 +695,8 @@ ggsave("figs/cd4_trajectory_tvalue_scatter.pdf", plot = p_t_scatter,
 ```{r surv_load}
 library(scales)
 
-mat_indep  <- readRDS("~/Rstudio/CTCL/int/surv.mat.rds")
-meta_indep <- readRDS("~/Rstudio/CTCL/int/surv.meta.ss.rds")
+mat_indep  <- readRDS("../../int/surv.mat.rds")
+meta_indep <- readRDS("../../int/surv.meta.ss.rds")
 
 # Log-normalize
 logcpm_indep <- edgeR::cpm(mat_indep, log = TRUE)
@@ -1667,10 +1667,10 @@ library(survival)
 library(broom)
 
 if (!exists("mat_indep")) {
-  mat_indep <- readRDS("~/Rstudio/CTCL/int/surv.mat.rds")
+  mat_indep <- readRDS("../../int/surv.mat.rds")
 }
 if (!exists("meta_indep")) {
-  meta_indep <- readRDS("~/Rstudio/CTCL/int/surv.meta.ss.rds")
+  meta_indep <- readRDS("../../int/surv.meta.ss.rds")
 }
 if (!exists("deg_s1s2")) {
   deg_s1s2 <- readRDS("../fig4/results/res_skin_subtypes.rds")
@@ -1881,10 +1881,10 @@ library(patchwork)
 library(survival)
 
 if (!exists("mat_indep")) {
-  mat_indep <- readRDS("~/Rstudio/CTCL/int/surv.mat.rds")
+  mat_indep <- readRDS("../../int/surv.mat.rds")
 }
 if (!exists("meta_indep")) {
-  meta_indep <- readRDS("~/Rstudio/CTCL/int/surv.meta.ss.rds")
+  meta_indep <- readRDS("../../int/surv.meta.ss.rds")
 }
 if (!exists("deg_s1s2")) {
   deg_s1s2 <- readRDS("../fig4/results/res_skin_subtypes.rds")
@@ -2123,10 +2123,10 @@ library(ggrepel)
 library(survival)
 
 if (!exists("mat_indep")) {
-  mat_indep <- readRDS("~/Rstudio/CTCL/int/surv.mat.rds")
+  mat_indep <- readRDS("../../int/surv.mat.rds")
 }
 if (!exists("meta_indep")) {
-  meta_indep <- readRDS("~/Rstudio/CTCL/int/surv.meta.ss.rds")
+  meta_indep <- readRDS("../../int/surv.meta.ss.rds")
 }
 
 meta_os <- meta_indep[colnames(mat_indep), , drop = FALSE] %>%
@@ -2355,10 +2355,10 @@ library(patchwork)
 library(survival)
 
 if (!exists("mat_indep")) {
-  mat_indep <- readRDS("~/Rstudio/CTCL/int/surv.mat.rds")
+  mat_indep <- readRDS("../../int/surv.mat.rds")
 }
 if (!exists("meta_indep")) {
-  meta_indep <- readRDS("~/Rstudio/CTCL/int/surv.meta.ss.rds")
+  meta_indep <- readRDS("../../int/surv.meta.ss.rds")
 }
 
 meta_tcell <- meta_indep[colnames(mat_indep), , drop = FALSE] %>%
@@ -2529,10 +2529,10 @@ library(ggplot2)
 
 if (!exists("tcell_fraction_df")) {
   if (!exists("mat_indep")) {
-    mat_indep <- readRDS("~/Rstudio/CTCL/int/surv.mat.rds")
+    mat_indep <- readRDS("../../int/surv.mat.rds")
   }
   if (!exists("meta_indep")) {
-    meta_indep <- readRDS("~/Rstudio/CTCL/int/surv.meta.ss.rds")
+    meta_indep <- readRDS("../../int/surv.meta.ss.rds")
   }
 
   meta_tcell <- meta_indep[colnames(mat_indep), , drop = FALSE] %>%

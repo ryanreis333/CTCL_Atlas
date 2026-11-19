@@ -104,13 +104,13 @@ The atlas includes 18 cohorts:
 | GSE171811 | 14 | 14 | 8 | blood, skin | HC, MF, SS |
 | GSE173205 | 27 | 27 | 14 | skin | FMF, HC, MF |
 | GSE182861 | 8 | 8 | 7 | blood, skin | MF, SS |
-| GSE207679 | 8 | 8 | 8 | blood, skin | MF, SS |
+| GSE207679 | 7 | 7 | 7 | blood | MF, SS |
 | GSE284075 | 40 | 26 | 17 | blood, skin | MF, SS |
+| [GSE290557](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE290557) | 16 | 16 | 6 | blood | SS |
 | HRA000166 | 16 | 16 | 12 | skin | MF, PCALCL |
 | PRJNA842142 | 15 | 15 | 6 | blood | SS |
-| SRP332550 | 15 | 15 | 8 | skin | MF |
+| SRP332550 | 16 | 16 | 8 | skin | MF |
 | Shandong | 4 | 4 | 4 | blood | HC, SS |
-| WashU | 16 | 16 | 6 | blood | SS |
 
 Libraries from the same specimen (e.g., sorted fractions) were merged into one biological sample (`orig.merge`). A few patients appear in more than one cohort.
 

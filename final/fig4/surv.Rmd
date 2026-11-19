@@ -16,7 +16,7 @@ library(data.table)
 library(edgeR)
 
 # ── Expression matrix ──────────────────────────────────────────────────────────
-expr_raw <- fread("int/GSE168508_gene_expression-MF_skin-biopsy_sample_.txt")
+expr_raw <- fread("../../int/GSE168508_gene_expression-MF_skin-biopsy_sample_.txt")
 
 # Drop non-expression column, aggregate duplicate gene symbols by mean
 expr_raw[, genes := NULL]
@@ -58,8 +58,8 @@ cat("Expression matrix:", nrow(mat), "genes x", ncol(mat), "samples\n")
 cat("Metadata:", nrow(meta), "samples,", ncol(meta), "variables\n")
 cat("LCT status:", table(meta$lct), "\n")
 
-saveRDS(mat, "surv.mat.rds")
-saveRDS(meta, "surv.meta.rds")
+saveRDS(mat, "../../int/surv.mat.rds")
+saveRDS(meta, "../../int/surv.meta.rds")
 ```
 
 ## Clean metadata
@@ -90,15 +90,15 @@ meta.ss$tnmb_staging_b         <- as.integer(meta.ss$tnmb_staging_b)
 
 str(meta.ss)
 
-saveRDS(meta.ss, "surv.meta.ss.rds")
+saveRDS(meta.ss, "../../int/surv.meta.ss.rds")
 ```
 
 
 ```{r load-saved}
 library(survival)
 library(survminer)
-mat  <- readRDS("~/Rstudio/CTCL/int/surv.mat.rds")
-meta <- readRDS("~/Rstudio/CTCL/int/surv.meta.ss.rds")
+mat  <- readRDS("../../int/surv.mat.rds")
+meta <- readRDS("../../int/surv.meta.ss.rds")
 logcpm <- edgeR::cpm(mat, log = TRUE)
 ```
 
